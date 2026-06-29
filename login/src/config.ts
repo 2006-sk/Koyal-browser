@@ -30,6 +30,13 @@ export const config = {
   headed: process.env.AGENT_BROWSER_HEADED !== 'false',
   showCursor: process.env.AGENT_SHOW_CURSOR !== 'false',
   actionDelayMs: Number(process.env.AGENT_ACTION_DELAY_MS ?? '350'),
+  /** Max wait per verification step — exceed → fail */
+  verificationMaxWaitMs: Number(process.env.VERIFICATION_MAX_WAIT_MS ?? '15000'),
+  verificationPollMs: Number(process.env.VERIFICATION_POLL_MS ?? '1000'),
+  /** How long to wait for OTP/reset code file (signup-otp.txt / reset-code.txt) */
+  codeWaitMs: Number(process.env.KOYAL_CODE_WAIT_MS ?? '60000'),
+  /** Poll interval while waiting for code file */
+  codePollMs: Number(process.env.KOYAL_CODE_POLL_MS ?? '2000'),
   llm: {
     enabled: process.env.LLM_ENABLED !== 'false' && Boolean(process.env.LLM_API_KEY),
     provider: (process.env.LLM_PROVIDER ?? 'openai') as LlmProvider,

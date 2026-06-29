@@ -8,8 +8,12 @@
     "build": "tsc",
     "qa:login": "tsx src/run-login.ts",
     "qa": "tsx src/run.ts",
+    "qa:phase1": "tsx src/run.ts --skip-signup --skip-forgot",
     "qa:forgot": "tsx src/run.ts --forgot-only",
     "qa:signup": "tsx src/run.ts --signup-only",
+    "qa:validation": "tsx src/run.ts --validation-only",
+    "qa:back-forth": "tsx src/run.ts --back-forth-only",
+    "qa:app-shell": "tsx src/run.ts --app-shell-only",
     "discover": "tsx src/discover.ts"
   },
   "dependencies": {

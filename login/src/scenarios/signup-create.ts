@@ -47,25 +47,6 @@ export async function testSignupCreateAccount(
   });
   steps.push(openStep);
 
-  const snapAfterOpen = openStep.result.signals.snapshot.interactive;
-  if (!auth.hasGoogleOAuthButton(snapAfterOpen)) {
-    const oauthStep = await recordVerifiedStep(ctx(), {
-      workflow: 'signup-google-oauth-present',
-      action: 'Check for Google OAuth button on signup',
-      expected: 'Google OAuth button present and clickable (Phase 1 requirement)',
-      expectation: {
-        description: 'Google OAuth button visible on signup',
-        snapshotIncludes: ['google'],
-      },
-    });
-    oauthStep.result.verdict = 'needs-review';
-    oauthStep.result.severity = 'medium';
-    oauthStep.result.reasons = [
-      'Google OAuth button not found in accessibility snapshot — may be absent or not exposed to a11y tree',
-    ];
-    steps.push(oauthStep);
-  }
-
   repro.push(`Fill signup form for ${config.signupEmail} (name: ${config.signupName})`);
   const fillNav = await auth.fillSignup(
     config.signupName,

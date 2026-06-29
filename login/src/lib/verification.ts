@@ -1,3 +1,4 @@
+import { config } from '../config.js';
 import type { AgentBrowser } from './agent-browser.js';
 import type {
   ConsoleMessage,
@@ -9,9 +10,6 @@ import type {
   VerificationResult,
   Verdict,
 } from './types.js';
-
-const DEFAULT_WAIT_MS = 2000;
-const RETRY_WAIT_MS = 3000;
 
 const RAW_ERROR_PATTERNS: RegExp[] = [
   /\bstack trace\b/i,
@@ -25,11 +23,6 @@ const RAW_ERROR_PATTERNS: RegExp[] = [
   /NetworkError/i,
   /Unexpected token/i,
   /Cannot read propert/i,
-];
-
-const BLANK_SCREEN_PATTERNS: RegExp[] = [
-  /^- document:\s*$/m,
-  /^- document:\s*\n\s*$/m,
 ];
 
 function sleep(ms: number): Promise<void> {
@@ -70,7 +63,6 @@ function findUglyErrors(snapshot: string, patterns: RegExp[]): string[] {
 function isBlankScreen(snapshot: string): boolean {
   const trimmed = snapshot.trim();
   if (!trimmed) return true;
-  // Snapshots always start with "- document:" — only blank if there are no child nodes
   const hasChildNodes = /\n\s+-\s/.test(trimmed) || /\[ref=e\d+\]/.test(trimmed);
   return !hasChildNodes;
 }
@@ -90,6 +82,7 @@ function networkStatusSummary(requests: NetworkRequest[]): string {
 function inferSeverity(reasons: string[], verdict: Verdict): Severity {
   if (verdict === 'needs-review') return 'medium';
   const joined = reasons.join(' ').toLowerCase();
+  if (joined.includes('exceeded') && joined.includes('15s')) return 'high';
   if (joined.includes('uncaught') || joined.includes('white screen') || joined.includes('500')) {
     return 'critical';
   }
@@ -191,12 +184,35 @@ export class VerificationLayer {
       }
     }
 
+    if (expectation.urlExcludes) {
+      if (!includesPattern(signals.url, expectation.urlExcludes)) {
+        passSignals++;
+      } else {
+        failSignals++;
+        reasons.push(`URL should not match "${String(expectation.urlExcludes)}", got "${signals.url}"`);
+      }
+    }
+
     for (const text of expectation.snapshotIncludes ?? []) {
       if (snap.toLowerCase().includes(text.toLowerCase())) {
         passSignals++;
       } else {
         failSignals++;
         reasons.push(`Expected snapshot to include "${text}"`);
+      }
+    }
+
+    if (expectation.snapshotIncludesAny?.length) {
+      const anyHit = expectation.snapshotIncludesAny.some((text) =>
+        snap.toLowerCase().includes(text.toLowerCase()),
+      );
+      if (anyHit) {
+        passSignals++;
+      } else {
+        failSignals++;
+        reasons.push(
+          `Expected snapshot to include one of: ${expectation.snapshotIncludesAny.map((t) => `"${t}"`).join(', ')}`,
+        );
       }
     }
 
@@ -232,6 +248,24 @@ export class VerificationLayer {
       }
     }
 
+    if (expectation.maxUnexpectedNetwork5xx) {
+      const bad = signals.networkRequests.filter((r) => {
+        const status = r.status ?? 0;
+        const url = r.url ?? '';
+        if (status < 500) return false;
+        if (/google-analytics|googletagmanager|mux\.com|posthog/i.test(url)) return false;
+        return true;
+      });
+      if (bad.length > expectation.maxUnexpectedNetwork5xx) {
+        failSignals++;
+        reasons.push(
+          `Unexpected 5xx responses: ${bad.map((r) => `${r.url} → ${r.status}`).join('; ')}`,
+        );
+      } else {
+        passSignals++;
+      }
+    }
+
     let verdict: Verdict;
     if (failSignals > 0) {
       verdict = 'fail';
@@ -258,7 +292,9 @@ export class VerificationLayer {
       `Network: ${networkStatusSummary(signals.networkRequests)}`,
     ];
 
-    const visibleErrors = signals.snapshot.raw.match(/User not found\.|Invalid|incorrect|error/gi);
+    const visibleErrors = signals.snapshot.raw.match(
+      /User not found\.|Invalid|incorrect|error|required|do not match|at least 6/i,
+    );
     if (visibleErrors) {
       parts.push(`Visible messages: ${visibleErrors.join(', ')}`);
     }
@@ -268,40 +304,48 @@ export class VerificationLayer {
 
   async verifyAfterAction(
     expectation: VerificationExpectation,
-    options: { waitMs?: number; retryWaitMs?: number } = {},
+    options: { maxWaitMs?: number; pollMs?: number } = {},
   ): Promise<VerificationResult> {
-    const waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
-    const retryWaitMs = options.retryWaitMs ?? RETRY_WAIT_MS;
+    const maxWaitMs = options.maxWaitMs ?? config.verificationMaxWaitMs;
+    const pollMs = options.pollMs ?? config.verificationPollMs;
+    const deadline = Date.now() + maxWaitMs;
 
-    await sleep(waitMs);
-    let signals = await this.captureSignals(expectation.networkFilter);
-    let evaluation = this.evaluateSignals(signals, expectation);
+    let lastSignals = await this.captureSignals(expectation.networkFilter);
+    let lastEvaluation = this.evaluateSignals(lastSignals, expectation);
+    let retried = false;
 
-    if (evaluation.verdict === 'needs-review') {
-      await sleep(retryWaitMs);
-      signals = await this.captureSignals(expectation.networkFilter);
-      evaluation = this.evaluateSignals(signals, expectation);
-      if (evaluation.verdict === 'needs-review') {
+    while (Date.now() < deadline) {
+      if (lastEvaluation.verdict === 'pass' || lastEvaluation.verdict === 'fail') {
         return {
-          verdict: 'needs-review',
-          severity: inferSeverity(evaluation.reasons, 'needs-review'),
+          verdict: lastEvaluation.verdict,
+          severity: inferSeverity(lastEvaluation.reasons, lastEvaluation.verdict),
           expected: expectation.description,
-          actual: this.buildActualSummary(signals),
-          signals,
-          reasons: evaluation.reasons,
-          retried: true,
+          actual: this.buildActualSummary(lastSignals),
+          signals: lastSignals,
+          reasons: lastEvaluation.reasons,
+          retried,
         };
       }
+
+      await sleep(pollMs);
+      retried = true;
+      lastSignals = await this.captureSignals(expectation.networkFilter);
+      lastEvaluation = this.evaluateSignals(lastSignals, expectation);
     }
 
+    const timeoutReasons = [
+      `Exceeded ${maxWaitMs / 1000}s wait without a clear pass signal`,
+      ...lastEvaluation.reasons,
+    ];
+
     return {
-      verdict: evaluation.verdict,
-      severity: inferSeverity(evaluation.reasons, evaluation.verdict),
+      verdict: 'fail',
+      severity: inferSeverity(timeoutReasons, 'fail'),
       expected: expectation.description,
-      actual: this.buildActualSummary(signals),
-      signals,
-      reasons: evaluation.reasons,
-      retried: false,
+      actual: this.buildActualSummary(lastSignals),
+      signals: lastSignals,
+      reasons: timeoutReasons,
+      retried,
     };
   }
 }

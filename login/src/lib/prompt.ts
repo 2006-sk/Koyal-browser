@@ -4,8 +4,6 @@ import readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { config } from '../config.js';
 
-const CODE_WAIT_MS = Number(process.env.KOYAL_CODE_WAIT_MS ?? 10 * 60 * 1000);
-
 function codeFile(name: string): string {
   fs.mkdirSync(config.stateDir, { recursive: true });
   return path.join(config.stateDir, name);
@@ -15,14 +13,16 @@ async function waitForCodeFile(filePath: string, label: string): Promise<string>
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`  Waiting for ${label}…`);
   console.log(`  Write the code to: ${filePath}`);
-  console.log('  (single line, save the file — the runner polls every second)');
+  console.log(
+    `  (single line, save the file — polls every ${config.codePollMs / 1000}s, max ${config.codeWaitMs / 1000}s)`,
+  );
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, '', 'utf8');
+  console.log(`  Created empty file — paste your code there and save.\n`);
 
-  const deadline = Date.now() + CODE_WAIT_MS;
+  const deadline = Date.now() + config.codeWaitMs;
   while (Date.now() < deadline) {
     if (fs.existsSync(filePath)) {
       const code = fs.readFileSync(filePath, 'utf8').trim();
@@ -32,10 +32,12 @@ async function waitForCodeFile(filePath: string, label: string): Promise<string>
         return code;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, config.codePollMs));
   }
 
-  throw new Error(`Timed out after ${CODE_WAIT_MS / 1000}s waiting for ${label} in ${filePath}`);
+  throw new Error(
+    `Timed out after ${config.codeWaitMs / 1000}s waiting for ${label} in ${filePath}`,
+  );
 }
 
 async function promptCodeInteractive(promptLabel: string, header: string): Promise<string> {
@@ -67,11 +69,13 @@ async function promptCode(options: {
   }
 
   const filePath = codeFile(options.fileName);
-  if (!input.isTTY) {
-    return waitForCodeFile(filePath, options.fileLabel);
+  const useInteractive =
+    process.env.KOYAL_CODE_PROMPT_INTERACTIVE === 'true' && input.isTTY;
+  if (useInteractive) {
+    return promptCodeInteractive(options.promptLabel, options.header);
   }
 
-  return promptCodeInteractive(options.promptLabel, options.header);
+  return waitForCodeFile(filePath, options.fileLabel);
 }
 
 export async function promptVerificationCode(): Promise<string> {

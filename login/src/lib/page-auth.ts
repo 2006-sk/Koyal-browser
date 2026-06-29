@@ -233,6 +233,16 @@ export class AuthPage {
     password: string,
     skipEnsure = false,
   ): Promise<AuthNavigationResult> {
+    return this.fillSignupFields(fullName, email, password, password, skipEnsure);
+  }
+
+  async fillSignupFields(
+    fullName: string,
+    email: string,
+    password: string,
+    confirmPassword: string,
+    skipEnsure = false,
+  ): Promise<AuthNavigationResult> {
     if (!skipEnsure) {
       await this.ensureSignupForm();
     }
@@ -264,10 +274,10 @@ export class AuthPage {
         snap = this.browser.snapshotInteractive();
         const confirmRef2 = refForInteractiveSnapshot(snap, authSelectors.signup.confirmPasswordField);
         if (!confirmRef2) throw new Error('Confirm password field ref lost after fill');
-        this.browser.fillVisible(confirmRef2, password);
+        this.browser.fillVisible(confirmRef2, confirmPassword);
         filled = true;
       },
-      exploreGoal: `On the signup form, fill full name "${fullName}", email "${email}", password and confirm password both "${password}". Do not submit yet.`,
+      exploreGoal: `On the signup form, fill full name "${fullName}", email "${email}", password "${password}", confirm "${confirmPassword}". Do not submit yet.`,
     });
     return this.toAuthResult(result);
   }
@@ -331,6 +341,33 @@ export class AuthPage {
     return this.toAuthResult(result);
   }
 
+  async backToLoginFromForgot(): Promise<AuthNavigationResult> {
+    const result = await this.harness.run({
+      action: 'back-to-login-from-forgot',
+      verify: () => isLoginFormSnapshot(this.browser.snapshotInteractive()),
+      deterministic: () => {
+        const snap = this.browser.snapshotInteractive();
+        const backRef = refForInteractiveSnapshot(snap, authSelectors.forgotPassword.backToLogin);
+        if (backRef) {
+          this.browser.clickVisible(backRef);
+          return;
+        }
+        const loginToggle = refForInteractiveSnapshot(snap, authSelectors.login.toggleFromSignup);
+        if (loginToggle) this.browser.clickVisible(loginToggle);
+        else this.browser.back();
+      },
+      exploreGoal: 'Return to the login form from forgot-password (Back to Login or browser back).',
+    });
+    return this.toAuthResult(result);
+  }
+
+  fillLoginEmailOnly(email: string): void {
+    const snap = this.browser.snapshotInteractive();
+    const emailRef = refForInteractiveSnapshot(snap, authSelectors.login.emailField);
+    if (!emailRef) throw new Error('Login email field not found');
+    this.browser.fillVisible(emailRef, email);
+  }
+
   hasGoogleOAuthButton(snapshot: string): boolean {
     return /google|continue with google|sign up with google/i.test(snapshot);
   }
@@ -354,11 +391,22 @@ export class AuthPage {
   }
 
   visibleSignupErrorText(snapshot: string): string | null {
-    return (
-      this.visibleUserFacingErrorText(snapshot) ??
-      snapshot.match(/passwords? do not match/i)?.[0] ??
-      null
-    );
+    const validationPatterns = [
+      /passwords? do not match/i,
+      /do not match/i,
+      /at least 6 character/i,
+      /uppercase/i,
+      /lowercase/i,
+      /one number/i,
+      /required/i,
+      /please enter/i,
+      /invalid/i,
+    ];
+    for (const pattern of validationPatterns) {
+      const match = snapshot.match(pattern);
+      if (match) return match[0];
+    }
+    return this.visibleUserFacingErrorText(snapshot);
   }
 
   appendExplorerSteps(repro: string[], nav?: AuthNavigationResult): void {

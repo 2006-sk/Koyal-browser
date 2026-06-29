@@ -45,8 +45,14 @@ export interface VerificationExpectation {
   urlIncludes?: string | RegExp;
   /** Text that must appear in snapshot (case-insensitive) */
   snapshotIncludes?: string[];
+  /** At least one of these must appear in snapshot */
+  snapshotIncludesAny?: string[];
+  /** URL must NOT match */
+  urlExcludes?: string | RegExp;
   /** Text that must NOT appear in snapshot */
   snapshotExcludes?: string[];
+  /** Fail if more than N unexpected 5xx API responses (excludes analytics/CDN) */
+  maxUnexpectedNetwork5xx?: number;
   /** Network filter passed to agent-browser network requests */
   networkFilter?: string;
   /** Expected HTTP status codes for filtered requests (e.g. [200], [401,404]) */
