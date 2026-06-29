@@ -1,13 +1,13 @@
-# Koyal Beta QA — Login flow (`logjn`)
+# Koyal Beta QA — Login flow (`login`)
 
 Automated QA for **beta.koyal.ai** auth flow (login, signup, forgot-password), using [agent-browser](https://github.com/vercel-labs/agent-browser).
 
-Run all commands from this folder (`logjn/`).
+Run all commands from this folder (`login/`).
 
 ## Setup
 
 ```bash
-cd logjn
+cd login
 npm install
 npx agent-browser install   # Downloads Chrome (requires network)
 cp .env.example .env          # Add test credentials
@@ -52,7 +52,7 @@ npm run discover
 
 ## Output
 
-Each run creates `logjn/reports/<timestamp>/` (or `reports/<timestamp>/` when run from this folder):
+Each run creates `reports/<timestamp>/` when run from this folder:
 
 - `report.md` — markdown table with verdicts and evidence links
 - `report.json` — machine-readable results
