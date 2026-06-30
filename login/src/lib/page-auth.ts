@@ -97,7 +97,8 @@ export class AuthPage {
 
     const result = await this.harness.run({
       action: 'open-forgot-password',
-      verify: () => isForgotPasswordRequestSnapshot(this.browser.snapshotInteractive()),
+      verify: () => isForgotPasswordRequestSnapshot(this.browser.snapshotInteractive()) ||
+        isForgotPasswordCodeSnapshot(this.browser.snapshotInteractive()),
       deterministic: () => {
         const snap = this.browser.snapshotInteractive();
         const forgotRef = refForInteractiveSnapshot(snap, authSelectors.login.forgotPassword);
@@ -125,11 +126,14 @@ export class AuthPage {
       },
       deterministic: () => {
         const snap = this.browser.snapshotInteractive();
+        if (isForgotPasswordCodeSnapshot(snap)) return;
+
         const emailRef = refForInteractiveSnapshot(snap, authSelectors.forgotPassword.emailField);
         const sendRef = refForInteractiveSnapshot(snap, authSelectors.forgotPassword.sendButton);
         if (!emailRef || !sendRef) throw new Error('Forgot-password request form not found');
         this.browser.fillVisible(emailRef, email);
         this.browser.clickVisible(sendRef);
+        this.browser.wait(2500);
       },
       exploreGoal: `On the forgot-password form, fill email with exactly "${email}" and click send reset (e.g. "Send new password"). Do not enter verification code yet.`,
     });
@@ -140,6 +144,8 @@ export class AuthPage {
     const result = await this.harness.run({
       action: 'complete-password-reset',
       verify: () => {
+        const url = this.browser.getUrl();
+        if (isPostAuthUrl(url)) return true;
         const snap = this.browser.snapshotInteractive();
         return (
           isLoginFormSnapshot(snap) ||
@@ -165,8 +171,10 @@ export class AuthPage {
 
         snap = this.browser.snapshotInteractive();
         const submitRef = this.firstRef(snap, authSelectors.forgotPassword.submitButton);
-        if (!submitRef) throw new Error('Password reset submit button not found');
-        this.browser.clickVisible(submitRef);
+        if (submitRef) {
+          this.browser.clickVisible(submitRef);
+          this.browser.wait(2500);
+        }
       },
       exploreGoal: `Complete password reset: enter verification code exactly "${code}", set new password exactly "${newPassword}" (confirm if required), then submit.`,
     });
