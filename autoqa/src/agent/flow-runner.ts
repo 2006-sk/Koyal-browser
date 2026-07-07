@@ -109,10 +109,24 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
   );
 }
 
+/** Rebuild flow position by replaying prior milestones' recipes from the entry. */
+async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): Promise<void> {
+  await navigateToEntry(deps, flow);
+  for (let j = 0; j < milestoneIndex; j++) {
+    const recipeId = `flow:${flow.id}:${flow.milestones[j].id}`;
+    if (!deps.player.has(recipeId)) continue;
+    await deps.player.tryReplay(recipeId, {
+      pageId: flow.milestones[j].guardPhases?.[0],
+      secrets: { email: deps.state.secrets.email, password: deps.state.secrets.password },
+    });
+  }
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
   milestone: FlowMilestone,
+  milestoneIndex: number,
   ctx: StepContext,
   authCtx: AuthContext,
 ): Promise<{ step: TestStep; marker?: string }> {
@@ -121,12 +135,13 @@ async function runMilestone(
   let pageId = currentPageId(deps);
 
   // guard-phase check: poll first (processing lag ≠ off-track — restarting a wizard
-  // from its entry mid-flow destroys the walk), then recover
+  // from its entry mid-flow destroys the walk), then recover by REBUILDING position
+  // (entry alone is not enough — probes/aborts can strand us anywhere)
   if (milestone.guardPhases?.length && !milestone.guardPhases.includes(pageId) && pageId !== 'unknown') {
     pageId = waitForGuardPhase(deps, milestone.guardPhases, 30000);
     if (!milestone.guardPhases.includes(pageId)) {
-      console.log(`[flow] off-track (on "${pageId}", expected ${milestone.guardPhases.join('/')}) — recovering`);
-      await navigateToEntry(deps, flow);
+      console.log(`[flow] off-track (on "${pageId}", expected ${milestone.guardPhases.join('/')}) — replaying up to this milestone`);
+      await replayUpTo(deps, flow, milestoneIndex);
     }
   }
 
@@ -333,7 +348,7 @@ export async function runFlows(
         }
 
         ctx.stepsToReproduce.push(milestone.goal);
-        const { step, marker } = await runMilestone(deps, flow, milestone, ctx, authCtx);
+        const { step, marker } = await runMilestone(deps, flow, milestone, mi, ctx, authCtx);
         scenario.steps.push(step);
         if (step.result.verdict === 'fail') {
           console.log(`[flow] ✗ ${flow.id} broken at ${milestone.id} — moving to next flow`);

@@ -57,18 +57,22 @@ export interface PageNode {
   lastSeenAt: string;
 }
 
+export interface WalkAction {
+  type: 'click' | 'fill' | 'upload' | 'wait-processing';
+  label?: string;
+  role?: string;
+  selector?: string;
+  assetPath?: string;
+  value?: string;
+}
+
 export interface WalkStep {
   index: number;
   pageId: string;
   kind: PageKind;
-  action?: {
-    type: 'click' | 'fill' | 'upload' | 'wait-processing';
-    label?: string;
-    role?: string;
-    selector?: string;
-    assetPath?: string;
-    value?: string;
-  };
+  /** primary action (display) — `actions` holds the full ordered sequence */
+  action?: WalkAction;
+  actions?: WalkAction[];
   /** literal on-page text, verified against a live snapshot before storing */
   landmark?: string;
   processingMs?: number;
@@ -187,13 +191,16 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
     if (isPlainPage(page) && page.urlPatterns.includes(normalized)) return page;
   }
 
-  // PASS 2: detection recipes (URL fragment and/or snapshot landmarks)
+  // PASS 2: detection recipes (URL fragment and/or snapshot landmarks).
+  // Plain pages are URL-addressable by definition — they may only match when the
+  // URL agrees. Snapshot-only matching is reserved for stateful kinds; otherwise
+  // one shared chrome landmark (site header) absorbs every page on the site.
   for (const page of Object.values(sitemap.pages)) {
     const det = page.detection;
     const urlOk = det.urlIncludes ? lowerUrl.includes(det.urlIncludes.toLowerCase()) : false;
     const snapOk = det.snapshotAnyOf.some((text) => lowerSnap.includes(text.toLowerCase()));
     if (det.urlIncludes && urlOk && (det.snapshotAnyOf.length === 0 || snapOk)) return page;
-    if (!det.urlIncludes && det.snapshotAnyOf.length > 0 && snapOk) return page;
+    if (!isPlainPage(page) && !det.urlIncludes && det.snapshotAnyOf.length > 0 && snapOk) return page;
   }
 
   return null;

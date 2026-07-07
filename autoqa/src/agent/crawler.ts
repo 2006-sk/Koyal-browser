@@ -56,20 +56,31 @@ function diffInventory(before: Inventory, sitemap: SiteMap): { added: string[]; 
   return { added, removedHint };
 }
 
-/** Same-origin hrefs from the full accessibility snapshot — free edges, no clicks. */
-function extractSameOriginLinks(snapshotFull: string, origin: string): string[] {
+/** Same-origin hrefs pulled from the live DOM — accessibility snapshots omit hrefs. */
+function extractSameOriginLinks(browser: AgentBrowser, origin: string): string[] {
   const urls = new Set<string>();
-  const re = /\/url:\s*(\S+)|link\s+"[^"]*"[^\n]*?:\s*(https?:\/\/\S+|\/[^\s"']*)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(snapshotFull))) {
-    const raw = (m[1] ?? m[2] ?? '').replace(/[),.'"]+$/, '');
-    if (!raw) continue;
-    try {
-      const url = new URL(raw, origin);
-      if (url.origin === origin) urls.add(url.href.split('#')[0]);
-    } catch {
-      // not a URL
+  try {
+    const stdout = browser.evalScript(`
+      (function() {
+        const out = new Set();
+        for (const a of document.querySelectorAll('a[href]')) {
+          const href = a.getAttribute('href');
+          if (href && !href.startsWith('#') && !href.startsWith('javascript:')) out.add(a.href);
+        }
+        return JSON.stringify([...out].slice(0, 100));
+      })();
+    `);
+    const match = stdout.match(/\[[\s\S]*\]/);
+    for (const raw of match ? (JSON.parse(match[0]) as string[]) : []) {
+      try {
+        const url = new URL(raw, origin);
+        if (url.origin === origin) urls.add(url.href.split('#')[0]);
+      } catch {
+        // not a URL
+      }
     }
+  } catch {
+    // eval unavailable — no free edges this page
   }
   return [...urls];
 }
@@ -101,7 +112,19 @@ export async function explore(
     }
   }
 
-  const queue: QueueItem[] = [{ url: origin, depth: 0 }];
+  // Seed with the CURRENT (post-auth) page first: many apps show the login form
+  // at the origin even with a valid session (no auth redirect), so re-opening the
+  // origin would discard the only authenticated doorway into the app.
+  const queue: QueueItem[] = [];
+  try {
+    const landing = browser.getUrl();
+    if (landing && new URL(landing).origin === origin && normalizePath(landing) !== '/') {
+      queue.push({ url: landing, depth: 0 });
+    }
+  } catch {
+    // no current page
+  }
+  queue.push({ url: origin, depth: 0 });
   for (const page of Object.values(state.sitemap.pages)) {
     for (const pattern of page.urlPatterns) {
       if (!pattern.includes(':id')) queue.push({ url: `${origin}${pattern}`, depth: 1 });
@@ -154,17 +177,17 @@ export async function explore(
     const page = await identifyCurrentPage();
     pagesVisited++;
 
-    // free edges from hrefs
-    const fullSnap = browser.snapshotFull();
-    for (const href of extractSameOriginLinks(fullSnap, origin)) {
+    // free edges from live-DOM hrefs
+    for (const href of extractSameOriginLinks(browser, origin)) {
       const hrefNorm = normalizePath(href);
       if (!visitedThisRun.has(hrefNorm)) queue.push({ url: href, depth: item.depth + 1 });
     }
 
-    // click probes for SPA nav (buttons without hrefs) — nav-tagged only, never destructive/submit/upload
-    const probeTargets = page.interactives
-      .filter((el) => el.category === 'nav' && !el.probed)
-      .slice(0, probesPerPage);
+    // click probes for SPA nav (buttons/links without hrefs): nav-tagged first,
+    // then unknown-tagged as fallback — never destructive/submit/upload
+    const navTargets = page.interactives.filter((el) => el.category === 'nav' && !el.probed);
+    const unknownTargets = page.interactives.filter((el) => el.category === 'unknown' && !el.probed);
+    const probeTargets = [...navTargets, ...unknownTargets].slice(0, probesPerPage);
 
     for (const el of probeTargets) {
       el.probed = true;
@@ -222,7 +245,8 @@ export async function explore(
       const pattern = page.urlPatterns.find((u) => !u.includes(':id'));
       if (!pattern) continue;
       for (const el of page.interactives) {
-        if (el.category !== 'create' && el.category !== 'upload') continue;
+        const checkoutish = el.category === 'submit' && /check ?out|place order|start|begin/i.test(el.label);
+        if (el.category !== 'create' && el.category !== 'upload' && !checkoutish) continue;
         // wizard states resumed by direct URL need the fresh entry chain that
         // originally discovered them (e.g. projects → "Create …" → fork)
         let via: DeepWalkEntry['via'];

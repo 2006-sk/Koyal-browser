@@ -16,6 +16,7 @@ import {
   type FlowMilestone,
   type PageInteractive,
   type PageNode,
+  type WalkAction,
   type WalkStep,
   type WalkTrail,
 } from './sitemap.js';
@@ -78,22 +79,25 @@ function verifiedLandmark(page: PageNode, snapshot: string): string | undefined 
   return page.detection.snapshotAnyOf.find((t) => lower.includes(t.toLowerCase()));
 }
 
-function summarizeActions(explored: ExplorerResult): WalkStep['action'] | undefined {
-  // most meaningful action wins: upload > fill > click
-  const upload = explored.actions.find((a) => a.action === 'upload' && a.uploadedPath);
-  if (upload) {
-    return { type: 'upload', assetPath: upload.uploadedPath, selector: upload.selector };
+/** Full ordered sequence of meaningful actions from one explorer goal. */
+function collectActions(explored: ExplorerResult): WalkAction[] {
+  const out: WalkAction[] = [];
+  for (const a of explored.actions) {
+    if (a.action === 'upload' && a.uploadedPath) {
+      out.push({ type: 'upload', assetPath: a.uploadedPath, selector: a.selector });
+    } else if (a.action === 'fill' && a.resolvedLabel && a.value !== undefined) {
+      out.push({ type: 'fill', label: a.resolvedLabel, value: a.value });
+    } else if (a.action === 'click' && a.resolvedLabel) {
+      out.push({ type: 'click', label: a.resolvedLabel, role: a.resolvedRole });
+    }
   }
-  const fill = explored.actions.find((a) => a.action === 'fill' && a.resolvedLabel);
-  if (fill) {
-    return { type: 'fill', label: fill.resolvedLabel, value: fill.value };
-  }
-  const clicks = explored.actions.filter((a) => a.action === 'click' && a.resolvedLabel);
-  const click = clicks[clicks.length - 1];
-  if (click) {
-    return { type: 'click', label: click.resolvedLabel, role: click.resolvedRole };
-  }
-  return undefined;
+  return out;
+}
+
+function summarizeActions(explored: ExplorerResult): WalkAction | undefined {
+  const all = collectActions(explored);
+  // most meaningful action wins for the display summary: upload > fill > last click
+  return all.find((a) => a.type === 'upload') ?? all.find((a) => a.type === 'fill') ?? all[all.length - 1];
 }
 
 /**
@@ -357,6 +361,7 @@ export async function deepWalk(
         kind,
         landmark,
         action: summarizeActions(explored),
+        actions: collectActions(explored),
       });
       prev = { page, snapshot };
     }
@@ -453,7 +458,8 @@ export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
       id: `m${i + 1}`,
       goal:
         `On "${page?.title ?? step.pageId}": ${actionDesc}, then advance one screen` +
-        (target?.landmark ? ` until "${target.landmark}" is visible.` : '.'),
+        (target?.landmark ? ` until "${target.landmark}" is visible.` : '.') +
+        ' If this action appears already done (the control now shows Remove/Undo/Added or is missing), skip it and just advance.',
       kind,
       successHint: target?.landmark,
       guardPhases: [step.pageId],
@@ -495,15 +501,16 @@ export function recordWalkRecipes(state: SiteState, flow: Flow, trail: WalkTrail
     if (!step?.action) continue;
 
     const recipeSteps: RecipeStep[] = [];
-    if (step.action.type === 'click' && step.action.label) {
-      recipeSteps.push({ kind: 'click', label: step.action.label, role: step.action.role });
-    } else if (step.action.type === 'fill' && step.action.label && step.action.value) {
-      recipeSteps.push({ kind: 'fill', hint: step.action.label, value: step.action.value });
-    } else if (step.action.type === 'upload' && step.action.assetPath) {
-      recipeSteps.push({ kind: 'upload', assetPath: step.action.assetPath, selector: step.action.selector });
-    } else {
-      continue;
+    for (const action of step.actions?.length ? step.actions : [step.action]) {
+      if (action.type === 'click' && action.label) {
+        recipeSteps.push({ kind: 'click', label: action.label, role: action.role });
+      } else if (action.type === 'fill' && action.label && action.value) {
+        recipeSteps.push({ kind: 'fill', hint: action.label, value: action.value });
+      } else if (action.type === 'upload' && action.assetPath) {
+        recipeSteps.push({ kind: 'upload', assetPath: action.assetPath, selector: action.selector });
+      }
     }
+    if (recipeSteps.length === 0) continue;
 
     if (milestone.successHint) {
       recipeSteps.push({
