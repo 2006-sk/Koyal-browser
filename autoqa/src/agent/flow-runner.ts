@@ -69,7 +69,7 @@ function waitForGuardPhase(deps: FlowRunnerDeps, phases: string[], maxMs: number
 
 /** Only literal-looking hints are snapshot-matched; prose descriptions would never appear on the page. */
 function isLiteralHint(hint: string): boolean {
-  return hint.length <= 60 && !/[()]/.test(hint) && hint.split(/\s+/).length <= 8;
+  return hint.length <= 120 && !/[()]/.test(hint) && hint.split(/\s+/).length <= 16;
 }
 
 function baseExpectationFor(milestone: FlowMilestone): VerificationExpectation {
@@ -134,10 +134,11 @@ async function runMilestone(
   const verification = ctx.verification;
   const before = await verification.captureSignals();
 
-  // fill in run-unique edit markers so edits are real and verifiable
+  // fill in run-unique edit markers so edits are real and verifiable — only for
+  // explicit edit milestones (a 'create' click may involve no text field at all)
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' || milestone.kind === 'create') {
+  if (milestone.kind === 'edit') {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   }
@@ -314,7 +315,23 @@ export async function runFlows(
         stepCtx: ctx,
       };
 
-      for (const milestone of flow.milestones) {
+      for (let mi = 0; mi < flow.milestones.length; mi++) {
+        const milestone = flow.milestones[mi];
+
+        // wizard drafts can resume mid-flow: if we're already on a LATER
+        // milestone's page, fast-forward instead of failing the earlier ones
+        const hereId = currentPageId(deps);
+        const aheadIdx = flow.milestones.findIndex(
+          (m, j) => j > mi && m.guardPhases?.includes(hereId),
+        );
+        if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
+          console.log(
+            `[flow] resumed mid-wizard on "${hereId}" — fast-forwarding ${aheadIdx - mi} milestone(s)`,
+          );
+          mi = aheadIdx - 1;
+          continue;
+        }
+
         ctx.stepsToReproduce.push(milestone.goal);
         const { step, marker } = await runMilestone(deps, flow, milestone, ctx, authCtx);
         scenario.steps.push(step);
