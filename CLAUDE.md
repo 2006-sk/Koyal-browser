@@ -69,7 +69,7 @@ Login page defaults to Sign Up — click "Log In" toggle, submit is "Start Creat
 
 ## Validation results
 - **saucedemo.com**: full autonomy proven — login learned, store mapped (after crawl fixes), checkout deep-walked to terminal "Thank you for your order!" twice, final test **7 PASS / 0 FAIL / 0 NEEDS-REVIEW, 9 LLM calls** (recipes did the work). Legit findings: checkout state lost on abandon; back/forward quirks at the fork.
-- **beta.koyal.ai**: script wizard mapped end-to-end from zero (9 states, kinds+landmarks+option groups), flows auto-generated + tested with probes (story-type matrix, marker persistence). Audio branch traversed. A final full wipe→autonomous run was IN FLIGHT at session end — check `/tmp/autoqa-koyal-final.log` + `.autoqa-state/beta.koyal.ai/` for its outcome.
+- **beta.koyal.ai**: script wizard mapped end-to-end from zero (9 states, kinds+landmarks+option groups), flows auto-generated + tested with probes (story-type matrix, marker persistence). Audio branch traversed. The final autonomous run was SHUT DOWN by the user mid-flight (after commit ddf957f fixed the proposal-truncation fatal): state has 9 pages + 2 walks + 0 approved flows. TO RESUME: `npx tsx src/cli.ts run --url https://beta.koyal.ai --deep-flows 2 --budget 250` (it will re-explore because no flows are approved, walk the remaining fork branches incl. audio, propose+approve, then test) with a watcher on `.autoqa-state/beta.koyal.ai/inbox/`.
 
 ## Known rough edges / next steps
 - Draft contention on Koyal still causes recovery churn on repeated runs (fresh-project-per-run strategy is the fix).
