@@ -23,14 +23,29 @@ export class ScriptNavigator {
   }
 
   async explore(goal: string, maxSteps?: number): Promise<ExploreRecord> {
-    this.browser.clearSignals();
-    const result = await this.explorer.achieveGoal(goal, {
-      maxSteps: maxSteps ?? config.llm.maxStepsPerGoal,
-    });
-    for (const step of result.stepsTaken) {
-      this.explorerLog.push(`[LLM] ${step}`);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        this.browser.clearSignals();
+        const result = await this.explorer.achieveGoal(goal, {
+          maxSteps: maxSteps ?? config.llm.maxStepsPerGoal,
+        });
+        for (const step of result.stepsTaken) {
+          this.explorerLog.push(`[LLM] ${step}`);
+        }
+        return { goal, result, ok: result.success };
+      } catch (error) {
+        lastError = error;
+        const msg = error instanceof Error ? error.message : String(error);
+        if (attempt < 2 && /fetch failed|EPIPE|ECONNRESET|timed out/i.test(msg)) {
+          console.warn(`[explorer] LLM error, retrying: ${msg}`);
+          this.browser.wait(3000);
+          continue;
+        }
+        throw error;
+      }
     }
-    return { goal, result, ok: result.success };
+    throw lastError;
   }
 
   phase(): ScriptPhase {
@@ -39,7 +54,16 @@ export class ScriptNavigator {
 
   async waitForPhase(phases: ScriptPhase[], maxMs: number, pollMs = 3000): Promise<ScriptPhase> {
     const deadline = Date.now() + maxMs;
+    let lastRecovery = 0;
     while (Date.now() < deadline) {
+      const url = this.browser.getUrl();
+      const lost =
+        /about:blank/i.test(url) ||
+        (this.phase() === 'unknown' && !this.wizard.isOnWizard() && Date.now() - lastRecovery > 20_000);
+      if (lost && Date.now() - lastRecovery > 10_000) {
+        await this.recoverFromBlankOrLost();
+        lastRecovery = Date.now();
+      }
       const phase = this.phase();
       if (phases.includes(phase)) return phase;
       this.browser.wait(pollMs);
@@ -47,33 +71,199 @@ export class ScriptNavigator {
     return this.phase();
   }
 
+  /** Re-open in-progress project when browser tab is blank or wizard was lost. */
+  async recoverFromBlankOrLost(): Promise<boolean> {
+    const url = this.browser.getUrl();
+    if (!/about:blank/i.test(url) && this.wizard.isOnWizard()) return true;
+
+    const base = config.baseUrl.replace(/\/$/, '');
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        this.browser.open(`${base}${config.paths.projects}`);
+        this.browser.wait(3000);
+      } catch {
+        this.browser.wait(2000);
+        continue;
+      }
+      if (/about:blank/i.test(this.browser.getUrl())) continue;
+
+      const snap = this.browser.snapshotInteractive();
+      const resume =
+        refForInteractiveSnapshot(snap, /Continue|Resume|In Progress/i) ??
+        refForInteractiveSnapshot(snap, /button "Open"/i);
+      if (resume) {
+        this.wizard.safeClick(resume);
+        this.browser.wait(4000);
+        if (this.wizard.isOnWizard()) return true;
+      }
+
+      const card = refForInteractiveSnapshot(snap, /project card|Create Your Next Video/i);
+      if (card && !/create your next video/i.test(snap)) {
+        this.wizard.safeClick(card);
+        this.browser.wait(4000);
+        if (this.wizard.isOnWizard()) return true;
+      }
+
+      const explore = await this.recoverWizardIfLost();
+      if (explore?.ok || this.wizard.isOnWizard()) return true;
+    }
+    return this.wizard.isOnWizard();
+  }
+
   openUploadFork(): void {
     const base = config.baseUrl.replace(/\/$/, '');
-    this.browser.open(`${base}${config.paths.upload}`);
-    this.browser.wait(2500);
+    const uploadUrl = `${base}${config.paths.upload}`;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        this.browser.open(uploadUrl);
+        this.browser.wait(3000);
+        const url = this.browser.getUrl();
+        if (!/about:blank/i.test(url)) return;
+      } catch {
+        // retry
+      }
+      this.browser.wait(2000 * attempt);
+    }
+    throw new Error(`Could not open upload fork (url=${this.browser.getUrl()})`);
   }
 
   uploadScriptFile(filePath: string): void {
-    this.browser.clearSignals();
-    try {
-      this.browser.upload('#script-file-input', filePath);
-    } catch {
-      this.browser.upload('input[type=file]', filePath);
-    }
-    this.browser.wait(5000);
+    this.wizard.uploadScriptFile(filePath);
   }
 
   clickNextIfEnabled(): boolean {
     return this.wizard.clickNext();
   }
 
-  async waitUntilNextEnabled(maxMs = 120_000): Promise<void> {
-    const deadline = Date.now() + maxMs;
-    while (Date.now() < deadline) {
-      const snap = this.browser.snapshotInteractive();
-      if (refForEnabledButton(snap, 'Next')) return;
-      this.browser.wait(3000);
+  async waitUntilNextEnabled(maxMs = config.scriptProcessingWaitMs): Promise<void> {
+    this.wizard.waitForNextEnabled(maxMs);
+  }
+
+  async waitForScriptEditIdle(maxMs = config.scriptProcessingWaitMs): Promise<void> {
+    try {
+      this.wizard.waitForScriptEditIdle(maxMs);
+    } catch {
+      // May already be past script edit
     }
+  }
+
+  /** Return to script edit from any wizard step (e.g. after character probe). */
+  async ensureOnScriptEdit(): Promise<boolean> {
+    if (this.phase() === 'script-edit') {
+      try {
+        await this.waitForScriptEditIdle(60_000);
+      } catch {
+        // already idle enough
+      }
+      return true;
+    }
+    if (!(await this.resetToConceptDriven())) return false;
+    await this.waitForScriptEditReady(config.scriptProcessingWaitMs);
+    await this.waitForScriptEditIdle(config.scriptProcessingWaitMs);
+    return this.phase() === 'script-edit';
+  }
+
+  /** Mechanical advance script edit → theme; LLM only if needed. */
+  async advanceFromScriptEdit(): Promise<ExploreRecord | null> {
+    if (!(await this.ensureOnScriptEdit())) {
+      return this.explore(
+        `Get to Edit Script with Next enabled, then click Next to reach Theme. Mark done on Theme step.`,
+        8,
+      );
+    }
+    this.wizard.dismissOverlays();
+    if (this.wizard.advanceToTheme()) {
+      return null;
+    }
+    return this.explore(
+      `On Edit Script: click Next when enabled to reach Theme (Story Theme). ` +
+        `If Next is disabled, wait. Use sidebar Theme if needed. Mark done on Theme step.`,
+      8,
+    );
+  }
+
+  /** Mechanical theme → style; LLM fallback. */
+  async advanceFromTheme(): Promise<ExploreRecord | null> {
+    this.wizard.dismissOverlays();
+    this.wizard.dismissEditPanels();
+    await this.waitUntilNextEnabled(config.scriptProcessingWaitMs);
+    this.wizard.dismissOverlays();
+    if (this.wizard.advanceToStyle()) {
+      return null;
+    }
+    return this.explore(
+      `On Story Theme: dismiss any Create New Theme dialog (×). Click Next when enabled. Mark done on Style (Choose art style).`,
+      6,
+    );
+  }
+
+  /** Mechanical style step; LLM fallback. */
+  async completeStyleStep(): Promise<ExploreRecord | null> {
+    this.wizard.dismissCreditModal();
+    if (this.wizard.completeStyleAndAdvance()) {
+      return null;
+    }
+    return this.explore(
+      `On Style: select Realistic and Landscape. Dismiss credit modal (×). ` +
+        `Click Next when enabled. Mark done on Edit scenes or Locations.`,
+      10,
+    );
+  }
+
+  /** Mechanical scene edit + create video; LLM fallback. */
+  async editSceneAndCreateVideo(sceneEditHint: string): Promise<ExploreRecord | null> {
+    this.wizard.dismissOverlays();
+    this.wizard.dismissEditPanels();
+    try {
+      this.wizard.waitForCreateVideoReady();
+      this.wizard.clickCreateVideo();
+      await this.waitForPhase(['final-video'], config.sceneWaitMs, 5000);
+      if (this.phase() === 'final-video') return null;
+    } catch {
+      // fall through to LLM
+    }
+    return this.explore(
+      `Dismiss blocking panels (Close, Cancel, credit ×). On Edit scenes: edit description to include "${sceneEditHint}". ` +
+        `When Create Video is enabled, click it. Mark done on Final video.`,
+      12,
+    );
+  }
+
+  /** Wait for final video UI; LLM for optional controls. */
+  async completeFinalVideo(): Promise<ExploreRecord | null> {
+    try {
+      this.wizard.waitForDownloadReady();
+      return null;
+    } catch {
+      return this.explore(
+        `On Final video: wait for Download Video or Generating Video. ` +
+          `Try Edit Video / Export XML if visible. Mark done when download or preview is shown.`,
+        10,
+      );
+    }
+  }
+
+  /** Mechanical story-type round trip without full re-process when possible. */
+  async goBackToStoryTypeAndReturn(): Promise<ExploreRecord | null> {
+    const phase = this.phase();
+    if (phase === 'script-edit') {
+      const snap = this.browser.snapshotInteractive();
+      const back = refForInteractiveSnapshot(snap, /Go back to Story Type/i);
+      if (back) {
+        this.wizard.safeClick(back);
+        this.browser.wait(2500);
+        if (await this.completeStoryTypeConcept()) {
+          await this.waitForScriptEditReady();
+          await this.waitForScriptEditIdle();
+          if (this.phase() === 'script-edit') return null;
+        }
+      }
+    }
+    return this.explore(
+      `From script edit: click "Go back to Story Type Selection" OR sidebar Story Type (not Dashboard). ` +
+        `Select Concept Driven, click Next. Mark done when Edit Script is visible with Next enabled.`,
+      12,
+    );
   }
 
   async waitUntilCreateVideoEnabled(maxMs = config.sceneWaitMs): Promise<void> {
@@ -87,6 +277,14 @@ export class ScriptNavigator {
 
   async recoverWizardIfLost(): Promise<ExploreRecord | null> {
     const url = this.browser.getUrl();
+    if (/about:blank/i.test(url)) {
+      const ok = await this.recoverFromBlankOrLost();
+      return ok ? null : this.explore(
+        `Browser tab is blank. Open projects, resume the in-progress script video wizard. ` +
+          `Mark done on Edit scenes, Style, or script wizard with sidebar visible.`,
+        10,
+      );
+    }
     const phase = this.phase();
     if (phase !== 'app-shell' && this.wizard.isOnWizard()) return null;
     if (!/\/(dashboard|projects|project\/)/i.test(url) && phase !== 'app-shell') return null;
@@ -101,20 +299,35 @@ export class ScriptNavigator {
 
   /** After plan: click Next on upload until Story Type appears. */
   async advanceUploadToStoryType(): Promise<boolean> {
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 8; i++) {
+      this.wizard.dismissOverlays();
       const phase = this.phase();
-      if (phase === 'story-type' || this.snapIncludes('concept driven or character driven')) {
+      if (phase === 'story-type' || this.snapIncludes('Concept Driven', 'Character Driven')) {
         return true;
       }
-      // Lost wizard — reopen script path
+
       if (phase === 'upload-fork') {
-        await this.startWithScript();
+        if (!this.wizard.startWithScript()) {
+          await this.startWithScript();
+        }
         this.browser.wait(2000);
         continue;
       }
 
-      const snap = this.browser.snapshotInteractive();
-      if (refForEnabledButton(snap, 'Next') && this.wizard.clickNext()) {
+      // Sidebar Story Type works once file is uploaded (more reliable than Next through modals)
+      if (
+        this.snapIncludes('Upload Your Script', 'Upload file', 'Choose PDF') &&
+        this.snapIncludes('Story Type')
+      ) {
+        if (this.wizard.clickSidebarStep('Story Type')) {
+          this.browser.wait(3000);
+          if (this.phase() === 'story-type' || this.snapIncludes('Concept Driven', 'Character Driven')) {
+            return true;
+          }
+        }
+      }
+
+      if (this.wizard.clickNextRobust()) {
         this.browser.wait(3000);
         if (this.phase() === 'story-type' || this.snapIncludes('Concept Driven', 'Character Driven')) {
           return true;
@@ -267,10 +480,12 @@ export class ScriptNavigator {
     return true;
   }
 
-  async startWithScript(): Promise<ExploreRecord> {
+  async startWithScript(): Promise<ExploreRecord | null> {
+    if (this.wizard.startWithScript()) return null;
     return this.explore(
       `On the upload start page ("How would you like to start?"), click Start with Script (not audio). ` +
         `Mark done when script upload UI is visible (Upload Your Script, PDF picker, or file input).`,
+      6,
     );
   }
 
@@ -330,7 +545,8 @@ export class ScriptNavigator {
     return this.phase();
   }
 
-  async advanceFromScriptEdit(): Promise<ExploreRecord> {
+
+  async advanceFromScriptEditLlm(): Promise<ExploreRecord> {
     return this.explore(
       `On Edit Script / script review: optionally click Play audio. Click Next when enabled to proceed to Theme. ` +
         `Do not get stuck on emotion tags. Mark done on Theme step (Story Theme visible).`,
@@ -346,22 +562,6 @@ export class ScriptNavigator {
     );
   }
 
-  async advanceFromTheme(): Promise<ExploreRecord> {
-    return this.explore(
-      `On Story Theme: click Edit Text or Describe New Theme if you need to edit fields. ` +
-        `Click Next when enabled. Mark done on Style step (Choose art style).`,
-    );
-  }
-
-  async completeStyleStep(): Promise<ExploreRecord> {
-    return this.explore(
-      `On Style: select Realistic art style and Landscape aspect ratio. ` +
-        `Dismiss any credit package modal (click × or close). Click Next when enabled. ` +
-        `Mark done on Locations or Edit scenes.`,
-      12,
-    );
-  }
-
   async advanceFromLocations(): Promise<ExploreRecord> {
     return this.explore(
       `On Locations step (if shown): optionally click Add New Location, then click Next when enabled. ` +
@@ -370,47 +570,11 @@ export class ScriptNavigator {
     );
   }
 
-  async editSceneAndCreateVideo(sceneEditHint: string): Promise<ExploreRecord> {
-    this.wizard.dismissOverlays();
-    return this.explore(
-      `Dismiss any blocking modal first (credit package ×, "Taking longer" — click × or Escape). ` +
-        `On Edit scenes: click a scene card. Edit description to include: "${sceneEditHint}". ` +
-        `Try Retake or Reframe if visible. When Create Video is enabled, click it. Mark done on Final video.`,
-      15,
-    );
-  }
-
-  async completeFinalVideo(): Promise<ExploreRecord> {
-    return this.explore(
-      `On Final video: try Edit Video, Export XML, captions toggle if visible. ` +
-        `Add an edit note if Edit field is available. Wait for Download Video to become enabled if rendering. ` +
-        `Mark done when Download Video is clickable or preview shots are visible.`,
-      12,
-    );
-  }
-
   async sidebarRoundTrip(): Promise<ExploreRecord> {
     return this.explore(
       `Use wizard sidebar to visit each step: Upload file, Story Type, Review transcript, Theme, Style, Edit scenes, Final video. ` +
         `Click each sidebar label if reachable. Verify no crash. Mark done after visiting Final video.`,
       18,
-    );
-  }
-
-  async goBackToStoryTypeAndReturn(): Promise<ExploreRecord> {
-    const phase = this.phase();
-    if (phase === 'script-edit') {
-      return this.explore(
-        `Click "Go back to Story Type Selection" if visible. On Story Type, select Concept Driven, click Next. ` +
-          `Mark done when Edit Script is visible again.`,
-        12,
-      );
-    }
-    this.wizard.dismissOverlays();
-    return this.explore(
-      `Use wizard sidebar: click "Story Type" (NOT Dashboard). Dismiss overlays first (×, Escape). ` +
-        `On Story Type select Concept Driven and click Next. Mark done when Edit Script or Review transcript is visible.`,
-      12,
     );
   }
 

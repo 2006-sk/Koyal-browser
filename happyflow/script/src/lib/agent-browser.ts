@@ -94,12 +94,17 @@ export class AgentBrowser {
   }
 
   open(url: string): string {
-    const { stdout, exitCode, stderr } = this.run(['open', url]);
-    if (exitCode !== 0) {
-      throw new Error(`agent-browser open failed: ${stderr || stdout}`);
+    let lastError = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const { stdout, exitCode, stderr } = this.run(['open', url], { timeoutMs: 90_000 });
+      if (exitCode === 0) {
+        this.ensureCursorOverlay();
+        return stdout;
+      }
+      lastError = stderr || stdout;
+      this.wait(2000 * attempt);
     }
-    this.ensureCursorOverlay();
-    return stdout;
+    throw new Error(`agent-browser open failed: ${lastError}`);
   }
 
   close(): void {

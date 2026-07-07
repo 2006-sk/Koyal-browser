@@ -14,6 +14,8 @@ import {
 import { AgentBrowser } from '../lib/agent-browser.js';
 import { SessionPage } from '../lib/page-session.js';
 import { ScriptNavigator } from '../lib/script-navigator.js';
+import { ScriptNav, waitUntil } from '../lib/script-nav.js';
+import { isFinalVideoVisible } from '../lib/script-selectors.js';
 import { assertNoStepFailures, probeStep, STEP_BASE } from '../lib/script-scenario-helpers.js';
 import type { StepContext } from '../lib/scenario-runner.js';
 import type { ScenarioResult, TestStep } from '../lib/types.js';
@@ -38,6 +40,7 @@ export async function runScriptCompleteFlow(
   const steps: TestStep[] = [];
   const session = new SessionPage(browser);
   const nav = new ScriptNavigator(browser);
+  const uiNav = new ScriptNav(browser);
   const verification = new VerificationLayer(browser);
   const repro: string[] = [];
   const ctx = (): StepContext => ({ browser, verification, evidenceDir, stepsToReproduce: repro });
@@ -56,18 +59,19 @@ export async function runScriptCompleteFlow(
   const forkExplore = await nav.startWithScript();
   steps.push(
     await probeStep(
-      ctx(), repro, 'upload-fork', 'Start with Script (LLM)', 'Script upload UI',
+      ctx(), repro, 'upload-fork', 'Start with Script', 'Script upload UI',
       {
         description: 'Script upload fork',
         urlIncludes: '/upload',
-        snapshotIncludesAny: ['Upload Your Script', 'Upload file', 'script', 'PDF'],
+        snapshotIncludesAny: ['Upload Your Script', 'Choose PDF', 'How would you like to start'],
         ...STEP_BASE,
       },
       undefined,
-      undefined,
-      forkExplore,
+      30_000,
+      forkExplore ?? undefined,
     ),
   );
+  assertNoStepFailures(steps, options.scenarioId);
 
   // ── FILE UPLOAD (mechanical) ──────────────────────────────────
   nav.uploadScriptFile(options.scriptPath);
@@ -104,9 +108,17 @@ export async function runScriptCompleteFlow(
     );
   }
 
-  // Click Next once right after plan — no overlay dismiss (Escape/× closes wizard)
-  nav.wizard.clickNext();
-  browser.wait(3000);
+  // Advance past upload — dismiss bug modal, sidebar Story Type, then Next
+  for (let i = 0; i < 6; i++) {
+    nav.wizard.dismissOverlays();
+    if (nav.phase() === 'story-type' || nav.snapIncludes('Concept Driven', 'Character Driven')) break;
+    if (nav.wizard.clickSidebarStep('Story Type')) {
+      browser.wait(3000);
+      if (nav.phase() === 'story-type' || nav.snapIncludes('Concept Driven', 'Character Driven')) break;
+    }
+    nav.wizard.clickNextRobust();
+    browser.wait(3000);
+  }
 
   await nav.recoverWizardIfLost();
 
@@ -191,9 +203,9 @@ export async function runScriptCompleteFlow(
     ),
   );
 
-  // Optional: probe random character via sidebar (non-blocking)
+  // Optional: probe random character — always restore script edit afterward
   if (options.tryRandomCharacter !== false) {
-    const charOk = await nav.probeRandomCharacter(character.name, character.description);
+    await nav.probeRandomCharacter(character.name, character.description);
     steps.push(
       await probeStep(
         ctx(), repro, 'random-character-probe', `Probe character ${character.tag}`, 'Character UI explored',
@@ -206,13 +218,11 @@ export async function runScriptCompleteFlow(
         60_000,
       ),
     );
-    if (!charOk) {
-      await nav.resetToConceptDriven();
-      await nav.waitForScriptEditReady(120_000);
-    }
+    await nav.ensureOnScriptEdit();
   }
 
-  // Mechanical edit, LLM fallback — only when on script edit
+  // Mechanical edit on script edit — LLM fallback
+  await nav.ensureOnScriptEdit();
   let dialogueResult = editScriptDialogue(browser, transcriptEdit);
   if (!dialogueResult.ok) {
     const llmEdit = await nav.editFieldViaLlm('dialogue line', transcriptEdit);
@@ -222,13 +232,14 @@ export async function runScriptCompleteFlow(
     };
   }
 
-  await nav.explore('Click Play audio on any dialogue line if visible. Mark done when clicked or not available.', 4);
+  uiNav.click({ label: 'Play audio', optional: true });
 
   steps.push(
     await probeStep(
       ctx(), repro, 'script-dialogue-edit', 'Edit script dialogue', 'Edited text visible',
       {
         description: 'Script dialogue edit',
+        urlIncludes: '/scriptEdit',
         snapshotIncludesAny: [transcriptEdit.slice(0, 18), 'QA script line'],
         ...STEP_BASE,
       },
@@ -249,9 +260,11 @@ export async function runScriptCompleteFlow(
         },
         undefined,
         config.scriptProcessingWaitMs,
-        backExplore,
+        backExplore ?? undefined,
       ),
     );
+
+    await nav.waitForScriptEditIdle(config.scriptProcessingWaitMs);
 
     nav.browserHistoryProbe();
     steps.push(
@@ -267,7 +280,7 @@ export async function runScriptCompleteFlow(
     );
   }
 
-  await nav.waitUntilNextEnabled(config.scriptProcessingWaitMs);
+  await nav.waitForScriptEditIdle(config.scriptProcessingWaitMs);
   const advanceEdit = await nav.advanceFromScriptEdit();
   steps.push(
     await probeStep(
@@ -279,13 +292,14 @@ export async function runScriptCompleteFlow(
       },
       undefined,
       60_000,
-      advanceEdit,
+      advanceEdit ?? undefined,
     ),
   );
 
   // ── THEME EDITS ───────────────────────────────────────────────
   await nav.waitForPhase(['theme', 'style'], 60_000);
-  await nav.explore('Click Edit Text or Describe New Theme if those buttons are visible.', 4);
+  uiNav.click({ label: 'Describe new theme', optional: true });
+  uiNav.click({ label: 'Edit Text', optional: true });
 
   let themeEdits = editThemeFields(browser, themeVisual, themeNarrative);
   if (!themeEdits.visual.ok) {
@@ -295,6 +309,8 @@ export async function runScriptCompleteFlow(
     await nav.editFieldViaLlm('Visual Narrative', themeNarrative);
   }
   themeEdits = editThemeFields(browser, themeVisual, themeNarrative);
+  uiNav.dismissOverlays();
+  nav.wizard.dismissOverlays();
 
   steps.push(
     await probeStep(
@@ -318,7 +334,7 @@ export async function runScriptCompleteFlow(
       },
       undefined,
       60_000,
-      themeAdvance,
+      themeAdvance ?? undefined,
     ),
   );
 
@@ -326,7 +342,7 @@ export async function runScriptCompleteFlow(
   const styleExplore = await nav.completeStyleStep();
   steps.push(
     await probeStep(
-      ctx(), repro, 'style-complete', 'Style + dismiss credits (LLM)', 'Past style',
+      ctx(), repro, 'style-complete', 'Style + dismiss credits', 'Past style',
       {
         description: 'Style step',
         snapshotIncludesAny: ['Edit scenes', 'Create Video', 'Location', 'editscene'],
@@ -334,9 +350,14 @@ export async function runScriptCompleteFlow(
       },
       undefined,
       config.sceneWaitMs,
-      styleExplore,
+      styleExplore ?? undefined,
     ),
   );
+
+  if (!['edit-scenes', 'final-video', 'locations'].includes(nav.phase())) {
+    nav.wizard.clickSidebarStep('Edit scenes');
+    nav.wizard.clickNextRobust();
+  }
 
   // ── LOCATIONS (optional) ──────────────────────────────────────
   if (nav.phase() === 'locations') {
@@ -357,23 +378,59 @@ export async function runScriptCompleteFlow(
   }
 
   // ── EDIT SCENES ───────────────────────────────────────────────
-  await nav.waitForPhase(['edit-scenes', 'final-video'], config.sceneWaitMs, 5000);
+  await nav.recoverFromBlankOrLost();
+  await nav.waitForPhase(['edit-scenes', 'final-video', 'locations'], config.sceneWaitMs, 5000);
   nav.wizard.dismissOverlays();
+
+  if (nav.phase() === 'locations') {
+    uiNav.click({ label: 'Add New Location', optional: true });
+    nav.wizard.clickNext();
+    await nav.waitForPhase(['edit-scenes', 'final-video'], config.sceneWaitMs, 5000);
+  }
+
+  nav.wizard.dismissEditPanels();
 
   let sceneResult = editSceneDescription(browser, sceneEdit);
   if (!sceneResult.ok) {
     await nav.editFieldViaLlm('scene description', sceneEdit);
   }
+  uiNav.click({ label: 'Submit Edit', optional: true });
+  uiNav.click({ label: 'Retake', optional: true });
+  uiNav.click({ label: 'Reframe', optional: true });
 
-  await nav.waitUntilCreateVideoEnabled();
-  nav.wizard.clickNext(); // dismiss any open edit panel
-  browser.evalScript(`document.body.click()`);
-  browser.wait(500);
-
-  const sceneExplore = await nav.editSceneAndCreateVideo(sceneEdit.slice(0, 30));
   steps.push(
     await probeStep(
-      ctx(), repro, 'scene-edit-create', 'Scene edit + Create Video (LLM)', 'Final video',
+      ctx(), repro, 'scene-edit', 'Edit scene description', 'QA marker visible',
+      {
+        description: 'Scene description edit',
+        snapshotIncludesAny: [sceneEdit.slice(0, 16), 'Create Video', 'Edit scenes'],
+        ...STEP_BASE,
+      },
+    ),
+  );
+
+  nav.wizard.dismissEditPanels();
+  let sceneExplore = null;
+  try {
+    nav.wizard.waitForCreateVideoReady();
+    nav.wizard.clickCreateVideo();
+  } catch {
+    sceneExplore = await nav.editSceneAndCreateVideo(sceneEdit.slice(0, 30));
+  }
+
+  waitUntil(
+    browser,
+    (u, s) => nav.phase() === 'final-video' || isFinalVideoVisible(s, u),
+    config.sceneWaitMs,
+    'final video after create',
+  );
+  if (/about:blank/i.test(browser.getUrl())) {
+    await nav.recoverFromBlankOrLost();
+  }
+
+  steps.push(
+    await probeStep(
+      ctx(), repro, 'scene-edit-create', 'Create Video', 'Final video step',
       {
         description: 'Scene edit and create video',
         snapshotIncludesAny: [sceneEdit.slice(0, 14), 'finalvideo', 'Download Video', 'Generating Video', 'Preview'],
@@ -381,35 +438,60 @@ export async function runScriptCompleteFlow(
       },
       undefined,
       config.sceneWaitMs,
-      sceneExplore,
+      sceneExplore ?? undefined,
     ),
   );
 
   // ── FINAL VIDEO ───────────────────────────────────────────────
+  await nav.recoverFromBlankOrLost();
   await nav.waitForPhase(['final-video'], config.finalWaitMs, 5000);
-
-  let finalResult = editFinalVideoNote(browser, finalEdit);
-  if (!finalResult.ok) {
-    await nav.explore(
-      `On Final video: click Edit Video if visible. Enter edit note: "${finalEdit}". ` +
-        `Try Export XML and captions toggle. Mark done when edit is saved or preview visible.`,
-      10,
-    );
+  if (nav.phase() !== 'final-video') {
+    await nav.waitForPhase(['final-video'], config.finalWaitMs, 5000);
   }
 
-  const finalExplore = await nav.completeFinalVideo();
+  uiNav.toggleCheckbox(/captions/i);
+  uiNav.click({ label: 'Export XML', optional: true });
+  uiNav.click({ label: 'Edit Video', optional: true });
+  let finalResult = editFinalVideoNote(browser, finalEdit);
+  if (!finalResult.ok) {
+    await nav.editFieldViaLlm('final video edit', finalEdit);
+  }
+
   steps.push(
     await probeStep(
-      ctx(), repro, 'final-video', 'Final video + download wait (LLM)', 'Download or generating',
+      ctx(), repro, 'final-video-edit', 'Final video edit + controls', 'Edit note or preview',
       {
-        description: 'Final video',
+        description: 'Final video edit',
         urlIncludes: '/finalvideo',
-        snapshotIncludesAny: ['Download Video', 'Generating Video', 'Preview', finalEdit.slice(0, 12)],
+        snapshotIncludesAny: ['Download Video', 'Preview', 'Generating Video', finalEdit.slice(0, 12)],
         ...STEP_BASE,
       },
       undefined,
       config.finalWaitMs,
-      finalExplore,
+    ),
+  );
+
+  let finalExplore = null;
+  try {
+    nav.wizard.waitForDownloadReady();
+  } catch {
+    finalExplore = await nav.completeFinalVideo();
+  }
+  uiNav.dismissOverlays();
+  uiNav.clickIfEnabled('Download Video');
+
+  steps.push(
+    await probeStep(
+      ctx(), repro, 'download-ready', 'Download Video ready', 'Download or generating',
+      {
+        description: 'Download ready',
+        urlIncludes: '/finalvideo',
+        snapshotIncludesAny: ['Download Video', 'Downloading', 'Generating Video', 'Preview'],
+        ...STEP_BASE,
+      },
+      undefined,
+      config.finalWaitMs,
+      finalExplore ?? undefined,
     ),
   );
 

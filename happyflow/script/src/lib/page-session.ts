@@ -28,24 +28,49 @@ export class SessionPage {
 
   async loginOrRestoreSession(): Promise<void> {
     const projectsUrl = `${config.baseUrl.replace(/\/$/, '')}${config.paths.projects}`;
+    const hasSavedState = fs.existsSync(config.loginStatePath);
 
-    if (fs.existsSync(config.loginStatePath)) {
+    if (hasSavedState) {
       try {
         this.browser.stateLoad(config.loginStatePath);
         this.browser.wait(500);
+        if (this.tryOpenAndAuthenticate(projectsUrl)) return;
       } catch {
-        // fall through
+        // stale state — fall through to fresh login
       }
+      try {
+        this.browser.close();
+      } catch {
+        // ignore
+      }
+      this.browser.wait(2000);
     }
 
-    this.browser.open(projectsUrl);
-    this.browser.wait(2000);
-    if (this.waitForAuthenticated(30_000)) return;
+    if (this.tryOpenAndAuthenticate(projectsUrl)) return;
 
     requireCredentials();
     this.loginFresh();
     fs.mkdirSync(path.dirname(config.loginStatePath), { recursive: true });
     this.browser.stateSave(config.loginStatePath);
+  }
+
+  private tryOpenAndAuthenticate(projectsUrl: string): boolean {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        this.browser.open(projectsUrl);
+      } catch {
+        this.browser.wait(2000 * attempt);
+        continue;
+      }
+      this.browser.wait(2000);
+      const url = this.browser.getUrl();
+      if (/about:blank/i.test(url)) {
+        this.browser.wait(2000);
+        continue;
+      }
+      if (this.waitForAuthenticated(30_000)) return true;
+    }
+    return false;
   }
 
   loginFresh(): void {
