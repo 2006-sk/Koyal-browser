@@ -1,4 +1,6 @@
-import { config, defaultLlmBaseUrl, type LlmProvider } from '../../config.js';
+import { config, defaultLlmBaseUrl } from '../../config.js';
+
+export type LlmProvider = 'openai' | 'anthropic' | 'openrouter' | 'custom';
 
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant';

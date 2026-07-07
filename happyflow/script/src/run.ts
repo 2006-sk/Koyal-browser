@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Audio QA — 2 tests by default:
- *   1. audio-complete-wav  — full path, all probes, real edits, nav, download (~6–8 min)
- *   2. audio-complete-mp3  — MP3 format parity with edits (~6 min)
+ * Script path QA — LLM-powered E2E with short PDF.
+ *   npm run qa       — full script-complete-pdf scenario
+ *   npm run qa:pdf   — same (explicit)
  */
-import { config, requireCredentials } from './config.js';
+import { config, requireCredentials, requireLlm } from './config.js';
 import { AgentBrowser } from './lib/agent-browser.js';
 import { writeArtifactsIndex } from './lib/evidence.js';
 import {
@@ -14,16 +14,7 @@ import {
   scenarioEvidenceDir,
   writeRunReport,
 } from './lib/report.js';
-import { testAudioComplete } from './scenarios/audio-complete.js';
-import { testAudioMp3 } from './scenarios/audio-mp3.js';
-
-function hasFlag(flag: string): boolean {
-  return process.argv.includes(flag);
-}
-
-function hasOnlyFlag(prefix: string): boolean {
-  return process.argv.includes(`${prefix}-only`);
-}
+import { testScriptCompletePdf } from './scenarios/script-complete-pdf.js';
 
 async function runScenario(
   report: { scenarios: unknown[] },
@@ -43,30 +34,19 @@ async function runScenario(
 }
 
 async function main(): Promise<void> {
-  const onlyWav = hasOnlyFlag('--wav') || hasOnlyFlag('--complete') || hasOnlyFlag('--full');
-  const onlyMp3 = hasOnlyFlag('--mp3');
-  const anyOnly = onlyWav || onlyMp3;
-
-  const runWav = onlyWav || (!anyOnly && !hasFlag('--skip-wav'));
-  const runMp3 = onlyMp3 || (!anyOnly && !hasFlag('--skip-mp3'));
-
   requireCredentials();
+  requireLlm();
 
   const report = createRunReport(config.baseUrl);
   const runDir = `${config.reportsDir}/${report.runId}`;
 
   console.log(`\nRun ID: ${report.runId}`);
   console.log(`Artifacts: ${runDir}/`);
+  console.log(`Script: ${config.script.shortPdf}`);
   console.log(`Headed: ${config.headed} | Cursor: ${config.showCursor}`);
-  console.log(`Tests: ${runWav ? 'WAV complete' : ''}${runWav && runMp3 ? ' + ' : ''}${runMp3 ? 'MP3 complete' : ''}\n`);
+  console.log(`LLM: enabled (max ${config.llm.maxStepsPerGoal} steps/goal)\n`);
 
-  if (runWav) {
-    await runScenario(report, runDir, 'audio-complete-wav', config.sessionAudio, testAudioComplete);
-  }
-
-  if (runMp3) {
-    await runScenario(report, runDir, 'audio-complete-mp3', `${config.sessionAudio}-mp3`, testAudioMp3);
-  }
+  await runScenario(report, runDir, 'script-complete-pdf', config.sessionScript, testScriptCompletePdf);
 
   const finalReport = finalizeRunReport(report as never);
   const outputDir = writeRunReport(finalReport, config.reportsDir);

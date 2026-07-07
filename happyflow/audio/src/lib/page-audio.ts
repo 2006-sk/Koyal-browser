@@ -125,72 +125,76 @@ export class AudioWizardPage {
 
   /** After probing Record Audio / Select Sample, restore the file-upload drop zone */
   ensureUploadFileTab(): void {
-    const deadline = Date.now() + config.verificationMaxWaitMs;
-    while (Date.now() < deadline) {
+    for (let i = 0; i < 6; i++) {
       const snap = this.browser.snapshotInteractive();
       if (isUploadFileTabReady(snap)) return;
+      if (/\/login/i.test(this.browser.getUrl())) return;
+
+      if (snapshotIncludes(snap, 'Upload File')) {
+        this.browser.clickButtonByText('Upload File', true);
+        this.browser.wait(1000);
+        continue;
+      }
 
       const uploadBtn = refForInteractiveSnapshot(snap, audioSelectors.audioUpload.uploadFile);
       if (uploadBtn) {
-        this.browser.clickVisible(uploadBtn);
-      } else if (snapshotIncludes(snap, 'Upload File')) {
-        this.browser.clickButtonByText('Upload File');
-      } else {
-        break;
+        try {
+          this.browser.clickVisible(uploadBtn);
+          this.browser.wait(1000);
+        } catch {
+          // continue
+        }
       }
-      this.browser.wait(800);
-    }
-
-    let snap = this.browser.snapshotInteractive();
-    if (isUploadFileTabReady(snap)) return;
-
-    this.browser.evalScript(`
-      const btn = [...document.querySelectorAll('button')].find(
-        (el) => (el.textContent || '').trim() === 'Upload File',
-      );
-      if (btn) btn.click();
-    `);
-    this.browser.wait(1000);
-    snap = this.browser.snapshotInteractive();
-    if (isUploadFileTabReady(snap)) return;
-
-    this.openFreshUploadFork();
-    this.startWithAudio();
-    snap = this.browser.snapshotInteractive();
-    if (!isUploadFileTabReady(snap)) {
-      const uploadBtn = refForInteractiveSnapshot(snap, audioSelectors.audioUpload.uploadFile);
-      if (uploadBtn) this.browser.clickVisible(uploadBtn);
-      this.browser.wait(1000);
     }
   }
 
   uploadAudioFile(filePath: string): void {
     this.ensureAudioUploadScreen();
-    this.ensureUploadFileTab();
-
-    const snap = this.browser.snapshotInteractive();
-    const dropRef = refForInteractiveSnapshot(snap, audioSelectors.audioUpload.dropZone);
-    if (dropRef) {
-      try {
-        this.browser.clickVisible(dropRef);
-        this.browser.wait(400);
-      } catch {
-        // drop zone click is best-effort; upload may still work
-      }
+    if (/\/login/i.test(this.browser.getUrl())) {
+      throw new Error('Session expired before audio upload — re-run after auth restore');
     }
 
-    const selectors = ['input[type=file]', '#audio-file-input', 'input[type="file"]'];
-    let lastError: Error | undefined;
-    for (const sel of selectors) {
-      try {
-        this.browser.upload(sel, filePath);
-        this.browser.wait(3000);
-        return;
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
+    for (let attempt = 0; attempt < 4; attempt++) {
+      this.ensureUploadFileTab();
+      const snap = this.browser.snapshotInteractive();
+      if (!audioSelectors.audioUpload.dropZone.test(snap)) {
+        this.browser.clickButtonByText('Upload File', true);
+        this.browser.wait(1200);
       }
+
+      const dropRef = refForInteractiveSnapshot(
+        this.browser.snapshotInteractive(),
+        audioSelectors.audioUpload.dropZone,
+      );
+      if (dropRef) {
+        try {
+          this.browser.clickVisible(dropRef);
+          this.browser.wait(400);
+        } catch {
+          // best-effort
+        }
+      }
+
+      const selectors = [
+        'input[type=file]',
+        '#audio-file-input',
+        'input[type="file"]',
+        'input[accept*="audio"]',
+      ];
+      let lastError: Error | undefined;
+      for (const sel of selectors) {
+        try {
+          this.browser.upload(sel, filePath);
+          this.browser.wait(3000);
+          return;
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+
+      this.browser.wait(1000);
     }
-    throw lastError ?? new Error('No file input found for audio upload');
+    throw new Error(`No file input found for audio upload at ${this.browser.getUrl()}`);
   }
 
   selectPlan(plan: PlanType = 'Standard'): void {

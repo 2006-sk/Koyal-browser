@@ -14,7 +14,8 @@
     "qa:validation": "tsx src/run.ts --validation-only",
     "qa:back-forth": "tsx src/run.ts --back-forth-only",
     "qa:app-shell": "tsx src/run.ts --app-shell-only",
-    "discover": "tsx src/discover.ts"
+    "discover": "tsx src/discover.ts",
+    "probe:script": "tsx src/probe-script-path.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7"

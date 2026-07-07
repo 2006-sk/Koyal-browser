@@ -82,9 +82,11 @@ export function isAudioUploadScreen(s: string): boolean {
   );
 }
 
-/** Upload File tab active — drop zone visible and file input should exist in DOM */
+/** Upload File tab active — drop zone or file input available (not Record/Sample panel) */
 export function isUploadFileTabReady(s: string): boolean {
-  return audioSelectors.audioUpload.dropZone.test(s);
+  if (audioSelectors.audioUpload.dropZone.test(s)) return true;
+  if (/Select Plan to Record|Start Recording|sample audio/i.test(s)) return false;
+  return audioSelectors.audioUpload.uploadFile.test(s);
 }
 
 export function isPlanModalOpen(s: string): boolean {

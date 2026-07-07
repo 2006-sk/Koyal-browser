@@ -31,7 +31,7 @@ Rules:
 - For fill actions, use the exact value provided in the goal when filling credentials.
 - Use action "done" when the goal is clearly achieved in the current snapshot/URL.
 - Use action "fail" only if the goal is impossible (e.g. element missing after reasonable attempt).
-- Use action "wait" sparingly (page still loading).
+- Never click Dashboard when inside the video creation wizard (sidebar Dashboard exits the flow).
 - Respond with JSON only, no markdown.
 
 JSON schema:

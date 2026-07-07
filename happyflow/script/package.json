@@ -1,0 +1,24 @@
+{
+  "name": "koyal-qa-script",
+  "version": "0.1.0",
+  "description": "LLM-powered E2E QA for Koyal script upload path — edits, nav, characters",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "qa": "tsx src/run.ts",
+    "qa:pdf": "tsx src/run.ts --pdf-only"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "agent-browser": "^0.31.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,124 +1,147 @@
 # Koyal Audio Happy Flow QA
 
-Agentic E2E automation for the **audio upload** path on [beta.koyal.ai](https://beta.koyal.ai), modeled after `login/` Phase 1 QA.
+Agentic E2E automation for the **audio upload** path on [beta.koyal.ai](https://beta.koyal.ai).
 
-## Quick start
+## Test suite (2 tests — not 5)
+
+| # | Scenario | Command | Duration | What it covers |
+|---|----------|---------|----------|----------------|
+| **1** | `audio-complete-wav` | `npm run qa:wav` | ~6–8 min | **Everything** — one session, short WAV |
+| **2** | `audio-complete-mp3` | `npm run qa:mp3` | ~6 min | MP3 format parity + real edits |
+| **Both** | WAV + MP3 | `npm run qa` | ~12–14 min | Full suite |
+
+Legacy scripts (`qa:e2e`, `qa:back-forth`, `qa:wizard-nav`, `qa:full`) now map to the consolidated tests.
 
 ```bash
 cd happyflow/audio
 npm install
-# Credentials from login/.env (KOYAL_TEST_EMAIL, KOYAL_TEST_PASSWORD)
 
-npm run qa:full      # 100% audio path coverage — primary command (~6 min)
-npm run qa:all       # full + WAV/MP3 E2E + back-forth + wizard nav (~20 min)
+# Full suite (2 tests)
+npm run qa
+
+# Watch with red QA cursor
+AGENT_BROWSER_HEADED=true AGENT_SHOW_CURSOR=true npm run qa
 ```
 
-**Headed mode with persistent red QA cursor** (watch the agent work — cursor survives SPA navigation):
+---
 
-```bash
-AGENT_BROWSER_HEADED=true AGENT_SHOW_CURSOR=true npm run qa:all
+## Full flow — Test 1: `audio-complete-wav`
+
+Single browser session. Asset: `assets/test-narration-short.wav` (~5s).
+
+```
+LOGIN (reuse login/.state/qa-auth.json)
+│
+├─ UPLOAD FORK          /upload → Start with Audio
+├─ UPLOAD SCREEN        probe Select Sample, Record Audio, restore Upload File tab
+├─ FILE UPLOAD          WAV → plan modal
+├─ PLAN                 Standard → Continue
+├─ AUDIO TYPE           Music → Podcast → Narration → Multilingual No → Next
+├─ STORY TYPE           Character Driven probe → Use Existing modal → Concept Driven → Next
+│
+├─ TRANSCRIPT           /lyricedit — wait Analyzing → Processing complete
+│   ├─ ✏ EDIT           transcript dialogue line (verified in snapshot)
+│   ├─ emotions         Excited / Calm / Dramatic / Somber
+│   ├─ NAV              story-type go-back round-trip (if enabled)
+│   ├─ NAV              sidebar Theme → Review transcript
+│   └─ NAV              browser back / forward
+│
+├─ STORY THEME          /selectTheme
+│   └─ ✏ EDIT           Visual Style + Visual Narrative (both fields, verified)
+│
+├─ STYLE                Realistic / Animated / Sketch + Portrait/Landscape/Square probes
+│   └─ final pick       Realistic + Landscape → Next
+│
+├─ LOCATIONS            Add New Location probe (if shown) → Next
+│
+├─ EDIT SCENES          /editscene — wait Create Video
+│   └─ ✏ EDIT           scene description + Submit Edit / Retake / Reframe
+│
+├─ FINAL VIDEO          /finalvideo — Create Video → render
+│   ├─ captions, Export XML, Edit Video
+│   └─ ✏ EDIT           final video tweak note (verified)
+│
+├─ DOWNLOAD             Download Video enabled + click
+│
+└─ SIDEBAR ROUND-TRIP   Upload → Story → Review → Theme → Style → Scenes → Final
 ```
 
-## What it tests
+Every step saves **screenshot, snapshot, console.json, network.json** under `reports/<runId>/`.
 
+---
 
-| Scenario          | Command                 | Steps | Description                                                   |
-| ----------------- | ----------------------- | ----- | ------------------------------------------------------------- |
-| **100% coverage** | `npm run qa:full`       | 35    | One session — every control probed, ends at Download Video    |
-| **WAV E2E**       | `npm run qa:e2e`        | 7     | Upload alt WAV → transcript → theme/style → scenes → Download |
-| **MP3 E2E**       | `npm run qa:mp3`        | 7     | Same flow with MP3                                            |
-| **Back & forth**  | `npm run qa:back-forth` | 5     | Wizard sidebar + browser history on transcript/theme          |
-| **Wizard nav**    | `npm run qa:wizard-nav` | 7     | Click every wizard sidebar step                               |
-| **Full suite**    | `npm run qa:all`        | 61    | All scenarios above                                           |
+## Full flow — Test 2: `audio-complete-mp3`
 
+Same happy path with `assets/test-narration-short.mp3`. Skips redundant probes (sample/record tabs, style matrix, sidebar round-trip, back-forth) but **still performs all real edits**:
 
-Every verification step saves **screenshot, snapshot, console.json, network.json** under `reports/<runId>/`.
+- Transcript dialogue edit
+- Theme Visual Style + Narrative
+- Scene description edit
+- Final video edit note
+- Download Video
 
-## 100% coverage matrix (`audio-full-coverage`)
+---
 
-Single session with `test-narration-short.wav` (~5s). Probes every major control; verifies no crash / no blocking errors / console+network per step. Does **not** assert visual correctness of AI output.
+## Real edits (what changed)
 
+Previously `fillFirstEditable()` always hit the **first** field — theme narrative overwrote visual style.
 
-| Wizard stage | Controls probed                                                                |
-| ------------ | ------------------------------------------------------------------------------ |
-| Upload fork  | Start with Audio                                                               |
-| Audio screen | Select Sample, Record Audio, Upload File (tab restore)                         |
-| Plan         | Standard                                                                       |
-| Audio type   | Music, Podcast, Narration + Multilingual No                                    |
-| Story type   | Character Driven, Use Existing modal, Concept Driven                           |
-| Transcript   | Play audio, line edit, emotion tags (Excited/Calm/Dramatic/Somber)             |
-| Story Theme  | Edit Text, Visual Style + Narrative fields                                     |
-| Style        | Realistic / Animated / Sketch + Portrait / Landscape / Square, camera settings |
-| Locations    | Add New Location (if shown)                                                    |
-| Edit scenes  | Select Scenes, Submit Edit, Retake, Reframe, Add Reference                     |
-| Final video  | Preview shots, captions, Export XML, Edit Video, Download Video                |
-| Sidebar      | Round-trip: Upload → Story → Review → Theme → Style → Scenes → Final           |
+Now `src/lib/audio-edits.ts` targets fields by:
 
+| Stage | Method | Verification |
+|-------|--------|--------------|
+| Transcript | `editTranscriptLine()` — click segment, then fill | snapshot includes edit text |
+| Story Theme | `editThemeFields()` — label **Visual Style** + **Visual Narrative** | both strings in snapshot |
+| Edit Scenes | `editSceneDescription()` — Description field | snapshot includes edit text |
+| Final Video | `editFinalVideoNote()` — after Edit Video | snapshot includes edit text |
 
-## Robustness
+Tests **fail** if edit text does not appear in the snapshot.
 
-- `**AudioNav`** — multi-fallback clicks: snapshot ref → full snapshot → `find role` → text click
-- `**ensureUploadFileTab()**` — restores drop zone after Record Audio / Select Sample probes
-- `**wizard-phase.ts**` — phase detection from URL + snapshot
-- **Character probe** — opens modal only; does not confirm selection (avoids breaking Concept Driven flow)
-- **Transcript idle** — positive signals (Play audio / Next enabled) instead of fragile string absence
+---
+
+## What was merged (old → new)
+
+| Old scenario (5 sessions) | Now in |
+|---------------------------|--------|
+| `audio-full-coverage` | Test 1 |
+| `audio-e2e-wav` | Test 1 (superset) |
+| `audio-back-and-forth` | Test 1 (transcript nav block) |
+| `audio-wizard-navigation` | Test 1 (sidebar round-trip) |
+| `audio-e2e-mp3` | Test 2 |
+
+---
 
 ## Setup
 
+Credentials from `login/.env`. Auth state from `login/.state/qa-auth.json`.
+
 ```bash
-cd happyflow/audio
-npm install
-cp .env.example .env   # optional — inherits login/.env by default
+cp .env.example .env   # optional overrides
 ```
-
-Credentials come from `login/.env`. Auth state is reused from `login/.state/qa-auth.json` when present.
-
-## Test audio assets
-
-
-| File                                       | Description                                      |
-| ------------------------------------------ | ------------------------------------------------ |
-| `assets/test-narration-short.wav` / `.mp3` | ~5s clip — full coverage, back-forth, wizard nav |
-| `assets/test-narration-alt.wav` / `.mp3`   | ~12s dialogue — WAV/MP3 E2E smoke                |
-
-
-Override with `KOYAL_AUDIO_SHORT_WAV`, `KOYAL_AUDIO_WAV`, etc. in `.env`.
 
 ## Timeouts
 
-Audio processing is slow. Defaults:
-
-- `AUDIO_TRANSCRIPT_WAIT_MS=180000` (3 min)
-- `AUDIO_SCENE_WAIT_MS=180000` (3 min)
-- `AUDIO_FINAL_WAIT_MS=180000` (3 min)
-
-Full coverage ~6 min; `qa:all` ~20 min.
+- `AUDIO_TRANSCRIPT_WAIT_MS=180000`
+- `AUDIO_SCENE_WAIT_MS=180000`
+- `AUDIO_FINAL_WAIT_MS=180000`
 
 ## Reports
 
 ```
 reports/<runId>/
 ├── report.md
-├── ARTIFACTS.md
-├── audio-full-coverage/
-│   ├── 01-upload-fork/
-│   │   ├── screenshot.png
-│   │   ├── console.json
-│   │   ├── network.json
-│   │   └── step-summary.md
-│   └── ... (35 steps)
-└── audio-e2e-wav/ ...
+├── audio-complete-wav/
+│   ├── 14-transcript-edit/
+│   ├── 17-theme-edit/
+│   ├── 22-scene-edit/
+│   └── ...
+└── audio-complete-mp3/
 ```
-
-Latest passing run: `reports/2026-07-02T05-05-36-690Z/` — **61 PASS | 0 FAIL**.
 
 ## Architecture
 
-Same patterns as `login/`:
-
-- `page-session.ts` — login / restore auth (toggles **Log In** on signup form)
-- `page-audio.ts` — wizard navigation, upload tab restore, waits, modal dismiss
-- `audio-nav.ts` — resilient multi-fallback UI interactions
-- `audio-selectors.ts` — regex on `snapshot -i` (not stale `@eN` refs)
-- `recordVerifiedStep()` — console + network + DOM verification per step
-
+- `scenarios/audio-complete.ts` — shared flow engine + Test 1
+- `scenarios/audio-mp3.ts` — Test 2 wrapper
+- `lib/audio-edits.ts` — targeted field editing
+- `lib/audio-nav.ts` — resilient clicks
+- `lib/page-audio.ts` — wizard waits, upload tab restore

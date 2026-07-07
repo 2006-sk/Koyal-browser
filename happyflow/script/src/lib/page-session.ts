@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { config, requireCredentials } from '../config.js';
-import { POST_AUTH_URL } from './audio-expectations.js';
+import { POST_AUTH_URL } from './script-expectations.js';
 import {
   AgentBrowser,
   refForInteractiveSnapshot,
@@ -34,7 +34,7 @@ export class SessionPage {
         this.browser.stateLoad(config.loginStatePath);
         this.browser.wait(500);
       } catch {
-        // fall through to fresh login
+        // fall through
       }
     }
 

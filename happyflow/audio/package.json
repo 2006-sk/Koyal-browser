@@ -6,14 +6,15 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "qa": "tsx src/run.ts --full-only",
-    "qa:all": "tsx src/run.ts",
-    "qa:full": "tsx src/run.ts --full-only",
-    "qa:e2e": "tsx src/run.ts --e2e-only",
+    "qa": "tsx src/run.ts",
+    "qa:wav": "tsx src/run.ts --wav-only",
     "qa:mp3": "tsx src/run.ts --mp3-only",
-    "qa:back-forth": "tsx src/run.ts --back-forth-only",
-    "qa:wizard-nav": "tsx src/run.ts --wizard-nav-only",
-    "qa:quick": "tsx src/run.ts --e2e-only --skip-mp3 --skip-back-forth --skip-wizard-nav"
+    "qa:all": "tsx src/run.ts",
+    "qa:full": "tsx src/run.ts --wav-only",
+    "qa:complete": "tsx src/run.ts --wav-only",
+    "qa:e2e": "tsx src/run.ts --wav-only",
+    "qa:back-forth": "echo 'Merged into qa:wav (audio-complete-wav)' && tsx src/run.ts --wav-only",
+    "qa:wizard-nav": "echo 'Merged into qa:wav (audio-complete-wav)' && tsx src/run.ts --wav-only"
   },
   "dependencies": {
     "dotenv": "^16.4.7"

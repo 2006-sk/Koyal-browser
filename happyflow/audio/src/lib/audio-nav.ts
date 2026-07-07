@@ -1,3 +1,4 @@
+import { fillEditableByIndex } from './audio-edits.js';
 import { config } from '../config.js';
 import {
   AgentBrowser,
@@ -101,24 +102,7 @@ export class AudioNav {
   }
 
   fillFirstEditable(text: string): boolean {
-    const escaped = JSON.stringify(text);
-    this.browser.evalScript(`
-      (function() {
-        const el = document.querySelector('textarea,[contenteditable="true"],[contenteditable=true]');
-        if (!el) return false;
-        el.focus();
-        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-          el.value = ${escaped};
-        } else {
-          el.textContent = ${escaped};
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      })();
-    `);
-    this.browser.wait(500);
-    return true;
+    return fillEditableByIndex(this.browser, 0, text).ok;
   }
 
   toggleCheckbox(labelPattern: RegExp): boolean {

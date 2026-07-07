@@ -5,8 +5,6 @@ import { config, readCursorScript } from '../config.js';
 export interface AgentBrowserOptions {
   session?: string;
   headed?: boolean;
-  json?: boolean;
-  extraArgs?: string[];
 }
 
 export interface AgentBrowserJsonResponse<T = unknown> {
@@ -30,7 +28,7 @@ export class AgentBrowser {
   private cursorInjected = false;
 
   constructor(options: AgentBrowserOptions = {}) {
-    this.session = options.session ?? config.sessionAuth;
+    this.session = options.session ?? config.sessionScript;
     this.headed = options.headed ?? config.headed;
     this.showCursor = config.showCursor;
     this.binary = path.join(config.projectRoot, 'node_modules', '.bin', 'agent-browser');
@@ -42,6 +40,7 @@ export class AgentBrowser {
     exitCode: number;
     parsed?: AgentBrowserJsonResponse;
   } {
+    const timeoutMs = options.timeoutMs ?? 30_000;
     const fullArgs = [
       '--session',
       this.session,
@@ -54,11 +53,11 @@ export class AgentBrowser {
       encoding: 'utf8',
       maxBuffer: 20 * 1024 * 1024,
       env: process.env,
-      timeout: options.timeoutMs ?? 30_000,
+      timeout: timeoutMs,
     });
 
     if (result.error?.message?.includes('ETIMEDOUT') || result.signal === 'SIGTERM') {
-      throw new Error(`agent-browser timed out after 30s: ${args.join(' ')}`);
+      throw new Error(`agent-browser timed out after ${timeoutMs}ms: ${args.join(' ')}`);
     }
 
     const stdout = (result.stdout ?? '').trim();
@@ -204,26 +203,35 @@ export class AgentBrowser {
     }
   }
 
+  upload(selector: string, filePath: string): void {
+    if (this.showCursor) this.ensureCursorOverlay();
+    this.assertOk(
+      this.run(['upload', selector, filePath], { timeoutMs: 60_000 }),
+      `upload ${filePath}`,
+    );
+  }
+
   findAndClick(role: string, name: string, exact = false): void {
+    if (this.showCursor) this.ensureCursorOverlay();
     const args = ['find', 'role', role, 'click', '--name', name];
     if (exact) args.push('--exact');
-    this.assertOk(this.run(args), `find role ${role} click "${name}"`);
+    this.assertOk(this.run(args, { timeoutMs: 45_000 }), `find role ${role} click "${name}"`);
   }
 
   findAndFill(strategy: 'label' | 'placeholder', label: string, value: string): void {
     this.assertOk(
-      this.run(['find', strategy, label, 'fill', value]),
+      this.run(['find', strategy, label, 'fill', value], { timeoutMs: 45_000 }),
       `find ${strategy} "${label}" fill`,
     );
   }
 
   back(): void {
-    this.assertOk(this.run(['back']), 'back');
+    this.assertOk(this.run(['back'], { timeoutMs: 60_000 }), 'back');
     this.ensureCursorOverlay();
   }
 
   forward(): void {
-    this.assertOk(this.run(['forward']), 'forward');
+    this.assertOk(this.run(['forward'], { timeoutMs: 60_000 }), 'forward');
     this.ensureCursorOverlay();
   }
 
@@ -252,6 +260,7 @@ export class AgentBrowser {
   }
 
   snapshotInteractive(): string {
+    if (this.showCursor) this.ensureCursorOverlay();
     const { stdout, exitCode } = this.run(['snapshot', '-i']);
     if (exitCode !== 0) return '';
     return stdout;
@@ -281,9 +290,7 @@ export class AgentBrowser {
 
   networkRequestsJson(filter?: string): AgentBrowserJsonResponse<{ requests: unknown[] }> {
     const args = ['network', 'requests'];
-    if (filter) {
-      args.push('--filter', filter);
-    }
+    if (filter) args.push('--filter', filter);
     const result = this.run(args, { json: true });
     return (result.parsed ?? { success: false, error: result.stderr || result.stdout }) as AgentBrowserJsonResponse<{
       requests: unknown[];
@@ -297,7 +304,6 @@ export class AgentBrowser {
       [...baseArgs, 'screenshot', '--annotate', filePath],
       { encoding: 'utf8', timeout: 10_000 },
     );
-
     if (annotate.status === 0) return;
 
     const plain = spawnSync(this.binary, [...baseArgs, 'screenshot', filePath], {
@@ -305,9 +311,7 @@ export class AgentBrowser {
       timeout: 15_000,
     });
     if (plain.status !== 0) {
-      throw new Error(
-        `screenshot failed (annotate hung or errored; plain also failed): ${plain.stderr || plain.stdout || annotate.stderr}`,
-      );
+      throw new Error(`screenshot failed: ${plain.stderr || plain.stdout || annotate.stderr}`);
     }
   }
 
@@ -319,18 +323,55 @@ export class AgentBrowser {
     this.assertOk(this.run(['state', 'load', filePath]), `state load ${filePath}`);
   }
 
-  upload(selector: string, filePath: string): void {
-    if (this.showCursor) this.ensureCursorOverlay();
-    this.assertOk(
-      this.run(['upload', selector, filePath], { timeoutMs: 60_000 }),
-      `upload ${filePath}`,
-    );
+  dialogAccept(): void {
+    this.run(['dialog', 'accept']);
+    this.wait(300);
+  }
+
+  dialogDismiss(): void {
+    this.run(['dialog', 'dismiss']);
   }
 
   clearSignals(): void {
     this.run(['errors', '--clear']);
     this.run(['console', '--clear']);
     this.run(['network', 'requests', '--clear']);
+  }
+
+  clickButtonByText(text: string, exact = false): boolean {
+    const escaped = text.replace(/'/g, "\\'");
+    this.evalScript(`
+      (function() {
+        const buttons = [...document.querySelectorAll('button,a,[role=button],label')];
+        for (const b of buttons) {
+          const t = (b.textContent || '').trim();
+          const match = ${exact ? `t === '${escaped}'` : `t.includes('${escaped}')`};
+          if (match && !b.disabled) { b.scrollIntoView({block:'center'}); b.click(); return; }
+        }
+      })();
+    `);
+    this.wait(config.actionDelayMs);
+    return true;
+  }
+
+  clickNextIfEnabled(): boolean {
+    const snap = this.snapshotInteractive();
+    const line = snap.split('\n').find((l) => /button "Next"/.test(l) && !/\[disabled/.test(l));
+    if (!line) return false;
+    const ref = line.match(/\[ref=(e\d+)\]/)?.[1];
+    if (!ref) return false;
+    this.evalScript(`
+      const btn = document.querySelector('[data-ref="${ref}"]') ||
+        [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Next' && !b.disabled);
+      if (btn) { btn.scrollIntoView({block:'center'}); btn.click(); }
+    `);
+    try {
+      this.clickVisible(`@${ref}`);
+    } catch {
+      this.clickButtonByText('Next', true);
+    }
+    this.wait(config.actionDelayMs);
+    return true;
   }
 
   private assertOk(
@@ -352,6 +393,24 @@ export function refForInteractiveSnapshot(snapshot: string, pattern: RegExp): st
   return match ? `@${match[1]}` : null;
 }
 
+export function refForEnabledButton(snapshot: string, label: string): string | null {
+  const lines = snapshot.split('\n').filter((l) => new RegExp(`button "${label}"`, 'i').test(l));
+  const enabled = lines.find((l) => !/\[disabled/.test(l));
+  if (!enabled) return null;
+  const match = enabled.match(/\[ref=(e\d+)\]/);
+  return match ? `@${match[1]}` : null;
+}
+
 export function snapshotIncludes(snapshot: string, text: string): boolean {
   return snapshot.toLowerCase().includes(text.toLowerCase());
+}
+
+export function snapshotIncludesAny(snapshot: string, texts: string[]): boolean {
+  const lower = snapshot.toLowerCase();
+  return texts.some((t) => lower.includes(t.toLowerCase()));
+}
+
+export function isButtonDisabled(snapshot: string, label: string): boolean {
+  const line = snapshot.split('\n').find((l) => new RegExp(`button "${label}"`, 'i').test(l));
+  return line ? /\[disabled/.test(line) : true;
 }

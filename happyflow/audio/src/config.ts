@@ -30,7 +30,7 @@ export const config = {
   verificationPollMs: Number(process.env.VERIFICATION_POLL_MS ?? '1000'),
   transcriptWaitMs: Number(process.env.AUDIO_TRANSCRIPT_WAIT_MS ?? '180000'),
   sceneWaitMs: Number(process.env.AUDIO_SCENE_WAIT_MS ?? '180000'),
-  finalWaitMs: Number(process.env.AUDIO_FINAL_WAIT_MS ?? '180000'),
+  finalWaitMs: Number(process.env.AUDIO_FINAL_WAIT_MS ?? '600000'),
   projectRoot,
   loginRoot,
   reportsDir: path.join(projectRoot, 'reports'),

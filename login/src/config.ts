@@ -15,6 +15,17 @@ function normalizeLlmModel(model: string): string {
   return MODEL_ALIASES[model.trim().toLowerCase()] ?? model;
 }
 
+function resolveLlmApiKey(provider: LlmProvider): string {
+  switch (provider) {
+    case 'anthropic':
+      return process.env.ANTHROPIC_API_KEY ?? process.env.LLM_API_KEY ?? '';
+    case 'openai':
+      return process.env.OPENAI_API_KEY ?? process.env.LLM_API_KEY ?? '';
+    default:
+      return process.env.LLM_API_KEY ?? process.env.ANTHROPIC_API_KEY ?? '';
+  }
+}
+
 export type LlmProvider = 'openai' | 'anthropic' | 'openrouter' | 'custom';
 
 export const config = {
@@ -37,14 +48,19 @@ export const config = {
   codeWaitMs: Number(process.env.KOYAL_CODE_WAIT_MS ?? '60000'),
   /** Poll interval while waiting for code file */
   codePollMs: Number(process.env.KOYAL_CODE_POLL_MS ?? '2000'),
-  llm: {
-    enabled: process.env.LLM_ENABLED !== 'false' && Boolean(process.env.LLM_API_KEY),
-    provider: (process.env.LLM_PROVIDER ?? 'openai') as LlmProvider,
-    apiKey: process.env.LLM_API_KEY ?? '',
+  llm: (() => {
+    const provider = (process.env.LLM_PROVIDER ?? 'anthropic') as LlmProvider;
+    const apiKey = resolveLlmApiKey(provider);
+    const defaultModel = provider === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o-mini';
+    return {
+    enabled: process.env.LLM_ENABLED !== 'false' && Boolean(apiKey),
+    provider,
+    apiKey,
     baseUrl: process.env.LLM_BASE_URL ?? '',
-    model: normalizeLlmModel(process.env.LLM_MODEL ?? 'gpt-4o-mini'),
+    model: normalizeLlmModel(process.env.LLM_MODEL ?? defaultModel),
     maxStepsPerGoal: Number(process.env.LLM_MAX_STEPS_PER_GOAL ?? '8'),
-  },
+  };
+  })(),
   projectRoot,
   reportsDir: path.join(projectRoot, 'reports'),
   stateDir: path.join(projectRoot, '.state'),
@@ -78,7 +94,7 @@ export function requireSignupCredentials(): void {
 export function requireLlm(): void {
   if (!config.llm.apiKey) {
     throw new Error(
-      'Missing LLM_API_KEY in .env — exploration layer requires an LLM for adaptive navigation.',
+      'Missing ANTHROPIC_API_KEY (or LLM_API_KEY) in .env — exploration layer requires an LLM for adaptive navigation.',
     );
   }
 }
