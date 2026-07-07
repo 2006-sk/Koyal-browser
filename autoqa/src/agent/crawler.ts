@@ -303,13 +303,21 @@ export async function explore(
   }
 
   // ---- Flow proposal — one LLM call over the summarized map ----
+  // A proposal failure must NEVER kill the run: walk-generated flows already exist.
   console.log('[crawl] proposing test flows...');
   const summary =
     summarizeSitemap(state.sitemap) +
     (diff.added.length
       ? `\n\nNEW since the previous exploration (prioritize flows covering these):\n${diff.added.map((a) => `- ${a}`).join('\n')}`
       : '');
-  const proposed = await proposeFlows(llm, summary);
+  let proposed: Flow[] = [];
+  try {
+    proposed = await proposeFlows(llm, summary);
+  } catch (error) {
+    console.warn(
+      `[crawl] flow proposal failed (${error instanceof Error ? error.message : error}) — continuing with walk-generated flows only`,
+    );
+  }
   const existingIds = new Set(state.sitemap.flows.map((f) => f.id));
   const llmFresh = proposed.filter((f) => !existingIds.has(f.id));
 

@@ -116,7 +116,7 @@ export async function proposeFlows(llm: LlmClient, sitemapSummary: string): Prom
 Site map:
 ${sitemapSummary}
 
-Propose 3-8 end-to-end flows a QA tester should walk, ordered by importance. Each flow is a sequence of milestones; each milestone is a natural-language goal a browser agent can execute (click/fill/upload — it will ask a human for file paths and credentials when needed). Include real content edits where the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
+Propose 3-6 end-to-end flows a QA tester should walk, ordered by importance. Keep milestone goals concise (one sentence each). Each flow is a sequence of milestones; each milestone is a natural-language goal a browser agent can execute (click/fill/upload — it will ask a human for file paths and credentials when needed). Include real content edits where the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
 
 Respond with JSON only:
 {
@@ -134,12 +134,12 @@ Respond with JSON only:
   ]
 }`;
 
-  const raw = await llm.complete({
+  let raw = await llm.complete({
     messages: [{ role: 'user', content: prompt }],
-    maxTokens: 3000,
+    maxTokens: 6000,
   });
 
-  const parsed = parseJsonFromLlm<{
+  let parsed: {
     flows?: Array<{
       id: string;
       title: string;
@@ -154,8 +154,14 @@ Respond with JSON only:
         guardPhases?: string[];
       }>;
     }>;
-  }>(raw);
-
+  };
+  try {
+    parsed = parseJsonFromLlm<typeof parsed>(raw);
+  } catch {
+    // truncated/malformed JSON — one retry
+    raw = await llm.complete({ messages: [{ role: 'user', content: prompt }], maxTokens: 6000 });
+    parsed = parseJsonFromLlm<typeof parsed>(raw);
+  }
   return (parsed.flows ?? []).map((f) => ({
     id: (f.id || 'flow').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
     title: f.title ?? f.id,
