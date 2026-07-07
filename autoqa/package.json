@@ -1,0 +1,26 @@
+{
+  "name": "autoqa",
+  "version": "0.1.0",
+  "description": "Autonomous site-agnostic QA agent — explores any web app, learns success/failure statements from a human once, then tests end-to-end with evidence-rich reports",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "qa": "tsx src/cli.ts",
+    "explore": "tsx src/cli.ts explore",
+    "test:flows": "tsx src/cli.ts test",
+    "review": "tsx src/cli.ts review"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "agent-browser": "^0.31.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
