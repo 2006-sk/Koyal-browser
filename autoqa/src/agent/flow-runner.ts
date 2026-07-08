@@ -122,6 +122,20 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
   }
 }
 
+/**
+ * Milestone goals never carry secrets, so the generic explorer can only guess
+ * credentials — or worse, type the run marker into the password field ("Epic
+ * sadface"). Positive-path auth milestones must route through the auth module.
+ * Negative-path goals (invalid/empty credentials) stay with the explorer.
+ */
+function isLoginShapedGoal(goal: string): boolean {
+  const wantsAuth =
+    /\b(log ?in|sign ?in)\b/i.test(goal) ||
+    (/\b(enter|fill|type|submit)\b/i.test(goal) && /\b(username|password|credentials?)\b/i.test(goal));
+  const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);
+  return wantsAuth && !negativePath;
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -151,9 +165,10 @@ async function runMilestone(
 
   // fill in run-unique edit markers so edits are real and verifiable — only for
   // explicit edit milestones (a 'create' click may involve no text field at all)
+  const loginShaped = isLoginShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit') {
+  if (milestone.kind === 'edit' && !loginShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   }
@@ -162,7 +177,15 @@ async function runMilestone(
   let explored: ExplorerResult | null = null;
   let replayOk = false;
 
-  if (player.has(recipeId)) {
+  if (loginShaped) {
+    console.log('[flow] auth milestone — delegating to the auth module');
+    try {
+      await ensureAuthenticated(authCtx);
+      replayOk = true; // authenticated; verification below judges the milestone
+    } catch (err) {
+      console.log(`[flow] auth milestone failed: ${err instanceof Error ? err.message : err}`);
+    }
+  } else if (player.has(recipeId)) {
     const replay = await player.tryReplay(recipeId, {
       pageId,
       secrets: { email: state.secrets.email, password: state.secrets.password },
@@ -170,7 +193,7 @@ async function runMilestone(
     replayOk = replay.ok;
   }
 
-  if (!replayOk) {
+  if (!replayOk && !loginShaped) {
     explored = await deps.explorer.achieveGoal(goal);
     // mid-flow auth wall → re-login once and retry
     if (!explored.success && /log ?in|password/i.test(explored.finalSnapshot.slice(0, 2000))) {

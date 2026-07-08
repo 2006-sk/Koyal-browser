@@ -116,7 +116,58 @@ export class AgentBrowser {
 
   click(ref: string): void {
     if (this.showCursor) this.ensureCursorOverlay();
+
+    // Trusted clicks can be silently lost: the driver reports success while the
+    // browser routes input to a stale page target (agent-browser 0.31.1 +
+    // Chromium 150; /json shows a zombie pre-navigation target). Eval always
+    // reaches the live page, so arm a one-shot probe there and verify the click
+    // actually arrived; if it provably didn't (probe reads 0 on the same,
+    // un-navigated document), activate the element through the DOM instead.
+    let urlBefore = '';
+    try {
+      urlBefore = this.getUrl();
+      this.evalScript(
+        `window.__abClickLanded=0;window.addEventListener('click',function(){window.__abClickLanded=1;},{capture:true,once:true});'armed'`,
+        { skipEnsure: true },
+      );
+    } catch {
+      // probe is best-effort — plain click semantics below still apply
+    }
+
     this.assertOk(this.run(['click', ref]), `click ${ref}`);
+
+    try {
+      const landed = this.evalScript('window.__abClickLanded', { skipEnsure: true }).trim();
+      // "0" = listener still armed on the same document and no click arrived.
+      // "1"/undefined/anything else = click landed or the document changed
+      // (navigation replaces the probe) — never double-click those.
+      if (landed !== '0') return;
+      if (urlBefore && this.getUrl() !== urlBefore) return;
+      console.log(`[browser] trusted click on ${ref} never reached the page — DOM activation fallback`);
+      this.domActivate(ref);
+    } catch {
+      // eval failing here usually means mid-navigation — the click worked
+    }
+  }
+
+  /** Click an element through the DOM (used when trusted input is lost). */
+  private domActivate(ref: string): void {
+    const box = this.getBox(ref);
+    if (box) {
+      const cx = Math.round(box.x + box.width / 2);
+      const cy = Math.round(box.y + box.height / 2);
+      const out = this.evalScript(
+        `(function(){var el=document.elementFromPoint(${cx},${cy});if(el){el.click();return 'clicked';}return 'miss';})()`,
+        { skipEnsure: true },
+      );
+      if (out.includes('clicked')) return;
+    }
+    // element not at point (scrolled away / covered) — focus route
+    this.assertOk(this.run(['focus', ref]), `focus ${ref}`);
+    this.evalScript(
+      `(function(){var el=document.activeElement;if(el&&el!==document.body)el.click();})()`,
+      { skipEnsure: true },
+    );
   }
 
   fill(ref: string, value: string): void {
