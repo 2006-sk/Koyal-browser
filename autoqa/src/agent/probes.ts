@@ -144,13 +144,15 @@ export async function optionMatrixProbe(
   page: PageNode,
 ): Promise<ProbeOutcome[]> {
   const outcomes: ProbeOutcome[] = [];
-  const groups = (page.optionGroups ?? []).slice(0, 2);
+  // exhaustive mode exercises EVERY option group and EVERY member; default caps to 2 groups / 6 members
+  const groups = config.probes.exhaustive ? (page.optionGroups ?? []) : (page.optionGroups ?? []).slice(0, 2);
 
   for (const group of groups) {
     const missing: string[] = [];
     let navigatedAway = false;
 
-    for (const label of group.memberLabels.slice(0, 6)) {
+    const members = config.probes.exhaustive ? group.memberLabels : group.memberLabels.slice(0, 6);
+    for (const label of members) {
       const clicked = ctx.nav.click({ label, exact: true, optional: true });
       if (!clicked) {
         missing.push(label);
@@ -288,15 +290,18 @@ export async function runProbesForMilestone(
   flow: Flow,
   milestone: FlowMilestone,
   page: PageNode | undefined,
-  opts: { marker?: string },
+  opts: { marker?: string; skipLandmark?: boolean },
 ): Promise<ProbeOutcome[]> {
   if (!config.probes.thorough) return [];
   const kind = page?.kind ?? 'page';
   if (kind === 'processing' || kind === 'terminal' || kind === 'error') return [];
 
-  const cap = config.probes.perMilestoneCap;
+  const cap = config.probes.exhaustive ? 99 : config.probes.perMilestoneCap;
   const prefix = `probe:${flow.id}:${milestone.id}`;
-  const landmark = milestone.successHint;
+  // a login-shaped milestone's successHint is often literal login-page text (e.g.
+  // "Login") that legitimately never reappears once authenticated — the same
+  // reason runMilestone() drops it (see isLoginShapedGoal), so probes must too.
+  const landmark = opts.skipLandmark ? undefined : milestone.successHint;
   const outcomes: ProbeOutcome[] = [];
 
   const runners: Array<() => Promise<ProbeOutcome[] | ProbeOutcome | null>> = [];

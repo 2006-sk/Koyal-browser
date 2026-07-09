@@ -109,7 +109,8 @@ export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
     }
   }
 
-  // 3. LLM-explore the login form
+  // 3. LLM-explore the login form (mask creds from logs/step history, not the prompt)
+  ctx.explorer.setRedactions([creds.password, creds.email]);
   const result = await ctx.explorer.achieveGoal(
     `Log in to this site with email "${creds.email}" and password "${creds.password}". ` +
       `The login form may be behind a toggle or "Log In" tab if the page defaults to sign-up. ` +

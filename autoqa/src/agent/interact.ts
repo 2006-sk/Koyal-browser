@@ -106,14 +106,22 @@ export class Interact {
 
   async askChoice<T extends string>(question: string, choices: T[], defaultChoice?: T): Promise<T> {
     const menu = choices.map((c) => `[${c[0]}]${c.slice(1)}`).join(' / ');
-    const raw = await this.ask(`${question} ${menu}`, { default: defaultChoice });
-    const lower = raw.trim().toLowerCase();
-    const match =
-      choices.find((c) => c.toLowerCase() === lower) ??
-      choices.find((c) => c[0].toLowerCase() === lower[0]);
-    if (match) return match;
-    if (defaultChoice) return defaultChoice;
-    return this.askChoice(question, choices, defaultChoice);
+    // bounded retries: an interactive user can mistype a few times, but a detached
+    // run whose answer file keeps arriving invalid must NOT recurse forever
+    // (that re-writes QUESTION.txt each round and hangs the run indefinitely).
+    const maxAttempts = this.isTty ? 5 : 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const raw = await this.ask(`${question} ${menu}`, { default: defaultChoice });
+      const lower = raw.trim().toLowerCase();
+      const match =
+        choices.find((c) => c.toLowerCase() === lower) ??
+        choices.find((c) => c[0].toLowerCase() === lower[0]);
+      if (match) return match;
+      if (defaultChoice) return defaultChoice;
+    }
+    // no valid answer after bounded attempts and no default: fall back to the
+    // first choice rather than looping forever
+    return defaultChoice ?? choices[0];
   }
 
   async askYesNo(question: string, defaultAnswer: boolean): Promise<boolean> {

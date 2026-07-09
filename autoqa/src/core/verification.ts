@@ -123,6 +123,8 @@ export class VerificationLayer {
       consoleMessages,
       consoleErrors,
       networkRequests,
+      errorsCaptureOk: errorsResp.success !== false,
+      consoleCaptureOk: consoleResp.success !== false,
     };
   }
 
@@ -141,8 +143,12 @@ export class VerificationLayer {
       reasons.push(
         `Uncaught JS exceptions: ${signals.pageErrors.map((e) => e.message).join(' | ')}`,
       );
-    } else if (signals.pageErrors.length === 0) {
+    } else if (signals.pageErrors.length === 0 && signals.errorsCaptureOk !== false) {
       passSignals++;
+    } else if (signals.errorsCaptureOk === false) {
+      // capture subprocess failed — "no errors" is unobservable, not a pass
+      ambiguous = true;
+      reasons.push('Could not capture page errors (agent-browser errors command failed)');
     }
 
     const disallowedConsoleErrors = signals.consoleErrors.filter((msg) => {
@@ -155,8 +161,11 @@ export class VerificationLayer {
       reasons.push(
         `Console errors: ${disallowedConsoleErrors.map((m) => m.text).join(' | ')}`,
       );
-    } else if (disallowedConsoleErrors.length === 0) {
+    } else if (disallowedConsoleErrors.length === 0 && signals.consoleCaptureOk !== false) {
       passSignals++;
+    } else if (signals.consoleCaptureOk === false) {
+      ambiguous = true;
+      reasons.push('Could not capture console (agent-browser console command failed)');
     }
 
     if (isBlankScreen(snap)) {
@@ -246,7 +255,7 @@ export class VerificationLayer {
       }
     }
 
-    if (expectation.maxUnexpectedNetwork5xx) {
+    if (expectation.maxUnexpectedNetwork5xx !== undefined) {
       const bad = signals.networkRequests.filter((r) => {
         const status = r.status ?? 0;
         const url = r.url ?? '';
@@ -313,10 +322,43 @@ export class VerificationLayer {
     let retried = false;
 
     while (Date.now() < deadline) {
-      if (lastEvaluation.verdict === 'pass' || lastEvaluation.verdict === 'fail') {
+      if (lastEvaluation.verdict === 'fail') {
         return {
-          verdict: lastEvaluation.verdict,
-          severity: inferSeverity(lastEvaluation.reasons, lastEvaluation.verdict),
+          verdict: 'fail',
+          severity: inferSeverity(lastEvaluation.reasons, 'fail'),
+          expected: expectation.description,
+          actual: this.buildActualSummary(lastSignals),
+          signals: lastSignals,
+          reasons: lastEvaluation.reasons,
+          retried,
+        };
+      }
+      if (lastEvaluation.verdict === 'pass') {
+        // Confirmation hold: async failures (e.g. an S3 fetch that returns HTML
+        // and throws a console error a beat after render) can surface right after
+        // an initial pass. Re-check once after a short settle before trusting it —
+        // bounded so we don't wait the full window on every passing step.
+        const holdMs = Math.min(pollMs, 2500);
+        if (Date.now() + holdMs <= deadline) {
+          await sleep(holdMs);
+          retried = true;
+          const confirm = await this.captureSignals(expectation.networkFilter);
+          const confirmEval = this.evaluateSignals(confirm, expectation);
+          if (confirmEval.verdict === 'fail') {
+            return {
+              verdict: 'fail',
+              severity: inferSeverity(confirmEval.reasons, 'fail'),
+              expected: expectation.description,
+              actual: this.buildActualSummary(confirm),
+              signals: confirm,
+              reasons: confirmEval.reasons,
+              retried,
+            };
+          }
+        }
+        return {
+          verdict: 'pass',
+          severity: inferSeverity(lastEvaluation.reasons, 'pass'),
           expected: expectation.description,
           actual: this.buildActualSummary(lastSignals),
           signals: lastSignals,

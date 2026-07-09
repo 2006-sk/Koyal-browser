@@ -109,6 +109,43 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
   );
 }
 
+/**
+ * Some create/upload entry points resume prior state (e.g. Koyal's "Create Your
+ * Next Video" always resumes the last draft) instead of landing on milestone 1's
+ * expected guard phase. Ask once for the label of a "start fresh" control, persist
+ * it on the flow (or persist "none" to stop asking), and apply it going forward.
+ * Only called at true flow start — never during replayUpTo repositioning, where
+ * clicking "start fresh" again would blow away the progress being rebuilt.
+ */
+async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
+  const firstGuardPhases = flow.milestones[0]?.guardPhases;
+  if (!firstGuardPhases?.length) return;
+
+  if (flow.entry.freshEntryHint) {
+    if (flow.entry.freshEntryHint !== 'none') {
+      new Nav(deps.browser).click({ label: flow.entry.freshEntryHint, optional: true });
+      deps.browser.wait(1500);
+    }
+    return;
+  }
+
+  const hereId = currentPageId(deps);
+  if (firstGuardPhases.includes(hereId) || hereId === 'unknown') return;
+
+  const answer = await deps.interact.ask(
+    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${firstGuardPhases.join('/')}) — ` +
+      `looks like it resumed stale state (e.g. a draft). Paste the exact label of a "start fresh/new" control to click here, or "none" if this is expected.`,
+    { default: 'none' },
+  );
+  const label = answer.trim();
+  flow.entry.freshEntryHint = label && label.toLowerCase() !== 'none' ? label : 'none';
+  deps.state.saveSitemap();
+  if (flow.entry.freshEntryHint !== 'none') {
+    new Nav(deps.browser).click({ label: flow.entry.freshEntryHint, optional: true });
+    deps.browser.wait(1500);
+  }
+}
+
 /** Rebuild flow position by replaying prior milestones' recipes from the entry. */
 async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): Promise<void> {
   await navigateToEntry(deps, flow);
@@ -206,6 +243,13 @@ async function runMilestone(
 
   // verify with the KB-augmented expectation
   const base = baseExpectationFor(milestone);
+  // a login-shaped milestone that authenticated successfully proves itself via
+  // ensureAuthenticated() above, not via a login-page landmark that may never
+  // reappear when the session silently restores — drop the literal-text check
+  // so the milestone is judged on the generic error/console/5xx signals instead.
+  if (loginShaped && replayOk) {
+    delete base.snapshotIncludesAny;
+  }
   if (marker) {
     base.snapshotIncludesAny = [...(base.snapshotIncludesAny ?? []), marker];
   }
@@ -344,6 +388,7 @@ export async function runFlows(
     try {
       await ensureAuthenticated(authCtx);
       await navigateToEntry(deps, flow);
+      await applyFreshEntryHint(deps, flow);
 
       const probeCtx: ProbeContext = {
         browser: deps.browser,
@@ -380,9 +425,25 @@ export async function runFlows(
 
         // QA probes: back/forward, matrices, edit sweeps — probe failures never abort the flow
         if (!opts.quick) {
-          const page = deps.state.sitemap.pages[currentPageId(deps)];
-          const probes = await runProbesForMilestone(probeCtx, flow, milestone, page, { marker });
+          const pageIdBeforeProbes = currentPageId(deps);
+          const page = deps.state.sitemap.pages[pageIdBeforeProbes];
+          const probes = await runProbesForMilestone(probeCtx, flow, milestone, page, {
+            marker,
+            skipLandmark: isLoginShapedGoal(milestone.goal),
+          });
           scenario.steps.push(...probes.map((p) => p.step));
+
+          // a probe (e.g. back/forward) can strand the browser off-track; the next
+          // milestone's own guard-phase check only fires when guardPhases is set,
+          // so reposition here whenever a probe both failed AND the page drifted
+          const pageIdAfterProbes = currentPageId(deps);
+          const probeBroke = probes.some((p) => p.step.result.verdict !== 'pass');
+          if (probeBroke && pageIdAfterProbes !== pageIdBeforeProbes) {
+            console.log(
+              `[flow] probe left page drifted (${pageIdBeforeProbes} → ${pageIdAfterProbes}) — repositioning`,
+            );
+            await replayUpTo(deps, flow, mi + 1);
+          }
         }
       }
     } catch (error) {
@@ -394,9 +455,16 @@ export async function runFlows(
     scenario.finishedAt = new Date().toISOString();
     report.scenarios.push(scenario);
 
-    // probe-step failures downgrade the flow to needs-review, never to fail
+    // Navigation/state-loss breakage (back/forward, abandon/resume) is a REAL,
+    // first-class product bug — the user explicitly wants it reported, not buried
+    // as probe noise. Other probe failures (option-matrix, edit-sweep) stay
+    // needs-review. Milestone failures are always first-class fails.
     const isProbe = (s: TestStep) => s.workflow.startsWith('probe:');
-    const verdict: Verdict = scenario.steps.some((s) => !isProbe(s) && s.result.verdict === 'fail')
+    const isNavProbe = (s: TestStep) =>
+      isProbe(s) && /(back-forward|abandon-resume)/.test(s.workflow);
+    const verdict: Verdict = scenario.steps.some(
+      (s) => (!isProbe(s) || isNavProbe(s)) && s.result.verdict === 'fail',
+    )
       ? 'fail'
       : scenario.steps.some((s) => s.result.verdict === 'needs-review' || (isProbe(s) && s.result.verdict === 'fail'))
         ? 'needs-review'

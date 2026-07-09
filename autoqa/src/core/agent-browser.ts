@@ -248,7 +248,14 @@ export class AgentBrowser {
       encoding: 'utf8',
       maxBuffer: 10 * 1024 * 1024,
       env: process.env,
+      // eval is on the hottest path (cursor overlay, click-landed probe, edits);
+      // without a timeout a wedged daemon or a never-resolving injected script
+      // hangs the entire run with no recovery
+      timeout: 30_000,
     });
+    if (result.error && (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      throw new Error('agent-browser eval timed out after 30s');
+    }
     if (result.status !== 0) {
       throw new Error(`agent-browser eval failed: ${result.stderr || result.stdout}`);
     }

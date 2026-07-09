@@ -112,7 +112,12 @@ export interface Flow {
   title: string;
   description: string;
   status: 'proposed' | 'approved' | 'skipped';
-  entry: { pageId: string; url?: string };
+  entry: {
+    pageId: string;
+    url?: string;
+    /** Learned once: label of a "start fresh" control to click when entry resumes stale state (e.g. a draft) instead of landing on milestone 1's guard phase. */
+    freshEntryHint?: string;
+  };
   milestones: FlowMilestone[];
   lastResult?: { runId: string; verdict: Verdict };
 }
@@ -213,18 +218,22 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
  */
 export function mergePage(sitemap: SiteMap, incoming: PageNode): PageNode {
   const landmarksLower = incoming.detection.snapshotAnyOf.map((t) => t.toLowerCase());
+  // Plain pages are identified by URL only: a single shared chrome landmark (a
+  // header/nav item) must NOT collapse two distinct plain pages into one. Landmark-
+  // overlap merging is reserved for stateful kinds (wizard/modal/…) that legitimately
+  // share a URL across sibling states.
   const existing =
     sitemap.pages[incoming.id] ??
-    Object.values(sitemap.pages).find(
-      (p) =>
-        (p.kind ?? 'page') === (incoming.kind ?? 'page') &&
-        p.detection.snapshotAnyOf.some((t) => landmarksLower.includes(t.toLowerCase())),
-    ) ??
     (isPlainPage(incoming)
       ? Object.values(sitemap.pages).find(
           (p) => isPlainPage(p) && p.urlPatterns.some((u) => incoming.urlPatterns.includes(u)),
         )
-      : undefined);
+      : Object.values(sitemap.pages).find(
+          (p) =>
+            (p.kind ?? 'page') === (incoming.kind ?? 'page') &&
+            !isPlainPage(p) &&
+            p.detection.snapshotAnyOf.some((t) => landmarksLower.includes(t.toLowerCase())),
+        ));
 
   if (!existing) {
     sitemap.pages[incoming.id] = incoming;

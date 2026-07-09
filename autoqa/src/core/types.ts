@@ -36,6 +36,9 @@ export interface SignalBundle {
   consoleMessages: ConsoleMessage[];
   consoleErrors: ConsoleMessage[];
   networkRequests: NetworkRequest[];
+  /** False when the errors/console capture subprocess failed — "no errors seen" is then unobservable, not a pass. */
+  errorsCaptureOk?: boolean;
+  consoleCaptureOk?: boolean;
 }
 
 export interface VerificationExpectation {

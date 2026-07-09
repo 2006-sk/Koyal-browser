@@ -5,7 +5,7 @@ import type { Explorer } from '../core/explorer.js';
 import type { LlmClient } from '../core/llm/client.js';
 import { Nav } from '../core/nav.js';
 import { deepWalk, type DeepWalkEntry } from './deep-walker.js';
-import { classifyPage, proposeFlows } from './page-classifier.js';
+import { classifyPage, looksLikeSoft404, proposeFlows } from './page-classifier.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import {
@@ -85,6 +85,25 @@ function extractSameOriginLinks(browser: AgentBrowser, origin: string): string[]
   return [...urls];
 }
 
+/** A page classified as a soft-404/catch-all is never merged into the sitemap. */
+function transientErrorPage(url: string): PageNode {
+  const now = new Date().toISOString();
+  return {
+    id: `soft-404:${normalizePath(url)}`,
+    title: 'Soft 404 (not persisted)',
+    description: '',
+    kind: 'error',
+    urlPatterns: [normalizePath(url)],
+    detection: { snapshotAnyOf: [] },
+    requiresAuth: false,
+    sensitive: false,
+    interactives: [],
+    optionGroups: [],
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
+}
+
 /**
  * The EXPLORE engine: BFS crawl from the origin, LLM-classifying each new page,
  * click-probing nav elements to discover SPA transitions, then proposing flows.
@@ -96,7 +115,14 @@ export async function explore(
   llm: LlmClient,
   interact: Interact,
   explorer: Explorer,
-  opts: { maxPages?: number; depth?: number; probesPerPage?: number; deepFlows?: number } = {},
+  opts: {
+    maxPages?: number;
+    depth?: number;
+    probesPerPage?: number;
+    deepFlows?: number;
+    /** Re-login hook passed to deep walks (sessions can expire mid-explore) */
+    ensureAuth?: () => Promise<void>;
+  } = {},
 ): Promise<void> {
   const maxPages = opts.maxPages ?? config.maxPages;
   const maxDepth = opts.depth ?? config.crawlDepth;
@@ -133,10 +159,20 @@ export async function explore(
 
   const visitedThisRun = new Set<string>();
   let pagesVisited = 0;
+  let soft404Skipped = 0;
+  // maps exact snapshot content -> the first URL that produced it, so an SPA
+  // catch-all/fallback served under many distinct paths is caught even when it
+  // doesn't literally say "404" (e.g. saucedemo's phantom /company/sauce-labs page)
+  const contentSignatures = new Map<string, string>();
 
   const identifyCurrentPage = async (): Promise<PageNode> => {
     const url = browser.getUrl();
     const snapshot = browser.snapshotInteractive();
+    // detached/blank target — never classify emptiness into the sitemap
+    if (url.startsWith('about:') || !snapshot.trim()) {
+      console.log(`[crawl] page read as blank (${url}) — skipping classification`);
+      return transientErrorPage(url || 'about:blank');
+    }
     const known = matchPage(state.sitemap, url, snapshot);
     if (known) {
       known.lastSeenAt = new Date().toISOString();
@@ -144,6 +180,23 @@ export async function explore(
       if (!known.urlPatterns.includes(norm)) known.urlPatterns.push(norm);
       return known;
     }
+
+    if (looksLikeSoft404(snapshot)) {
+      soft404Skipped++;
+      console.log(`[crawl] ${url} looks like a soft-404 — not adding to sitemap`);
+      return transientErrorPage(url);
+    }
+    const signature = snapshot.trim();
+    const priorUrl = signature ? contentSignatures.get(signature) : undefined;
+    if (priorUrl && normalizePath(priorUrl) !== normalizePath(url)) {
+      soft404Skipped++;
+      console.log(
+        `[crawl] ${url} renders content identical to ${priorUrl} — likely an SPA catch-all, not adding to sitemap`,
+      );
+      return transientErrorPage(url);
+    }
+    if (signature) contentSignatures.set(signature, url);
+
     console.log(`[crawl] classifying new page at ${url}`);
     const classified = await classifyPage(llm, url, snapshot);
     const merged = mergePage(state.sitemap, classified);
@@ -231,6 +284,9 @@ export async function explore(
   console.log(
     `[crawl] done: ${Object.keys(state.sitemap.pages).length} pages, ${state.sitemap.edges.length} edges`,
   );
+  if (soft404Skipped > 0) {
+    console.log(`[crawl] skipped ${soft404Skipped} suspected soft-404/catch-all page(s) (not added to sitemap)`);
+  }
 
   // ---- Deep-walk phase: actually enter create/upload flows ----
   const walkFlowIds: string[] = [];
@@ -276,7 +332,10 @@ export async function explore(
       return aScore - bScore;
     });
 
-    const toWalk = entries.filter((e) => !walks[trailIdFor(e)]).slice(0, deepCap);
+    // aborted trails (entry unreachable, login wall) are retried, not skipped
+    const toWalk = entries
+      .filter((e) => !walks[trailIdFor(e)] || walks[trailIdFor(e)].outcome === 'aborted')
+      .slice(0, deepCap);
     if (toWalk.length === 0) {
       console.log('[crawl] deep: all known entry points already walked (delete a walk via `review` to re-walk)');
     }
@@ -284,7 +343,7 @@ export async function explore(
     for (const entry of toWalk) {
       try {
         const result = await deepWalk(
-          { browser, state, llm, explorer, interact, nav },
+          { browser, state, llm, explorer, interact, nav, ensureAuth: opts.ensureAuth },
           entry,
           { evidenceDir: walkEvidenceDir },
         );

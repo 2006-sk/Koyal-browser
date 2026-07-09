@@ -2,10 +2,10 @@ import path from 'node:path';
 import { config } from '../config.js';
 import type { AgentBrowser } from '../core/agent-browser.js';
 import { randomEditMarker } from '../core/edits.js';
-import type { Explorer, ExplorerResult } from '../core/explorer.js';
+import { hasInlineProcessing, type Explorer, type ExplorerResult } from '../core/explorer.js';
 import { LlmBudgetExceededError, type LlmClient } from '../core/llm/client.js';
 import type { Nav } from '../core/nav.js';
-import { classifyPage } from './page-classifier.js';
+import { classifyPage, looksLikeAuthGate } from './page-classifier.js';
 import { recordWalkRecipe, type RecipeStep } from './recipes.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
@@ -28,6 +28,8 @@ export interface DeepWalkerDeps {
   explorer: Explorer;
   interact: Interact;
   nav: Nav;
+  /** Re-login hook: sessions can expire mid-explore, stranding a walk on the login wall */
+  ensureAuth?: () => Promise<void>;
 }
 
 export interface DeepWalkEntry {
@@ -53,13 +55,9 @@ function slug(text: string): string {
   return text.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 40);
 }
 
-/** In-page async work (spinners on the same URL/state) — wait for it to clear before advancing */
-const IN_PROGRESS_RE =
-  /analyzing|generating|transcribing|\buploading\b|\bprocessing\b|please wait|\best\.\s|\b\d{1,3}\s?% /i;
-const IN_PROGRESS_DONE_RE = /processing complete|100\s?%/i;
-
-function hasInlineProcessing(snapshot: string): boolean {
-  return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
+/** agent-browser's page target can detach mid-transition, reading as about:blank */
+function isBlankState(url: string, snapshot: string): boolean {
+  return url.startsWith('about:') || snapshot.trim() === '';
 }
 
 function advanceGoal(page: PageNode, marker: string): string {
@@ -130,9 +128,24 @@ export async function deepWalk(
 
   console.log(`\n[walk] ▶ ${trailId} — entering via "${entry.interactive.label}"`);
 
+  let lastRealUrl = entry.entryUrl;
+
   const identify = async (prevSnapshot = ''): Promise<{ page: PageNode; snapshot: string }> => {
-    const url = browser.getUrl();
-    const snapshot = browser.snapshotInteractive();
+    let url = browser.getUrl();
+    let snapshot = browser.snapshotInteractive();
+    // blank/detached target: recover by re-opening the last real URL — classifying
+    // about:blank pollutes the sitemap and burns the no-progress budget
+    for (let attempt = 0; isBlankState(url, snapshot) && attempt < 2; attempt++) {
+      console.log(`[walk] page went blank (${url}) — re-opening ${lastRealUrl}`);
+      browser.open(lastRealUrl);
+      browser.wait(3000);
+      url = browser.getUrl();
+      snapshot = browser.snapshotInteractive();
+    }
+    if (isBlankState(url, snapshot)) {
+      throw new Error(`page stuck at ${url} after blank-state recovery attempts`);
+    }
+    lastRealUrl = url;
     let page = matchPage(state.sitemap, url, snapshot);
     // A plain page matched by URL whose landmarks are all gone is likely a wizard
     // sub-state sharing that URL (fork → upload UI → modal) — classify it fresh.
@@ -170,8 +183,7 @@ export async function deepWalk(
     return { page, snapshot };
   };
 
-  try {
-    // enter the flow — deterministic first (we know the exact label), LLM only as fallback
+  const openEntry = (): void => {
     if (entry.via) {
       browser.open(entry.via.entryUrl);
       browser.wait(2000);
@@ -181,6 +193,29 @@ export async function deepWalk(
       browser.open(entry.entryUrl);
       browser.wait(2000);
     }
+  };
+
+  try {
+    // enter the flow — deterministic first (we know the exact label), LLM only as fallback
+    openEntry();
+
+    // sessions expire mid-explore: a login wall here means we'd deep-walk the auth
+    // pages instead of the target flow (observed: an "audio upload" walk that
+    // faithfully explored Sign Up + OTP). Re-authenticate and re-enter.
+    if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive())) {
+      if (deps.ensureAuth) {
+        console.log('[walk] entry landed on a login wall — re-authenticating');
+        await deps.ensureAuth();
+        openEntry();
+      }
+      if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive())) {
+        console.warn(`[walk] ${trailId}: entry is stuck behind a login wall — aborting (will retry next explore)`);
+        trail.outcome = 'aborted';
+        trail.finishedAt = new Date().toISOString();
+        return { trail, newPageIds, flow: null, recipeIds: [] };
+      }
+    }
+
     const role =
       entry.interactive.role === 'button' || entry.interactive.role === 'link' || entry.interactive.role === 'tab'
         ? entry.interactive.role
@@ -195,6 +230,15 @@ export async function deepWalk(
       );
       explorations.push(entered);
       browser.wait(1500);
+      if (!entered.success) {
+        // walking whatever page we happen to be on produces junk trails and flows
+        console.warn(
+          `[walk] ${trailId}: entry element "${entry.interactive.label}" not reachable — aborting (will retry next explore)`,
+        );
+        trail.outcome = 'aborted';
+        trail.finishedAt = new Date().toISOString();
+        return { trail, newPageIds, flow: null, recipeIds: [] };
+      }
     }
 
     let prev = await identify();
@@ -399,8 +443,13 @@ export async function deepWalk(
   return { trail, newPageIds, flow, recipeIds };
 }
 
-/** Deterministically turn an observed walk into a testable Flow (zero LLM). */
-export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
+/**
+ * The single source of truth for which trail steps become milestones. BOTH
+ * flowFromTrail and recordWalkRecipes must use this exact list — if they derive
+ * it independently they drift (e.g. a collapsed wait-processing step) and recipes
+ * bind to the wrong milestone.
+ */
+function actionableSteps(trail: WalkTrail): WalkStep[] {
   const candidates = trail.steps.filter(
     (s) => s.kind === 'wizard-step' || s.kind === 'modal' || s.kind === 'page',
   );
@@ -411,6 +460,12 @@ export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
     const meaningful = Boolean(step.action && step.action.type !== 'wait-processing');
     if (meaningful || !last || last.pageId !== step.pageId) actionable.push(step);
   }
+  return actionable;
+}
+
+/** Deterministically turn an observed walk into a testable Flow (zero LLM). */
+export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
+  const actionable = actionableSteps(trail);
   if (actionable.length === 0) return null;
 
   const flowId = `walked-${trail.entry.pageId}-${slug(trail.entry.actionLabel)}`;
@@ -490,9 +545,9 @@ export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
 
 /** Store per-milestone recipes from the trail so the FIRST test run already replays. */
 export function recordWalkRecipes(state: SiteState, flow: Flow, trail: WalkTrail): string[] {
-  const actionable = trail.steps.filter(
-    (s) => s.kind === 'wizard-step' || s.kind === 'modal' || s.kind === 'page',
-  );
+  // MUST be the same collapsed list flowFromTrail used, or recipes bind to the
+  // wrong milestone (milestone[i] ↔ actionable[i] is positional)
+  const actionable = actionableSteps(trail);
   const ids: string[] = [];
 
   for (let i = 0; i < flow.milestones.length; i++) {

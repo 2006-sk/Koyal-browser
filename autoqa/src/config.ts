@@ -54,6 +54,8 @@ export const config = {
   probes: {
     thorough: process.env.AUTOQA_QUICK !== 'true',
     perMilestoneCap: Number(process.env.AUTOQA_PROBES_PER_MILESTONE ?? '3'),
+    /** Exhaustive mode: exercise EVERY option/edit (no per-milestone cap, no 6-member slice) and treat nav/state-loss as first-class bugs. */
+    exhaustive: process.env.AUTOQA_EXHAUSTIVE === 'true',
   },
 
   /** Force this file for every upload this run (recipe replays + prompt default) */

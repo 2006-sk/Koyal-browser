@@ -10,7 +10,11 @@ export async function exploreCommand(opts: { session?: Session; keepOpen?: boole
   try {
     console.log(`[autoqa] exploring ${state.sitemap.origin} (state: ${state.dir})`);
     await ensureAuthenticated(session.authCtx);
-    await explore(browser, state, llm, interact, explorer);
+    await explore(browser, state, llm, interact, explorer, {
+      ensureAuth: async () => {
+        await ensureAuthenticated(session.authCtx);
+      },
+    });
     console.log(`[autoqa] sitemap saved → ${state.sitemapPath}`);
     console.log(`[autoqa] LLM calls so far: ${LlmClient.callCount}`);
   } finally {

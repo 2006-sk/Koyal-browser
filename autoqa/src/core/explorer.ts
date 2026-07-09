@@ -35,6 +35,22 @@ export interface ExplorerHooks {
   onUploadRequested?: (selectorHint: string | undefined, reason: string | undefined) => Promise<string | null>;
 }
 
+/**
+ * In-page async work (spinners on the same URL/state) — must be waited out, not
+ * stepped through. Anchored to progress-INDICATOR phrasing, not bare verbs:
+ * "generating"/"processing"/"validating" as gerunds followed by ellipsis or an
+ * ETA/percentage, or an explicit "please wait" / remaining-time estimate. This
+ * deliberately avoids matching static UI copy ("Image Processing", "95% cotton",
+ * "Delivery est. 5 days") that would otherwise trigger a multi-minute dead wait.
+ */
+const IN_PROGRESS_RE =
+  /(analy[sz]ing|generating|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|\bplease wait\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed)/i;
+const IN_PROGRESS_DONE_RE = /processing complete|100\s?%|\bdone\b\s*[!.]/i;
+
+export function hasInlineProcessing(snapshot: string): boolean {
+  return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
+}
+
 function buildSystemPrompt(siteDescription: string, siteHints: string[]): string {
   const hints = siteHints.length
     ? `\nSite-specific hints learned from previous runs:\n${siteHints.map((h) => `- ${h}`).join('\n')}\n`
@@ -90,6 +106,19 @@ export class Explorer {
   private readonly hooks: ExplorerHooks;
   private siteDescription: string;
   private siteHints: string[];
+  /** Secret strings (passwords, etc.) to mask from logs + persisted step history. */
+  private redactions: string[] = [];
+
+  /** Register secret values to scrub from console output and recorded steps (NOT from the LLM prompt, which needs them to type). */
+  setRedactions(values: Array<string | undefined>): void {
+    this.redactions = values.filter((v): v is string => Boolean(v) && v!.length >= 3);
+  }
+
+  private redact(text: string): string {
+    let out = text;
+    for (const secret of this.redactions) out = out.split(secret).join('«redacted»');
+    return out;
+  }
 
   constructor(
     private readonly browser: AgentBrowser,
@@ -117,12 +146,42 @@ export class Explorer {
     const stepsTaken: string[] = [];
     let repeatCount = 0;
     let lastSignature = '';
+    let processingWaitedMs = 0;
 
-    console.log(`\n[explorer] Goal: ${goal.slice(0, 120)}${goal.length > 120 ? '…' : ''}`);
+    const goalForLog = this.redact(goal);
+    console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
 
     for (let step = 0; step < maxSteps; step++) {
-      const snapshot = this.browser.snapshotInteractive();
-      const url = this.browser.getUrl();
+      let snapshot = this.browser.snapshotInteractive();
+      let url = this.browser.getUrl();
+
+      // Multi-minute server-side work (script engines, scene generation) renders as
+      // spinner text on the same URL. Burning LLM steps on 1.5s "wait" actions
+      // starves it and fails the goal — wait it out deterministically instead,
+      // without consuming steps, bounded by one processing budget per goal.
+      if (hasInlineProcessing(snapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+        console.log(
+          `  [explorer] in-page processing detected — waiting it out deterministically (max ${Math.round((config.deep.processingWaitMs - processingWaitedMs) / 1000)}s)`,
+        );
+        const t0 = Date.now();
+        try {
+          while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
+            this.browser.wait(5000);
+            const now = this.browser.snapshotInteractive();
+            // empty snapshot = capture/daemon error, NOT "processing finished" —
+            // stop waiting and let the normal loop re-snapshot and decide
+            if (!now.trim() || !hasInlineProcessing(now)) break;
+          }
+        } catch (error) {
+          stepsTaken.push(`processing-wait interrupted: ${error instanceof Error ? error.message : error}`);
+        }
+        processingWaitedMs += Date.now() - t0;
+        snapshot = this.browser.snapshotInteractive();
+        url = this.browser.getUrl();
+        stepsTaken.push(
+          `waited ${Math.round((Date.now() - t0) / 1000)}s for in-page processing to finish (deterministic, no steps consumed)`,
+        );
+      }
 
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
       const llmStart = Date.now();
@@ -158,7 +217,9 @@ export class Explorer {
 
       actions.push(decision);
       stepsTaken.push(
-        `${decision.action}${decision.ref ? ` ${decision.ref}` : ''}${decision.resolvedLabel ? ` (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}")` : ''}${decision.value ? ` "${decision.value}"` : ''} — ${decision.reason ?? ''}`.trim(),
+        this.redact(
+          `${decision.action}${decision.ref ? ` ${decision.ref}` : ''}${decision.resolvedLabel ? ` (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}")` : ''}${decision.value ? ` "${decision.value}"` : ''} — ${decision.reason ?? ''}`.trim(),
+        ),
       );
       if (repeatCount === 1) {
         stepsTaken.push('note: you repeated the same action — it is not working, try a different element or approach');

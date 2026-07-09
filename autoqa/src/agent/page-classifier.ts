@@ -162,28 +162,49 @@ Respond with JSON only:
     raw = await llm.complete({ messages: [{ role: 'user', content: prompt }], maxTokens: 6000 });
     parsed = parseJsonFromLlm<typeof parsed>(raw);
   }
-  return (parsed.flows ?? []).map((f) => ({
-    id: (f.id || 'flow').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
-    title: f.title ?? f.id,
-    description: f.description ?? '',
-    status: 'proposed' as const,
-    entry: { pageId: f.entryPageId ?? '', url: f.entryUrl ?? undefined },
-    milestones: (f.milestones ?? []).map((m, i) => ({
-      id: m.id || `m${i + 1}`,
-      goal: m.goal,
-      kind: ([
-        'navigate',
-        'edit',
-        'create',
-        'upload',
-        'verify',
-      ].includes(m.kind ?? '')
-        ? m.kind
-        : 'navigate') as Flow['milestones'][number]['kind'],
-      successHint: m.successHint,
-      guardPhases: m.guardPhases,
-    })),
-  }));
+  return (parsed.flows ?? []).map((f) => {
+    // the LLM sometimes copies one successHint onto every milestone (e.g. sidebar-nav
+    // destinations) — a duplicate landmark is guaranteed to mismatch on at least one
+    // milestone, so keep only the first occurrence and let the rest fall back to
+    // goal-based description with no snapshot assertion.
+    const seenHints = new Set<string>();
+    return {
+      id: (f.id || 'flow').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
+      title: f.title ?? f.id,
+      description: f.description ?? '',
+      status: 'proposed' as const,
+      entry: { pageId: f.entryPageId ?? '', url: f.entryUrl ?? undefined },
+      milestones: (f.milestones ?? []).map((m, i) => {
+        let successHint = m.successHint;
+        if (successHint) {
+          const key = successHint.trim().toLowerCase();
+          if (seenHints.has(key)) {
+            console.warn(
+              `[flow] duplicate successHint "${successHint}" on ${f.id ?? 'flow'}:${m.id ?? `m${i + 1}`} — clearing (likely LLM copy-paste)`,
+            );
+            successHint = undefined;
+          } else {
+            seenHints.add(key);
+          }
+        }
+        return {
+          id: m.id || `m${i + 1}`,
+          goal: m.goal,
+          kind: ([
+            'navigate',
+            'edit',
+            'create',
+            'upload',
+            'verify',
+          ].includes(m.kind ?? '')
+            ? m.kind
+            : 'navigate') as Flow['milestones'][number]['kind'],
+          successHint,
+          guardPhases: m.guardPhases,
+        };
+      }),
+    };
+  });
 }
 
 /** Deterministic auth-gate heuristic; call the LLM only if genuinely ambiguous. */
@@ -197,6 +218,18 @@ export function looksLikeAuthGate(url: string, interactiveSnapshot: string): boo
 /** Is the site currently asking for an emailed code / OTP? */
 export function looksLikeOtpGate(interactiveSnapshot: string): boolean {
   return /verification code|one[- ]time|otp|code sent|enter the code|6[- ]digit/i.test(interactiveSnapshot);
+}
+
+/**
+ * Deterministic soft-404 heuristic, checked before spending an LLM classification
+ * call on a page: SPAs often render a "not found" state for any unknown route
+ * rather than a real HTTP 404, which the crawler would otherwise map as a
+ * distinct, permanent page.
+ */
+export function looksLikeSoft404(interactiveSnapshot: string): boolean {
+  return /\b(404|page not found|not found|doesn'?t exist|does not exist|nothing (here|found)|no longer available)\b/i.test(
+    interactiveSnapshot,
+  );
 }
 
 export function makeSitemapHintList(sitemap: SiteMap): string[] {
