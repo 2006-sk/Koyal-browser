@@ -133,6 +133,17 @@ export async function explore(
   const nav = new Nav(browser);
   const origin = state.sitemap.origin;
   const inventoryBefore = takeInventory(state.sitemap);
+  // Footer/nav links to a related marketing site (e.g. an app's own vendor
+  // homepage) are common and must never be mapped/tested as part of the target
+  // app — a flow that wandered off-site was observed proposing a "trial signup"
+  // against a completely different domain.
+  const isOffOrigin = (url: string): boolean => {
+    try {
+      return new URL(url).origin !== origin;
+    } catch {
+      return false;
+    }
+  };
 
   // re-probe interactives whose earlier probe led nowhere (clicks can fail transiently)
   for (const page of Object.values(state.sitemap.pages)) {
@@ -263,6 +274,17 @@ export async function explore(
         afterUrl = browser.getUrl();
       }
       if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
+        if (isOffOrigin(afterUrl)) {
+          console.log(`[crawl] "${el.label}" led off-site (${afterUrl}) — not mapping, returning`);
+          try {
+            browser.open(item.url);
+            browser.wait(1500);
+            nav.dismissOverlays();
+          } catch {
+            break;
+          }
+          continue;
+        }
         const landed = await identifyCurrentPage();
         pagesVisited++;
         el.targetPageId = landed.id;
@@ -304,6 +326,17 @@ export async function explore(
           afterUrl = browser.getUrl();
         }
         if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
+          if (isOffOrigin(afterUrl)) {
+            console.log(`[crawl] "${label}" led off-site (${afterUrl}) — not mapping, returning`);
+            try {
+              browser.open(item.url);
+              browser.wait(1500);
+              nav.dismissOverlays();
+            } catch {
+              break;
+            }
+            continue;
+          }
           const landed = await identifyCurrentPage();
           pagesVisited++;
           if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === label)) {

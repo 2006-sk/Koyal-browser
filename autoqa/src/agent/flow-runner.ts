@@ -109,6 +109,41 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
   );
 }
 
+/** Heuristic: does this page id look like an unauthenticated login/signup/register entry? */
+function looksLikeAuthEntryPageId(pageId: string): boolean {
+  return /login|sign-?in|sign-?up|register/i.test(pageId);
+}
+
+/**
+ * Session leak between flows: a flow that needs to START on an unauthenticated
+ * page (login/signup) finds itself already logged in because an EARLIER flow in
+ * the same run authenticated. Distinct from draft-resume below — the fix is a
+ * SITE-LEVEL "log out" control, learned ONCE and reused by every flow that hits
+ * this (not asked per-flow, since it's the same underlying problem every time).
+ */
+async function ensureLoggedOutForEntry(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  firstGuardPhases: string[],
+): Promise<boolean> {
+  const sitemap = deps.state.sitemap;
+  if (sitemap.learnedLogoutControl === undefined) {
+    const answer = await deps.interact.ask(
+      `Flow "${flow.title}" needs to start on an unauthenticated page (${firstGuardPhases.join('/')}) but the session is currently logged in (likely left over from an earlier flow). Paste the exact label of a "Logout"/"Sign out" control to click, or "none" if there's no way to log out.`,
+      { default: 'none' },
+    );
+    const label = answer.trim();
+    sitemap.learnedLogoutControl = label && label.toLowerCase() !== 'none' ? label : 'none';
+    deps.state.saveSitemap();
+  }
+  if (sitemap.learnedLogoutControl && sitemap.learnedLogoutControl !== 'none') {
+    new Nav(deps.browser).click({ label: sitemap.learnedLogoutControl, optional: true });
+    deps.browser.wait(1500);
+    return true;
+  }
+  return false;
+}
+
 /**
  * Some create/upload entry points resume prior state (e.g. Koyal's "Create Your
  * Next Video" always resumes the last draft) instead of landing on milestone 1's
@@ -120,6 +155,15 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
 async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
   const firstGuardPhases = flow.milestones[0]?.guardPhases;
   if (!firstGuardPhases?.length) return;
+
+  const hereIdEarly = currentPageId(deps);
+  if (
+    hereIdEarly !== 'unknown' &&
+    !firstGuardPhases.includes(hereIdEarly) &&
+    firstGuardPhases.some(looksLikeAuthEntryPageId)
+  ) {
+    if (await ensureLoggedOutForEntry(deps, flow, firstGuardPhases)) return;
+  }
 
   if (flow.entry.freshEntryHint) {
     if (flow.entry.freshEntryHint !== 'none') {
@@ -173,6 +217,16 @@ function isLoginShapedGoal(goal: string): boolean {
   return wantsAuth && !negativePath;
 }
 
+/**
+ * A random marker string is meaningless as a search query — it deterministically
+ * returns zero results, so a milestone that then asserts results appear always
+ * false-fails on a healthy site. Search fields need a real-looking term, not the
+ * edit-verification marker (which is only meaningful for content-persistence checks).
+ */
+function isSearchShapedGoal(goal: string): boolean {
+  return /\bsearch\b/i.test(goal);
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -203,11 +257,14 @@ async function runMilestone(
   // fill in run-unique edit markers so edits are real and verifiable — only for
   // explicit edit milestones (a 'create' click may involve no text field at all)
   const loginShaped = isLoginShapedGoal(milestone.goal);
+  const searchShaped = isSearchShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped) {
+  if (milestone.kind === 'edit' && !loginShaped && !searchShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
+  } else if (searchShaped) {
+    goal = `${goal}\nUse a real, generic search term likely to match existing content (e.g. a common product/category word) — NOT a random or made-up string.`;
   }
 
   const recipeId = `flow:${flow.id}:${milestone.id}`;

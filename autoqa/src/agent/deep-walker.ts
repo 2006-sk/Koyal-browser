@@ -491,11 +491,17 @@ export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
     const step = actionable[i];
     const page = state.sitemap.pages[step.pageId];
     const stepIdx = trail.steps.indexOf(step);
+    // Bound the lookahead to the NEXT milestone's own boundary — if this step's
+    // action didn't immediately navigate (e.g. a same-page toast/modal), searching
+    // unbounded can walk PAST the next milestone and steal ITS landmark instead
+    // (observed: an "Add to cart" milestone grabbing a later, unrelated Signup
+    // page's landmark). The next milestone's own state is still a valid target.
+    const nextActionableIdx = i + 1 < actionable.length ? trail.steps.indexOf(actionable[i + 1]) : trail.steps.length;
     // fold processing waits after this step into its budget, and aim the success
     // hint at the NEXT DIFFERENT state's landmark (same-page hints are vacuous)
     let processing: WalkStep | undefined;
     let target: WalkStep | undefined;
-    for (let j = stepIdx + 1; j < trail.steps.length; j++) {
+    for (let j = stepIdx + 1; j < trail.steps.length && j <= nextActionableIdx; j++) {
       const candidate = trail.steps[j];
       if (candidate.kind === 'processing' || candidate.action?.type === 'wait-processing') {
         processing = processing ?? candidate;

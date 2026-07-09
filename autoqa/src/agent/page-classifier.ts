@@ -168,12 +168,13 @@ Respond with JSON only:
     raw = await llm.complete({ messages: [{ role: 'user', content: prompt }], maxTokens: 6000 });
     parsed = parseJsonFromLlm<typeof parsed>(raw);
   }
+  // Shared ACROSS all proposed flows in this call, not per-flow: the LLM sometimes
+  // copies one successHint onto every milestone (e.g. sidebar-nav destinations),
+  // or reuses one flow's landmark on an unrelated flow's milestone. A duplicate
+  // landmark is guaranteed to mismatch on at least one of them, so keep only the
+  // first occurrence globally and let the rest fall back to goal-based checks.
+  const seenHints = new Set<string>();
   return (parsed.flows ?? []).map((f) => {
-    // the LLM sometimes copies one successHint onto every milestone (e.g. sidebar-nav
-    // destinations) — a duplicate landmark is guaranteed to mismatch on at least one
-    // milestone, so keep only the first occurrence and let the rest fall back to
-    // goal-based description with no snapshot assertion.
-    const seenHints = new Set<string>();
     return {
       id: (f.id || 'flow').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
       title: f.title ?? f.id,

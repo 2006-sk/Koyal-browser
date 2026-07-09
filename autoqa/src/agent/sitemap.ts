@@ -132,6 +132,8 @@ export interface SiteMap {
   walks?: Record<string, WalkTrail>;
   /** Free-text hints appended to the Explorer system prompt */
   siteHints: string[];
+  /** Learned once: label of a site-wide "Logout"/"Sign out" control, or 'none' if there isn't one — reused by every flow that needs to start from an unauthenticated page. */
+  learnedLogoutControl?: string;
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
