@@ -116,7 +116,13 @@ export async function proposeFlows(llm: LlmClient, sitemapSummary: string): Prom
 Site map:
 ${sitemapSummary}
 
-Propose 3-6 end-to-end flows a QA tester should walk, ordered by importance. Keep milestone goals concise (one sentence each). Each flow is a sequence of milestones; each milestone is a natural-language goal a browser agent can execute (click/fill/upload — it will ask a human for file paths and credentials when needed). Include real content edits where the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
+Propose 3-6 end-to-end flows a QA tester should walk, ordered by importance. Keep milestone goals concise (one sentence each). Each flow is a sequence of milestones; each milestone is a natural-language goal a browser agent can execute (click/fill/upload — it will ask a human for file paths and credentials when needed).
+
+DEEP FUNCTIONAL COVERAGE (important): the goal is to prove the PLATFORM works, not just that pages render. So for any content-creation app, include flows/milestones that actually EXERCISE features end-to-end, not just navigate past them:
+- CREATE content where the app allows it (e.g. create a character, add a scene, add an item) and verify the new thing appears.
+- EDIT content (script/scene/prompt/profile text) by inserting unique marker text and verifying it persists.
+- Walk multi-step creation wizards to their real terminal artifact, exercising the meaningful choice at each step.
+Include real content edits/creations wherever the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
 
 Respond with JSON only:
 {

@@ -18,6 +18,9 @@ import {
   type SiteMap,
 } from './sitemap.js';
 
+/** Guard for the anchor-less click-probe fallback: never auto-click destructive-looking text during discovery. */
+const DESTRUCTIVE_TEXT_RE = /\b(delete|remove|destroy|clear all|pay|checkout|buy|purchase|place order|logout|log out|sign out|deactivate|cancel (account|subscription|plan|membership)|revoke|invite|withdraw|transfer)\b/i;
+
 interface QueueItem {
   url: string;
   depth: number;
@@ -158,6 +161,7 @@ export async function explore(
   }
 
   const visitedThisRun = new Set<string>();
+  const seenPageIds = new Set<string>(); // sitemap pages re-confirmed live this run (for removed-feature detection)
   let pagesVisited = 0;
   let soft404Skipped = 0;
   // maps exact snapshot content -> the first URL that produced it, so an SPA
@@ -176,6 +180,7 @@ export async function explore(
     const known = matchPage(state.sitemap, url, snapshot);
     if (known) {
       known.lastSeenAt = new Date().toISOString();
+      seenPageIds.add(known.id);
       const norm = normalizePath(url);
       if (!known.urlPatterns.includes(norm)) known.urlPatterns.push(norm);
       return known;
@@ -200,6 +205,7 @@ export async function explore(
     console.log(`[crawl] classifying new page at ${url}`);
     const classified = await classifyPage(llm, url, snapshot);
     const merged = mergePage(state.sitemap, classified);
+    seenPageIds.add(merged.id);
     try {
       const shot = path.join(state.screensDir, `${merged.id}.png`);
       browser.screenshotAnnotated(shot);
@@ -278,6 +284,45 @@ export async function explore(
       }
     }
 
+    // SPA fallback: JS-routed clickables the LLM did NOT surface as interactives
+    // (e.g. demoqa's <div> cards with no href). Probe by visible text; skip
+    // anything destructive-looking. Fixes sites whose whole nav is anchor-less.
+    if (pagesVisited < maxPages) {
+      const knownLabels = new Set(page.interactives.map((e) => e.label.toLowerCase()));
+      const candidates = browser
+        .findClickableCandidates()
+        .filter((t) => !knownLabels.has(t.toLowerCase()))
+        .filter((t) => !DESTRUCTIVE_TEXT_RE.test(t))
+        .slice(0, probesPerPage);
+      for (const label of candidates) {
+        const beforeUrl = browser.getUrl();
+        if (!browser.clickByText(label)) continue;
+        let afterUrl = browser.getUrl();
+        const navDeadline = Date.now() + 5000;
+        while (normalizePath(afterUrl) === normalizePath(beforeUrl) && Date.now() < navDeadline) {
+          browser.wait(1000);
+          afterUrl = browser.getUrl();
+        }
+        if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
+          const landed = await identifyCurrentPage();
+          pagesVisited++;
+          if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === label)) {
+            state.sitemap.edges.push({ from: page.id, actionLabel: label, to: landed.id });
+          }
+          try {
+            browser.open(item.url);
+            browser.wait(1500);
+            nav.dismissOverlays();
+          } catch {
+            break;
+          }
+          if (pagesVisited >= maxPages) break;
+        } else {
+          nav.dismissOverlays();
+        }
+      }
+    }
+
     state.saveSitemap();
   }
 
@@ -286,6 +331,34 @@ export async function explore(
   );
   if (soft404Skipped > 0) {
     console.log(`[crawl] skipped ${soft404Skipped} suspected soft-404/catch-all page(s) (not added to sitemap)`);
+  }
+
+  // ---- Refactor change-detection: known pages we RE-VISITED (their direct URL was
+  // queued) but could no longer match are likely removed/changed by a redesign.
+  // Only judge pages that were in the sitemap before this run AND had a direct URL
+  // (so we actually re-opened them) — never new-this-run pages.
+  const removedOrChanged: string[] = [];
+  for (const page of Object.values(state.sitemap.pages)) {
+    if (!inventoryBefore.pageIds.has(page.id)) continue; // new this run
+    if (seenPageIds.has(page.id)) continue; // re-confirmed live
+    const directPattern = page.urlPatterns.find((u) => !u.includes(':id'));
+    if (!directPattern) continue; // couldn't have re-visited it deterministically
+    if (visitedThisRun.has(normalizePath(`${origin}${directPattern}`))) {
+      removedOrChanged.push(`${page.id} (${directPattern})`);
+    }
+  }
+  if (removedOrChanged.length > 0) {
+    console.log('\n[crawl] ⚠ POSSIBLY REMOVED/CHANGED since last explore (re-visited but no longer matched):');
+    for (const p of removedOrChanged) console.log(`  - ${p}`);
+    const staleFlows = state.sitemap.flows.filter(
+      (f) =>
+        f.status === 'approved' &&
+        (removedOrChanged.some((r) => r.startsWith(`${f.entry.pageId} `)) ||
+          f.milestones.some((m) => m.guardPhases?.some((g) => removedOrChanged.some((r) => r.startsWith(`${g} `))))),
+    );
+    for (const f of staleFlows) {
+      console.log(`  ↳ flow "${f.id}" references a removed/changed page — needs re-verification`);
+    }
   }
 
   // ---- Deep-walk phase: actually enter create/upload flows ----

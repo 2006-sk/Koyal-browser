@@ -61,6 +61,22 @@ function isBlankState(url: string, snapshot: string): boolean {
 }
 
 function advanceGoal(page: PageNode, marker: string): string {
+  if (config.probes.exhaustive) {
+    // DEEP mode: don't just click through — actually USE the step's features so we
+    // test that they work (create a character, edit a scene, change settings), then
+    // advance. This is what proves the platform functions, not just that it renders.
+    return (
+      `You are one step inside a creation flow. Current step: "${page.title}" (${page.description}). ` +
+      `Your job is to EXERCISE this step's real functionality, then advance one screen:\n` +
+      `1. If this step lets you CREATE or ADD something (a character, a scene, an item), DO it — ` +
+      `click the create/add control, fill any required fields with exactly "${marker}", and confirm the new thing appears.\n` +
+      `2. If this step has EDITABLE content (script/scene/prompt text), edit it: insert exactly "${marker}" and verify it shows.\n` +
+      `3. If this step offers CHOICES (story type, style, settings), make a real selection (not necessarily the first — pick a meaningful one).\n` +
+      `4. Complete any REQUIRED modal (plan/confirmation) — never close it with ✕ or Cancel; upload via action "upload" if a file picker is required.\n` +
+      `Then click the enabled Next/Continue/primary button. Use "done" the moment the screen visibly changes to the next step. ` +
+      `If the step has no creatable/editable/selectable content, just advance.`
+    );
+  }
   return (
     `You are one step inside a creation flow. Current step: "${page.title}" (${page.description}). ` +
     `Complete ONLY this step and advance exactly one screen: make the minimal required choice ` +

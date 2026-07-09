@@ -162,13 +162,18 @@ export class Statements {
       }
 
       const normalized = normalizeStatement(candidate.text);
+      // success/failure classifications FLIP verdicts, so scope them to the page
+      // they were seen on — a global "success" phrase would wrongly pass every
+      // page containing it. 'noise' only SUPPRESSES a benign message, so keeping
+      // it global is low-risk and avoids re-asking about framework warnings.
+      const scope = answer === 'noise' ? 'global' : pageId || 'global';
       const entry: StatementEntry = {
         key: statementKey(normalized),
         normalized,
         pattern: statementPattern(normalized),
         raw: candidate.text,
         classification: answer,
-        scope: 'global',
+        scope,
         kind: candidate.kind,
         decidedBy: 'human',
         decidedAt: new Date().toISOString(),

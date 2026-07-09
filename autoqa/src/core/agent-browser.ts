@@ -415,6 +415,55 @@ export class AgentBrowser {
     return true;
   }
 
+  /** Visible text of navigational clickables that are NOT plain <a href> anchors — JS-routed cards, role=button/tab/menuitem, [onclick] divs. For SPAs (e.g. demoqa) whose nav has no hrefs. */
+  findClickableCandidates(max = 25): string[] {
+    try {
+      const stdout = this.evalScript(`
+        (function() {
+          const sel = 'a:not([href]),[role=button],[role=link],[role=tab],[role=menuitem],[onclick],button,[class*="card"],[class*="tile"],[class*="menu-item"]';
+          const out = [];
+          const seen = new Set();
+          for (const el of document.querySelectorAll(sel)) {
+            if (!(el.offsetParent !== null || el.getClientRects().length)) continue;
+            const t = (el.textContent || '').replace(/\\s+/g,' ').trim();
+            if (!t || t.length > 40 || seen.has(t)) continue;
+            seen.add(t);
+            out.push(t);
+            if (out.length >= ${max}) break;
+          }
+          return JSON.stringify(out);
+        })();
+      `);
+      const match = stdout.match(/\[[\s\S]*\]/);
+      return match ? (JSON.parse(match[0]) as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** JS-click the innermost visible element whose trimmed text equals `text`. Safe interpolation via JSON.stringify. */
+  clickByText(text: string): boolean {
+    const stdout = this.evalScript(`
+      (function() {
+        const target = ${JSON.stringify(text)};
+        const els = [...document.querySelectorAll('a,button,[role],[onclick],div,span,li')];
+        // innermost match first (most specific clickable), must be visible
+        for (let i = els.length - 1; i >= 0; i--) {
+          const el = els[i];
+          const t = (el.textContent || '').replace(/\\s+/g,' ').trim();
+          if (t !== target) continue;
+          if (!(el.offsetParent !== null || el.getClientRects().length)) continue;
+          el.scrollIntoView({block:'center'});
+          (el.closest('a,button,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]') || el).click();
+          return 'CLICKED';
+        }
+        return 'NO_MATCH';
+      })();
+    `);
+    this.wait(config.actionDelayMs);
+    return stdout.includes('CLICKED');
+  }
+
   clickNextIfEnabled(): boolean {
     const snap = this.snapshotInteractive();
     const line = snap.split('\n').find((l) => /button "Next"/.test(l) && !/\[disabled/.test(l));
