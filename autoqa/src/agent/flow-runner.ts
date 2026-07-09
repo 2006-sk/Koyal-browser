@@ -48,12 +48,18 @@ export interface FlowRunnerDeps {
 }
 
 function currentPageId(deps: FlowRunnerDeps): string {
-  const page = matchPage(
-    deps.state.sitemap,
-    deps.browser.getUrl(),
-    deps.browser.snapshotInteractive(),
-  );
-  return page?.id ?? 'unknown';
+  // Called throughout this module (guard-phase checks, probe repositioning, KB
+  // triage, fast-forward). If the browser daemon is wedged, getUrl/snapshot throw
+  // — treat that exactly like "couldn't identify the page" (the existing,
+  // already-handled 'unknown' case) rather than letting it escape and abort
+  // whatever step is currently in flight, potentially losing an already-passed
+  // milestone that just hasn't been pushed to scenario.steps yet.
+  try {
+    const page = matchPage(deps.state.sitemap, deps.browser.getUrl(), deps.browser.snapshotInteractive());
+    return page?.id ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 /** Wait for an expected guard phase to appear before declaring the flow off-track. */
@@ -324,82 +330,95 @@ async function runMilestone(
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 
-  // A missed successHint is an LLM guess, not ground truth: when it is the ONLY
-  // failure signal (page otherwise healthy, no edit marker at stake), escalate
-  // to the human instead of hard-failing.
-  if (
-    step.result.verdict === 'fail' &&
-    !marker &&
-    step.result.reasons.length > 0 &&
-    step.result.reasons.every((r) => r.startsWith('Expected snapshot to include'))
-  ) {
-    step.result.verdict = 'needs-review';
-  }
-
-  // ask-once statement triage on the new outcome state
-  const triage = await statements.triage(
-    extractCandidates(before, step.result.signals),
-    currentPageId(deps),
-  );
-  step.result.kbTriage = {
-    statementsSeen: triage.seen,
-    newlyClassified: triage.newlyClassified,
-  };
-
-  // the KB (including anything just classified) may resolve a non-pass verdict
-  if (step.result.verdict !== 'pass') {
-    const augmented = statements.augmentExpectation(base, currentPageId(deps));
-    const re = verification.evaluateSignals(step.result.signals, augmented);
-    const successSeen = statements.hasSuccessStatement(step.result.signals, currentPageId(deps));
-    // soften hint-only failures here too (same rule as above)
-    let reVerdict = re.verdict;
+  // Everything below is POST-verdict bookkeeping (KB triage, human escalation,
+  // recipe caching) — none of it should be able to lose the verdict `step`
+  // already computed above. A browser hiccup here (the daemon wedging between
+  // this milestone's own verification and the next browser call) previously
+  // threw out of runMilestone entirely, and since `step` is only pushed to
+  // scenario.steps by the CALLER after a normal return, the already-passing
+  // step vanished from the report with no trace beyond the console log.
+  try {
+    // A missed successHint is an LLM guess, not ground truth: when it is the ONLY
+    // failure signal (page otherwise healthy, no edit marker at stake), escalate
+    // to the human instead of hard-failing.
     if (
-      reVerdict === 'fail' &&
+      step.result.verdict === 'fail' &&
       !marker &&
-      re.reasons.length > 0 &&
-      re.reasons.every((r) => r.startsWith('Expected snapshot to include'))
+      step.result.reasons.length > 0 &&
+      step.result.reasons.every((r) => r.startsWith('Expected snapshot to include'))
     ) {
-      reVerdict = 'needs-review';
+      step.result.verdict = 'needs-review';
     }
-    let flipped: Verdict | null = null;
-    if (reVerdict === 'pass' || (reVerdict !== 'fail' && successSeen)) {
-      flipped = 'pass';
-    } else if (reVerdict === 'fail' && step.result.verdict !== 'fail') {
-      flipped = 'fail';
-    }
-    if (flipped && flipped !== step.result.verdict) {
-      console.log(`[flow] verdict flipped ${step.result.verdict} → ${flipped} after human classification`);
-      step.result.kbTriage.verdictFlippedFrom = step.result.verdict;
-      step.result.verdict = flipped;
-      step.result.reasons = flipped === 'pass' ? re.reasons.filter((r) => !r.startsWith('Expected')) : re.reasons;
-    }
-  }
 
-  // still ambiguous → the human is the escalation path
-  if (step.result.verdict === 'needs-review') {
-    const answer = await interact.askChoice(
-      `Step "${milestone.goal.slice(0, 80)}" is ambiguous (${step.result.reasons.join('; ').slice(0, 120)}). Verdict?`,
-      ['pass', 'fail', 'skip'],
-      'skip',
+    // ask-once statement triage on the new outcome state
+    const triage = await statements.triage(
+      extractCandidates(before, step.result.signals),
+      currentPageId(deps),
     );
-    if (answer === 'pass' || answer === 'fail') {
-      step.result.kbTriage = step.result.kbTriage ?? { statementsSeen: [], newlyClassified: [] };
-      step.result.kbTriage.verdictFlippedFrom = 'needs-review';
-      step.result.verdict = answer;
+    step.result.kbTriage = {
+      statementsSeen: triage.seen,
+      newlyClassified: triage.newlyClassified,
+    };
+
+    // the KB (including anything just classified) may resolve a non-pass verdict
+    if (step.result.verdict !== 'pass') {
+      const augmented = statements.augmentExpectation(base, currentPageId(deps));
+      const re = verification.evaluateSignals(step.result.signals, augmented);
+      const successSeen = statements.hasSuccessStatement(step.result.signals, currentPageId(deps));
+      // soften hint-only failures here too (same rule as above)
+      let reVerdict = re.verdict;
+      if (
+        reVerdict === 'fail' &&
+        !marker &&
+        re.reasons.length > 0 &&
+        re.reasons.every((r) => r.startsWith('Expected snapshot to include'))
+      ) {
+        reVerdict = 'needs-review';
+      }
+      let flipped: Verdict | null = null;
+      if (reVerdict === 'pass' || (reVerdict !== 'fail' && successSeen)) {
+        flipped = 'pass';
+      } else if (reVerdict === 'fail' && step.result.verdict !== 'fail') {
+        flipped = 'fail';
+      }
+      if (flipped && flipped !== step.result.verdict) {
+        console.log(`[flow] verdict flipped ${step.result.verdict} → ${flipped} after human classification`);
+        step.result.kbTriage.verdictFlippedFrom = step.result.verdict;
+        step.result.verdict = flipped;
+        step.result.reasons = flipped === 'pass' ? re.reasons.filter((r) => !r.startsWith('Expected')) : re.reasons;
+      }
     }
-  }
 
-  step.humanDecisions = interact.decisions.slice(decisionsBefore);
+    // still ambiguous → the human is the escalation path
+    if (step.result.verdict === 'needs-review') {
+      const answer = await interact.askChoice(
+        `Step "${milestone.goal.slice(0, 80)}" is ambiguous (${step.result.reasons.join('; ').slice(0, 120)}). Verdict?`,
+        ['pass', 'fail', 'skip'],
+        'skip',
+      );
+      if (answer === 'pass' || answer === 'fail') {
+        step.result.kbTriage = step.result.kbTriage ?? { statementsSeen: [], newlyClassified: [] };
+        step.result.kbTriage.verdictFlippedFrom = 'needs-review';
+        step.result.verdict = answer;
+      }
+    }
 
-  // success + explored → cache the recipe for next time
-  if (step.result.verdict === 'pass' && explored?.success) {
-    recordFromExplorer(state, recipeId, explored, {
-      secrets: { email: state.secrets.email, password: state.secrets.password },
-      successCheck:
-        milestone.successHint && isLiteralHint(milestone.successHint)
-          ? { snapshotAnyOf: [milestone.successHint] }
-          : undefined,
-    });
+    step.humanDecisions = interact.decisions.slice(decisionsBefore);
+
+    // success + explored → cache the recipe for next time
+    if (step.result.verdict === 'pass' && explored?.success) {
+      recordFromExplorer(state, recipeId, explored, {
+        secrets: { email: state.secrets.email, password: state.secrets.password },
+        successCheck:
+          milestone.successHint && isLiteralHint(milestone.successHint)
+            ? { snapshotAnyOf: [milestone.successHint] }
+            : undefined,
+      });
+    }
+  } catch (error) {
+    console.warn(
+      `[flow] post-verdict bookkeeping failed (keeping the already-computed "${step.result.verdict}" verdict): ${error instanceof Error ? error.message : error}`,
+    );
   }
 
   return { step, marker };
