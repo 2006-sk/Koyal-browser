@@ -247,7 +247,7 @@ export class AgentBrowser {
   }
 
   clickVisible(ref: string): void {
-    if (config.showCursor) {
+    if (this.showCursor) {
       this.pointAtRef(ref);
       this.click(ref);
       return;
@@ -256,7 +256,7 @@ export class AgentBrowser {
   }
 
   fillVisible(ref: string, value: string): void {
-    if (config.showCursor) {
+    if (this.showCursor) {
       this.pointAtRef(ref);
       this.fill(ref, value);
       return;
@@ -484,6 +484,23 @@ export class AgentBrowser {
     this.wait(config.actionDelayMs);
     if (stdout.includes('NO_MATCH')) return false;
     return true;
+  }
+
+  /** DOM-level password-input check — catches login forms whose <input type=password> has no accessible name/label, which the accessibility-tree snapshot then renders as an unlabeled "textbox" the text-based auth-gate heuristic can't see. */
+  hasVisiblePasswordInput(): boolean {
+    try {
+      const stdout = this.evalScript(`
+        (function() {
+          for (const el of document.querySelectorAll('input[type=password]')) {
+            if (el.offsetParent !== null || el.getClientRects().length) return 'YES';
+          }
+          return 'NO';
+        })();
+      `);
+      return stdout.includes('YES');
+    } catch {
+      return false;
+    }
   }
 
   /** Visible text of navigational clickables that are NOT plain <a href> anchors — JS-routed cards, role=button/tab/menuitem, [onclick] divs. For SPAs (e.g. demoqa) whose nav has no hrefs. */

@@ -116,6 +116,24 @@ export function applyCliOverrides(overrides: CliOverrides): void {
   if (overrides.noDeep) config.deep.enabled = false;
   if (overrides.quick) config.probes.thorough = false;
   if (overrides.uploadFile) config.uploadFileOverride = overrides.uploadFile;
+
+  // login/.env's KOYAL_TEST_EMAIL/PASSWORD are a convenience for testing Koyal
+  // specifically — they must NOT leak into AUTOQA_EMAIL/PASSWORD (checked by the
+  // generic, site-agnostic auth module) for every other target site. Scope the
+  // shim to when the resolved target actually is Koyal.
+  try {
+    const isKoyal = config.baseUrl && new URL(config.baseUrl).hostname.includes('koyal');
+    if (isKoyal) {
+      if (!process.env.AUTOQA_EMAIL && process.env.KOYAL_TEST_EMAIL) {
+        process.env.AUTOQA_EMAIL = process.env.KOYAL_TEST_EMAIL;
+      }
+      if (!process.env.AUTOQA_PASSWORD && process.env.KOYAL_TEST_PASSWORD) {
+        process.env.AUTOQA_PASSWORD = process.env.KOYAL_TEST_PASSWORD;
+      }
+    }
+  } catch {
+    // malformed baseUrl — requireBaseUrl() will surface this later
+  }
 }
 
 export function requireBaseUrl(): string {

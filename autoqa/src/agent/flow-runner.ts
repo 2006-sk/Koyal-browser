@@ -143,9 +143,24 @@ async function ensureLoggedOutForEntry(
     deps.state.saveSitemap();
   }
   if (sitemap.learnedLogoutControl && sitemap.learnedLogoutControl !== 'none') {
-    new Nav(deps.browser).click({ label: sitemap.learnedLogoutControl, optional: true });
+    const nav = new Nav(deps.browser);
+    const stillAuthed = () => !firstGuardPhases.includes(currentPageId(deps));
+    // The click is `optional` (never throws) and some sites hide the actual
+    // control inside a collapsed user-menu the first click only opens — verify
+    // it actually landed us on the expected anon page before trusting it, one
+    // retry, rather than silently declaring success on a no-op click.
+    nav.click({ label: sitemap.learnedLogoutControl, optional: true });
     deps.browser.wait(1500);
-    return true;
+    if (!stillAuthed()) return true;
+    deps.browser.wait(800);
+    nav.click({ label: sitemap.learnedLogoutControl, optional: true });
+    deps.browser.wait(1500);
+    if (!stillAuthed()) return true;
+    console.warn(
+      `[flow] logout control "${sitemap.learnedLogoutControl}" didn't change page state — ` +
+        `still looks authenticated (it may be hidden inside a menu that needs opening first)`,
+    );
+    return false;
   }
   return false;
 }
@@ -162,12 +177,25 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   const firstGuardPhases = flow.milestones[0]?.guardPhases;
   if (!firstGuardPhases?.length) return;
 
+  const needsAnonEntry = firstGuardPhases.some(looksLikeAuthEntryPageId);
   const hereIdEarly = currentPageId(deps);
-  if (
-    hereIdEarly !== 'unknown' &&
-    !firstGuardPhases.includes(hereIdEarly) &&
-    firstGuardPhases.some(looksLikeAuthEntryPageId)
-  ) {
+  // Page-id mismatch is the common signal. 'unknown' counts as a mismatch too —
+  // a same-session redirect right after navigateToEntry can land somewhere the
+  // sitemap hasn't classified yet, and requiring a resolved id previously let
+  // that case through uninspected. Once a logout control has been learned this
+  // run, its literal presence in the CURRENT snapshot is an even more direct
+  // "are we actually logged in" signal than the page id alone (some apps still
+  // render/resolve the login page's id/URL even while an earlier flow's session
+  // is silently active — e.g. a login URL that only redirects away on an actual
+  // protected-route hit).
+  const logoutCtrl = deps.state.sitemap.learnedLogoutControl;
+  const logoutControlVisible =
+    needsAnonEntry &&
+    Boolean(logoutCtrl) &&
+    logoutCtrl !== 'none' &&
+    deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
+  const pageIdLooksStillAuthed = needsAnonEntry && !firstGuardPhases.includes(hereIdEarly);
+  if (pageIdLooksStillAuthed || logoutControlVisible) {
     if (await ensureLoggedOutForEntry(deps, flow, firstGuardPhases)) return;
   }
 
@@ -526,6 +554,42 @@ export async function runFlows(
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[flow] ${flow.id} aborted: ${msg}`);
       writeJson(path.join(evidenceDir, 'flow-error.json'), { flow: flow.id, error: msg });
+      // An abort BEFORE any milestone ran (e.g. ensureAuthenticated/navigateToEntry
+      // throwing) leaves scenario.steps empty — the flow then vanishes from the
+      // report with zero evidence instead of showing up as a real, explained
+      // failure. Record one synthetic step so "could not even enter this flow" is
+      // as visible as a milestone that ran and failed.
+      if (scenario.steps.length === 0) {
+        let url = 'unknown';
+        try {
+          url = deps.browser.getUrl();
+        } catch {
+          // browser unavailable — keep 'unknown'
+        }
+        scenario.steps.push({
+          workflow: flow.id,
+          action: 'enter flow (authenticate + navigate to entry)',
+          expected: 'flow entry succeeds so its milestones can run',
+          result: {
+            verdict: 'fail',
+            severity: 'high',
+            expected: 'flow entry succeeds',
+            actual: msg,
+            signals: {
+              url,
+              title: '',
+              snapshot: { raw: '', interactive: '' },
+              pageErrors: [],
+              consoleMessages: [],
+              consoleErrors: [],
+              networkRequests: [],
+            },
+            reasons: [msg],
+            retried: false,
+          },
+          stepsToReproduce: [...ctx.stepsToReproduce],
+        });
+      }
       // A wedged browser daemon (heavy-page CDP stall) makes EVERY later flow abort
       // on timeouts. Recycle it and re-auth so the next flow starts on a fresh,
       // healthy daemon instead of cascading the whole test phase into failure.

@@ -30,9 +30,18 @@ export class Nav {
   }
 
   click(intent: ClickIntent): boolean {
+    // An exact-quoted-name match is tried FIRST — a broader parent wrapper whose
+    // accessible name concatenates ALL its children's text (e.g. a card-grid div
+    // absorbing "ElementsFormsWidgets...") also contains any single child's label
+    // as a substring, so a loose substring pattern alone can silently resolve to
+    // the wrong (wrapper) element every time. Only fall back to the loose pattern
+    // when no exact quoted match exists.
     const patterns =
       typeof intent.label === 'string'
-        ? [new RegExp(intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')]
+        ? (() => {
+            const escaped = intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return [new RegExp(`"${escaped}"`, 'i'), new RegExp(escaped, 'i')];
+          })()
         : [intent.label];
 
     for (const pattern of patterns) {

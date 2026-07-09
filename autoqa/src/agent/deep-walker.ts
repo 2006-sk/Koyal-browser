@@ -218,13 +218,13 @@ export async function deepWalk(
     // sessions expire mid-explore: a login wall here means we'd deep-walk the auth
     // pages instead of the target flow (observed: an "audio upload" walk that
     // faithfully explored Sign Up + OTP). Re-authenticate and re-enter.
-    if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive())) {
+    if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput())) {
       if (deps.ensureAuth) {
         console.log('[walk] entry landed on a login wall — re-authenticating');
         await deps.ensureAuth();
         openEntry();
       }
-      if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive())) {
+      if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput())) {
         console.warn(`[walk] ${trailId}: entry is stuck behind a login wall — aborting (will retry next explore)`);
         trail.outcome = 'aborted';
         trail.finishedAt = new Date().toISOString();

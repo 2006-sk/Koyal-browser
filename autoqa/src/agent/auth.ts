@@ -15,7 +15,7 @@ export interface AuthContext {
 }
 
 function isGated(browser: AgentBrowser): boolean {
-  return looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive());
+  return looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput());
 }
 
 /** SPA hydration + auth redirects lag page load — poll instead of sampling once. */
@@ -38,14 +38,17 @@ function authProbeUrl(state: SiteState): string {
 }
 
 async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; password: string }> {
+  // site-specific saved secrets are a deliberate, per-host choice and must win over
+  // any blanket env var — a generic AUTOQA_EMAIL/PASSWORD set for one site (e.g.
+  // while also testing Koyal) must never get submitted to an unrelated site's login.
   const emailRes = await ctx.interact.askSecret(
     `login email for ${ctx.state.hostname}`,
-    ['AUTOQA_EMAIL', 'KOYAL_TEST_EMAIL'],
+    ['AUTOQA_EMAIL'],
     ctx.state.secrets.email,
   );
   const passwordRes = await ctx.interact.askSecret(
     `login password for ${ctx.state.hostname}`,
-    ['AUTOQA_PASSWORD', 'KOYAL_TEST_PASSWORD'],
+    ['AUTOQA_PASSWORD'],
     ctx.state.secrets.password,
   );
 
@@ -111,12 +114,21 @@ export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
 
   // 3. LLM-explore the login form (mask creds from logs/step history, not the prompt)
   ctx.explorer.setRedactions([creds.password, creds.email]);
-  const result = await ctx.explorer.achieveGoal(
+  const loginGoal =
     `Log in to this site with email "${creds.email}" and password "${creds.password}". ` +
-      `The login form may be behind a toggle or "Log In" tab if the page defaults to sign-up. ` +
-      `Use action "done" once you are past the auth gate (URL changes away from login, or the app shell appears).`,
-    { maxSteps: 12 },
-  );
+    `The login form may be behind a toggle or "Log In" tab if the page defaults to sign-up. ` +
+    `Use action "done" once you are past the auth gate (URL changes away from login, or the app shell appears).`;
+  let result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12 });
+
+  // one full fresh retry — guards against a transient first-attempt hiccup
+  // (slow backend, one-off form-submit flake) without weakening detection of
+  // genuinely-wrong credentials, which will fail identically on the retry too.
+  if (!result.success) {
+    console.log(`[auth] first login attempt failed (${result.error ?? 'unknown'}) — retrying once fresh`);
+    browser.open(probeUrl);
+    browser.wait(1000);
+    result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12 });
+  }
 
   if (!result.success) {
     throw new Error(`Login failed: ${result.error ?? 'explorer could not complete login'}`);

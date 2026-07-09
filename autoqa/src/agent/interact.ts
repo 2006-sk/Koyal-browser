@@ -145,17 +145,22 @@ export class Interact {
     throw new Error(`No valid file path provided for: ${question}`);
   }
 
-  /** Resolution chain: env vars → saved secrets → human prompt */
+  /**
+   * Resolution chain: saved (site-specific) secret → env vars → human prompt.
+   * Saved secrets win over env vars deliberately — a generic env var (e.g.
+   * AUTOQA_EMAIL set while testing one site) must never silently override a
+   * DIFFERENT site's own previously-learned, per-host credentials.
+   */
   async askSecret(
     label: string,
     envVars: string[],
     saved: string | undefined,
   ): Promise<{ value: string; fromPrompt: boolean }> {
+    if (saved) return { value: saved, fromPrompt: false };
     for (const envVar of envVars) {
       const value = process.env[envVar];
       if (value) return { value, fromPrompt: false };
     }
-    if (saved) return { value: saved, fromPrompt: false };
     const value = await this.ask(`Enter ${label}`, { secret: true });
     return { value, fromPrompt: true };
   }
