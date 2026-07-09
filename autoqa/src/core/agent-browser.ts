@@ -26,12 +26,38 @@ export class AgentBrowser {
   private readonly showCursor: boolean;
   private readonly binary: string;
   private cursorInjected = false;
+  /** Consecutive subprocess timeouts — a wedged daemon; drives recycle decisions in the runner. */
+  consecutiveTimeouts = 0;
 
   constructor(options: AgentBrowserOptions = {}) {
     this.session = options.session ?? config.session;
     this.headed = options.headed ?? config.headed;
-    this.showCursor = config.showCursor;
+    // The cursor overlay injects an extra eval on every action. On heavy pages
+    // (Koyal's wizard) that CDP traffic helps wedge the daemon, so drop it in
+    // deep/exhaustive runs where throughput + stability matter more than the demo cursor.
+    this.showCursor = config.showCursor && !config.probes.exhaustive;
     this.binary = path.join(config.projectRoot, 'node_modules', '.bin', 'agent-browser');
+  }
+
+  /**
+   * Force-kill the browser daemon + its Chrome tree when it has wedged (graceful
+   * `close` hangs on a dead CDP connection, so kill hard). The next command
+   * lazily respawns a fresh daemon. Session cookies are reloaded by the caller
+   * via ensureAuthenticated/stateLoad. Returns true if a kill was issued.
+   */
+  recycle(): boolean {
+    console.log('[browser] recycling wedged daemon (force-kill + respawn)');
+    try {
+      spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
+      spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
+    } catch {
+      // best-effort
+    }
+    // give the OS a moment to reap and free ports/memory before respawn
+    spawnSync('sleep', ['3']);
+    this.cursorInjected = false;
+    this.consecutiveTimeouts = 0;
+    return true;
   }
 
   run(args: string[], options: { json?: boolean; timeoutMs?: number } = {}): {
@@ -49,16 +75,36 @@ export class AgentBrowser {
       ...args,
     ];
 
-    const result = spawnSync(this.binary, fullArgs, {
+    // A transient CDP stall on a heavy page often clears on a second try. Auto-retry
+    // ONCE, but only for idempotent read/navigation commands — never for mutating
+    // actions (click/fill/upload) where a retry could double-act.
+    const cmd = args[0] ?? '';
+    const retrySafe = ['open', 'snapshot', 'url', 'title', 'errors', 'console', 'network', 'screenshot'].includes(cmd);
+    let result = spawnSync(this.binary, fullArgs, {
       encoding: 'utf8',
       maxBuffer: 20 * 1024 * 1024,
       env: process.env,
       timeout: timeoutMs,
     });
+    const timedOut = (r: typeof result) =>
+      r.error?.message?.includes('ETIMEDOUT') || r.signal === 'SIGTERM';
 
-    if (result.error?.message?.includes('ETIMEDOUT') || result.signal === 'SIGTERM') {
+    if (timedOut(result) && retrySafe) {
+      console.warn(`[browser] ${cmd} timed out — one retry after 2s`);
+      spawnSync('sleep', ['2']);
+      result = spawnSync(this.binary, fullArgs, {
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+        env: process.env,
+        timeout: timeoutMs,
+      });
+    }
+
+    if (timedOut(result)) {
+      this.consecutiveTimeouts++;
       throw new Error(`agent-browser timed out after ${timeoutMs}ms: ${args.join(' ')}`);
     }
+    this.consecutiveTimeouts = 0;
 
     const stdout = (result.stdout ?? '').trim();
     const stderr = (result.stderr ?? '').trim();

@@ -450,6 +450,17 @@ export async function runFlows(
       const msg = error instanceof Error ? error.message : String(error);
       console.error(`[flow] ${flow.id} aborted: ${msg}`);
       writeJson(path.join(evidenceDir, 'flow-error.json'), { flow: flow.id, error: msg });
+      // A wedged browser daemon (heavy-page CDP stall) makes EVERY later flow abort
+      // on timeouts. Recycle it and re-auth so the next flow starts on a fresh,
+      // healthy daemon instead of cascading the whole test phase into failure.
+      if (/timed out|consecutiveTimeouts/i.test(msg) || deps.browser.consecutiveTimeouts >= 2) {
+        deps.browser.recycle();
+        try {
+          await ensureAuthenticated(authCtx);
+        } catch (reauthErr) {
+          console.warn(`[flow] re-auth after recycle failed: ${reauthErr instanceof Error ? reauthErr.message : reauthErr}`);
+        }
+      }
     }
 
     scenario.finishedAt = new Date().toISOString();
