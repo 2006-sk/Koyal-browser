@@ -47,11 +47,36 @@ export class AgentBrowser {
    */
   recycle(): boolean {
     console.log('[browser] recycling wedged daemon (force-kill + respawn)');
+    // Prefer a SESSION-SCOPED kill: `session info --json` exposes this session's
+    // own daemon PID, so we only tear down THIS session's Chrome tree — a blind
+    // `pkill -f agent-browser` kills every concurrent session on the machine,
+    // which breaks the (established) pattern of running several sites' explores
+    // at once. Fall back to the broad kill only if we can't resolve a specific PID.
+    let killedSpecific = false;
     try {
-      spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
-      spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
+      const infoResult = spawnSync(
+        this.binary,
+        ['--session', this.session, 'session', 'info', '--json'],
+        { encoding: 'utf8', timeout: 8_000 },
+      );
+      const parsed = this.tryParseJson((infoResult.stdout ?? '').trim());
+      const pid = (parsed?.data as { pid?: number } | undefined)?.pid;
+      if (pid) {
+        spawnSync('pkill', ['-9', '-P', String(pid)], { timeout: 5_000 }); // Chrome children
+        spawnSync('kill', ['-9', String(pid)], { timeout: 5_000 }); // the daemon itself
+        killedSpecific = true;
+      }
     } catch {
-      // best-effort
+      // best-effort — fall through to the broad kill below
+    }
+    if (!killedSpecific) {
+      console.warn('[browser] could not resolve a session-specific PID — falling back to a broad kill (affects ALL sessions)');
+      try {
+        spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
+        spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
+      } catch {
+        // best-effort
+      }
     }
     // give the OS a moment to reap and free ports/memory before respawn
     spawnSync('sleep', ['3']);
