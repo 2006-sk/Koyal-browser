@@ -68,6 +68,21 @@ Category guidance: "nav" = pure navigation; "create" = creates content; "edit" =
       : 'page'
   ) as PageNode['kind'];
 
+  // The LLM sometimes returns the bare hostname/domain as "distinctive" (e.g.
+  // "demoqa.com") despite being asked for a distinctive PATH fragment — that
+  // matches every page on the site and, combined with shared-chrome landmarks
+  // (a persistent sidebar), silently merges the entire site into one page node
+  // via matchPage's PASS 2. Reject anything that's really just the hostname.
+  let urlIncludes = parsed.detection?.urlIncludes || undefined;
+  if (urlIncludes) {
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      if (hostname.includes(urlIncludes.toLowerCase())) urlIncludes = undefined;
+    } catch {
+      // malformed url — leave urlIncludes as-is
+    }
+  }
+
   return {
     id: (parsed.id || 'page').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
     title: parsed.title ?? parsed.id ?? 'Untitled',
@@ -75,7 +90,7 @@ Category guidance: "nav" = pure navigation; "create" = creates content; "edit" =
     kind,
     urlPatterns: [normalizePath(url)],
     detection: {
-      urlIncludes: parsed.detection?.urlIncludes || undefined,
+      urlIncludes,
       snapshotAnyOf: parsed.detection?.snapshotAnyOf ?? [],
     },
     requiresAuth: parsed.requiresAuth ?? false,

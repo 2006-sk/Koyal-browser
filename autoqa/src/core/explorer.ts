@@ -367,7 +367,11 @@ export class Explorer {
    * dropzone (upload/browse buttons often mount the input lazily), then rescan.
    */
   private tryUpload(filePath: string, selectorHint?: string): string | null {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // React-mounted file inputs (react-dropzone etc.) can lag a beat behind
+      // the state transition that reveals them — give the DOM a moment before
+      // scanning, especially past the first attempt.
+      if (attempt > 0) this.browser.wait(800);
       const selectors = [
         ...(selectorHint ? [selectorHint] : []),
         'input[type=file]',
@@ -381,7 +385,7 @@ export class Explorer {
           // try next selector
         }
       }
-      // arm the dropzone and retry once — dropzones are often divs, so try a
+      // arm the dropzone and retry — dropzones are often divs, so try a
       // snapshot-ref click before the button-text fallback
       try {
         const snap = this.browser.snapshotInteractive();
@@ -393,7 +397,7 @@ export class Explorer {
             this.browser.clickButtonByText('Browse', false) ||
             this.browser.clickButtonByText('Choose', false);
         }
-        this.browser.wait(1200);
+        this.browser.wait(1500);
       } catch {
         // nothing to arm
       }
@@ -402,10 +406,30 @@ export class Explorer {
   }
 }
 
+/**
+ * Dropzone text ("Drop your audio or video file here") is often a nested
+ * heading/paragraph INSIDE the actual clickable wrapper, not clickable itself —
+ * clicking the text's own ref may be a no-op. Walk up by indentation to the
+ * nearest clickable ancestor line; DOM clicks bubble, so the direct ref still
+ * works as a last resort.
+ */
 function resolveDropzoneRef(snapshot: string): string | null {
-  const line = snapshot
-    .split('\n')
-    .find((l) => /drop your|drag (and|&) drop|choose file|browse file/i.test(l) && /\[ref=e\d+\]/.test(l));
-  const ref = line?.match(/\[ref=(e\d+)\]/)?.[1];
-  return ref ? `@${ref}` : null;
+  const lines = snapshot.split('\n');
+  const idx = lines.findIndex((l) => /drop your|drag (and|&) drop|choose file|browse file/i.test(l));
+  if (idx === -1) return null;
+
+  const selfRef = lines[idx].match(/\[ref=(e\d+)\]/)?.[1];
+  if (selfRef && /clickable|onclick/i.test(lines[idx])) return `@${selfRef}`;
+
+  const indentOf = (l: string) => l.match(/^(\s*)/)?.[1].length ?? 0;
+  const targetIndent = indentOf(lines[idx]);
+  for (let i = idx - 1; i >= 0 && i >= idx - 15; i--) {
+    const indent = indentOf(lines[i]);
+    if (indent >= targetIndent) continue; // not an ancestor
+    const ref = lines[i].match(/\[ref=(e\d+)\]/)?.[1];
+    if (ref && /clickable|onclick/i.test(lines[i])) return `@${ref}`;
+    if (indent === 0) break;
+  }
+
+  return selfRef ? `@${selfRef}` : null;
 }
