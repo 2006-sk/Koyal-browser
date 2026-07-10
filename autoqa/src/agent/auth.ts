@@ -74,6 +74,21 @@ async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; pa
 export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
   const { browser, state } = ctx;
 
+  // A login-shaped MILESTONE calls this while already sitting on the real login
+  // page (navigateToEntry took it straight there — e.g. a site whose whole auth
+  // gate is a separate /admin area, never linked from any page tagged
+  // requiresAuth). The generic probe below unconditionally NAVIGATES AWAY from
+  // wherever the browser currently is to authProbeUrl() (the bare origin, when
+  // no page is yet known to require auth) — on a public+admin split site that
+  // origin is never gated, so the probe concludes "not gated" THERE and returns,
+  // having never touched the real, unauthenticated login form it was already on.
+  // Confirmed live: automationintesting.online's admin-login milestone was
+  // silently skipped this way every run — credentials never entered, the
+  // milestone never recorded PASS/FAIL, and the flow still reported an overall
+  // "pass" despite authentication never being attempted. Trust the CURRENT page
+  // when it already looks like a genuine login gate, instead of bouncing away.
+  const alreadyOnRealLoginGate = isGated(browser);
+
   // 1. Silent path: restore saved storage state
   const probeUrl = authProbeUrl(state);
   if (fs.existsSync(state.authStatePath)) {
@@ -83,12 +98,14 @@ export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
     } catch {
       // corrupted state — fall through to fresh login
     }
-    browser.open(probeUrl);
-    if (waitForAuthenticated(browser, 15000)) {
+    if (!alreadyOnRealLoginGate) browser.open(probeUrl);
+    if (waitForAuthenticated(browser, alreadyOnRealLoginGate ? 5000 : 15000)) {
       console.log('[auth] session restored silently');
       return;
     }
     console.log('[auth] saved session expired — logging in fresh');
+  } else if (alreadyOnRealLoginGate) {
+    console.log('[auth] already on a real login gate — skipping the generic probe, logging in directly');
   } else {
     browser.open(probeUrl);
     if (waitForAuthenticated(browser, 8000)) {

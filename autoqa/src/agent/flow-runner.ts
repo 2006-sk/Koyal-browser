@@ -23,6 +23,7 @@ import { Nav } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
+import { looksLikeAuthGate } from './page-classifier.js';
 
 const STEP_BASE: Partial<VerificationExpectation> = {
   allowPageErrors: true,
@@ -189,8 +190,25 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   // is silently active — e.g. a login URL that only redirects away on an actual
   // protected-route hit).
   const logoutCtrl = deps.state.sitemap.learnedLogoutControl;
+  // A Logout-labeled control's mere presence isn't authoritative on every site —
+  // confirmed live on automationintesting.online: its /admin page renders a
+  // "Logout" nav button UNCONDITIONALLY, alongside the real, fillable
+  // Username/Password/Login form, regardless of whether anyone is actually
+  // logged in. Treating that label alone as proof of an active session made
+  // this check fire even when hereIdEarly was ALREADY the correct anon entry
+  // page, causing it to click a decorative "Logout" link, actually navigate
+  // AWAY to the wrong page, then misdiagnose the result as "still authenticated"
+  // — poisoning the flow's starting position before the milestone loop even
+  // began. A real, unauthenticated login gate (verified via the same DOM check
+  // auth.ts uses) is strong, direct counter-evidence that outweighs a merely-
+  // present Logout label: an actually-authenticated page would not simultaneously
+  // present a live password field to log in with.
+  const currentlyOnRealLoginGate =
+    needsAnonEntry &&
+    looksLikeAuthGate(deps.browser.getUrl(), deps.browser.snapshotInteractive(), deps.browser.hasVisiblePasswordInput());
   const logoutControlVisible =
     needsAnonEntry &&
+    !currentlyOnRealLoginGate &&
     Boolean(logoutCtrl) &&
     logoutCtrl !== 'none' &&
     deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
