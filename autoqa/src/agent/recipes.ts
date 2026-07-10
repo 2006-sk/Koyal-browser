@@ -12,6 +12,7 @@ export type RecipeStep =
   | { kind: 'open'; path: string }
   | { kind: 'click'; label: string; role?: string }
   | { kind: 'fill'; hint: string; value: string; secretRef?: 'email' | 'password' }
+  | { kind: 'select'; hint: string; value: string }
   | { kind: 'upload'; assetPath: string; selector?: string }
   | { kind: 'waitFor'; urlIncludes?: string; textIncludes?: string; maxMs: number };
 
@@ -49,9 +50,11 @@ export function recordFromExplorer(
         step.secretRef = 'password';
       }
       steps.push(step);
+    } else if (action.action === 'select' && action.resolvedLabel && action.value !== undefined) {
+      steps.push({ kind: 'select', hint: action.resolvedLabel, value: action.value });
     } else if (action.action === 'upload' && action.uploadedPath) {
       steps.push({ kind: 'upload', assetPath: action.uploadedPath, selector: action.selector });
-    } else if (action.action === 'click' || action.action === 'fill') {
+    } else if (action.action === 'click' || action.action === 'fill' || action.action === 'select') {
       // Un-resolvable ref (no label) — recipe would be brittle; skip recording entirely
       return null;
     }
@@ -176,6 +179,14 @@ export class RecipePlayer {
             if (!ref) throw new Error(`could not fill "${step.hint}": ${filled.detail}`);
             this.browser.fillVisible(`@${ref}`, value);
           }
+        } else if (step.kind === 'select') {
+          const snap = this.browser.snapshotInteractive();
+          const line = snap
+            .split('\n')
+            .find((l) => l.toLowerCase().includes(step.hint.toLowerCase()) && /\[ref=e\d+\]/.test(l));
+          const ref = line?.match(/\[ref=(e\d+)\]/)?.[1];
+          if (!ref) throw new Error(`could not find select "${step.hint}"`);
+          this.browser.select(`@${ref}`, step.value);
         } else if (step.kind === 'upload') {
           const assetPath = config.uploadFileOverride || step.assetPath;
           if (!fs.existsSync(assetPath)) {

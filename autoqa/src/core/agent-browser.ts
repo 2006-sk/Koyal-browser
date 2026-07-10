@@ -290,6 +290,20 @@ export class AgentBrowser {
     this.assertOk(this.run(['fill', ref, value]), `fill ${ref}`);
   }
 
+  /**
+   * Select an option in a native <select> by its visible text (or value). Native
+   * select options render in an OS-level dropdown outside normal page layout, so
+   * clicking an <option> ref fails with "CDP error (DOM.getBoxModel): Could not
+   * compute box model" every time — verified live on bstackdemo.com's "Order by"
+   * sort control (8 consecutive identical failures across two full explorer goal
+   * attempts, both eventually giving up with an honest "fail"). agent-browser's
+   * own `select` command handles this correctly at the CDP/DOM level.
+   */
+  select(ref: string, value: string): void {
+    if (this.showCursor) this.ensureCursorOverlay();
+    this.assertOk(this.run(['select', ref, value]), `select ${ref} ${value}`);
+  }
+
   clickVisible(ref: string): void {
     if (this.showCursor) {
       this.pointAtRef(ref);
