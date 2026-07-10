@@ -205,7 +205,26 @@ export class AgentBrowser {
       // probe is best-effort — plain click semantics below still apply
     }
 
-    this.assertOk(this.run(['click', ref]), `click ${ref}`);
+    const result = this.run(['click', ref]);
+    if (result.exitCode !== 0) {
+      const msg = result.stderr || result.stdout;
+      // agent-browser's own overlap guard refuses to click when it can see the point
+      // is occupied by a DIFFERENT element ("is covered by X ... the input would land
+      // on that element instead") — e.g. a react-select placeholder layered visually
+      // over its own backing <input>. That is exactly what a real user's click does
+      // too (topmost element at that point wins). Verified live this is NOT solvable
+      // via a synthetic elementFromPoint(...).click() (domActivate below) — react-select
+      // and similar widgets toggle open on the real 'mousedown' event, which a bare
+      // .click() call never dispatches. A real trusted mouse move+down+up at the same
+      // point (bypassing the ref-based guard entirely, coordinate-based) reproduces an
+      // actual user click and correctly opens the widget — confirmed live on
+      // bstackdemo.com's username/password comboboxes, which every retry otherwise hit
+      // the identical refusal on forever.
+      if (/is covered by/i.test(msg) && this.trustedClickAtRefPoint(ref)) {
+        return;
+      }
+      throw new Error(`agent-browser click ${ref} failed (exit ${result.exitCode}): ${msg}`);
+    }
 
     try {
       const landed = this.evalScript('window.__abClickLanded', { skipEnsure: true }).trim();
@@ -218,6 +237,31 @@ export class AgentBrowser {
       this.domActivate(ref);
     } catch {
       // eval failing here usually means mid-navigation — the click worked
+    }
+  }
+
+  /**
+   * A real trusted mouse move+down+up at a ref's box center — coordinate-based, so
+   * it bypasses agent-browser's ref-based overlap guard entirely and simply lands on
+   * whatever is actually topmost at that point (the same target the guard's own error
+   * message names). Unlike domActivate's synthetic elementFromPoint(...).click(), this
+   * dispatches a genuine mousedown/mouseup sequence, which widgets like react-select
+   * require to open (they toggle on mousedown, not on a bare 'click' event) — verified
+   * live on bstackdemo.com's username/password comboboxes. Returns false (never throws)
+   * so the caller can fall back to surfacing the original error.
+   */
+  private trustedClickAtRefPoint(ref: string): boolean {
+    const box = this.getBox(ref);
+    if (!box) return false;
+    const cx = Math.round(box.x + box.width / 2);
+    const cy = Math.round(box.y + box.height / 2);
+    try {
+      this.run(['mouse', 'move', String(cx), String(cy)]);
+      this.run(['mouse', 'down']);
+      this.run(['mouse', 'up']);
+      return true;
+    } catch {
+      return false;
     }
   }
 
