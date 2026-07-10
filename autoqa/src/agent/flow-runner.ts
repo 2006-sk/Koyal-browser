@@ -278,6 +278,26 @@ function isSearchShapedGoal(goal: string): boolean {
   return /\bsearch\b/i.test(goal);
 }
 
+/**
+ * A random marker string can only be verified if it was TYPED into a free-text
+ * field. A milestone that chooses/toggles a PRESET option (checkbox, native
+ * <select>, dropdown, radio, toggle) has no text field to type it into, so the
+ * injected "use exactly: <marker>" instruction is unsatisfiable and the
+ * milestone false-fails on the marker-presence check regardless of whether the
+ * real action succeeded. Verified live on bstackdemo.com: "Open the Order By
+ * sorting control and choose Price - Highest to Lowest" correctly selected the
+ * option (confirmed via the explorer's own snapshot check) but still failed
+ * with "Expected snapshot to include one of: <marker>". Only exempted when the
+ * goal doesn't ALSO ask to type/enter/fill something (a compound goal that
+ * really does need the marker).
+ */
+function isSelectionShapedGoal(goal: string): boolean {
+  return (
+    /\b(select|choose|checkbox|dropdown|combobox|toggle|checked|radio|option)\b/i.test(goal) &&
+    !/\b(type|enter|fill|write)\b/i.test(goal)
+  );
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -309,9 +329,10 @@ async function runMilestone(
   // explicit edit milestones (a 'create' click may involve no text field at all)
   const loginShaped = isLoginShapedGoal(milestone.goal);
   const searchShaped = isSearchShapedGoal(milestone.goal);
+  const selectionShaped = isSelectionShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped && !searchShaped) {
+  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
@@ -523,11 +544,21 @@ export async function runFlows(
         const milestone = flow.milestones[mi];
 
         // wizard drafts can resume mid-flow: if we're already on a LATER
-        // milestone's page, fast-forward instead of failing the earlier ones
+        // milestone's page, fast-forward instead of failing the earlier ones.
+        // But the flow's own entry page is never a valid fast-forward TARGET —
+        // a later milestone's guardPhases can legitimately equal entry.pageId
+        // (e.g. "log in" flows that start AND end on the same storefront page,
+        // just in a different auth state a page id alone can't see). Verified
+        // live on bstackdemo.com: entry.pageId="products-list" also happens to
+        // be m4 AND m5's guardPhase, so on the very first check of m1 — right
+        // after fresh entry navigation, nothing has run yet — this matched and
+        // skipped straight to m4, silently false-PASSing the entire
+        // username/password/login-click sequence.
         const hereId = currentPageId(deps);
-        const aheadIdx = flow.milestones.findIndex(
-          (m, j) => j > mi && m.guardPhases?.includes(hereId),
-        );
+        const isEntryPage = hereId !== 'unknown' && hereId === flow.entry.pageId;
+        const aheadIdx = isEntryPage
+          ? -1
+          : flow.milestones.findIndex((m, j) => j > mi && m.guardPhases?.includes(hereId));
         if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
           console.log(
             `[flow] resumed mid-wizard on "${hereId}" — fast-forwarding ${aheadIdx - mi} milestone(s)`,
