@@ -177,6 +177,17 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   const firstGuardPhases = flow.milestones[0]?.guardPhases;
   if (!firstGuardPhases?.length) return;
 
+  // "Where should entry navigation land?" is the flow's OWN declared entry page,
+  // not milestone 1's guardPhases — those describe the state AFTER m1 executes,
+  // which is a different page whenever m1 is a navigate-type step (e.g. "Click
+  // Sign In" landing on entry.pageId="products-list" with guardPhases=["login"]).
+  // Comparing entry landing against guardPhases was a false-positive generator on
+  // ANY flow shaped this way (verified live on bstackdemo.com: a completely normal
+  // "click Sign In then log in" flow triggered two consecutive "resumed stale
+  // state" prompts purely because m1 is a navigate step) — fall back to
+  // firstGuardPhases only when the flow has no entry.pageId to compare against.
+  const expectedEntryIds = flow.entry.pageId ? [flow.entry.pageId] : firstGuardPhases;
+
   const needsAnonEntry = firstGuardPhases.some(looksLikeAuthEntryPageId);
   const hereIdEarly = currentPageId(deps);
   // Page-id mismatch is the common signal. 'unknown' counts as a mismatch too —
@@ -194,7 +205,7 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
     Boolean(logoutCtrl) &&
     logoutCtrl !== 'none' &&
     deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
-  const pageIdLooksStillAuthed = needsAnonEntry && !firstGuardPhases.includes(hereIdEarly);
+  const pageIdLooksStillAuthed = needsAnonEntry && !expectedEntryIds.includes(hereIdEarly);
   if (pageIdLooksStillAuthed || logoutControlVisible) {
     if (await ensureLoggedOutForEntry(deps, flow, firstGuardPhases)) return;
   }
@@ -208,10 +219,10 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   }
 
   const hereId = currentPageId(deps);
-  if (firstGuardPhases.includes(hereId) || hereId === 'unknown') return;
+  if (expectedEntryIds.includes(hereId) || hereId === 'unknown') return;
 
   const answer = await deps.interact.ask(
-    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${firstGuardPhases.join('/')}) — ` +
+    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${expectedEntryIds.join('/')}) — ` +
       `looks like it resumed stale state (e.g. a draft). Paste the exact label of a "start fresh/new" control to click here, or "none" if this is expected.`,
     { default: 'none' },
   );
