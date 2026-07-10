@@ -28,13 +28,21 @@ function waitForAuthenticated(browser: AgentBrowser, maxMs: number): boolean {
   }
 }
 
-/** A protected route is a better auth probe than the origin (which may always show login). */
+/**
+ * A protected route is a better auth probe than the origin (which may always show
+ * login). Before any page has been learned (a totally fresh explore), fall back to
+ * the exact URL the user asked for (state.startUrl) rather than the bare origin —
+ * a deep-linked target (e.g. a hash-routed SPA's "#/login") has its path/hash
+ * silently discarded by `sitemap.origin` alone, stranding the very first
+ * navigation of the run on the site root instead of the requested entry point.
+ */
 function authProbeUrl(state: SiteState): string {
   const authedPage = Object.values(state.sitemap.pages).find(
     (p) => p.requiresAuth && p.urlPatterns.some((u) => !u.includes(':id')),
   );
   const pattern = authedPage?.urlPatterns.find((u) => !u.includes(':id'));
-  return pattern ? `${state.sitemap.origin}${pattern}` : state.sitemap.origin;
+  if (pattern) return `${state.sitemap.origin}${pattern}`;
+  return state.startUrl || state.sitemap.origin;
 }
 
 async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; password: string }> {
