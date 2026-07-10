@@ -18,7 +18,12 @@ const RAW_ERROR_PATTERNS: RegExp[] = [
   /TypeError:/i,
   /UnhandledPromiseRejection/i,
   /Internal Server Error/i,
-  /\b500\b.*error/i,
+  // NOT `/\b500\b.*error/i` — too loose: matches any page that merely
+  // *documents* a possible 500 response (REST API docs, Swagger UI, a
+  // status-codes practice page) as if it were an actual crash dump. A real
+  // server error already trips `Internal Server Error` or the stack-trace
+  // patterns above; this standalone pairing added false positives, not
+  // meaningfully more true positives.
   /ECONNREFUSED/i,
   /NetworkError/i,
   /Unexpected token/i,

@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { config } from '../config.js';
-import type { AgentBrowser } from '../core/agent-browser.js';
+import { parseJsonArrayFromEvalStdout, type AgentBrowser } from '../core/agent-browser.js';
 import type { Explorer } from '../core/explorer.js';
 import type { LlmClient } from '../core/llm/client.js';
 import { Nav } from '../core/nav.js';
@@ -73,8 +73,7 @@ function extractSameOriginLinks(browser: AgentBrowser, origin: string): string[]
         return JSON.stringify([...out].slice(0, 100));
       })();
     `);
-    const match = stdout.match(/\[[\s\S]*\]/);
-    for (const raw of match ? (JSON.parse(match[0]) as string[]) : []) {
+    for (const raw of parseJsonArrayFromEvalStdout(stdout)) {
       try {
         const url = new URL(raw, origin);
         if (url.origin === origin) urls.add(url.href.split('#')[0]);

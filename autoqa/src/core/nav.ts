@@ -34,13 +34,19 @@ export class Nav {
     // accessible name concatenates ALL its children's text (e.g. a card-grid div
     // absorbing "ElementsFormsWidgets...") also contains any single child's label
     // as a substring, so a loose substring pattern alone can silently resolve to
-    // the wrong (wrapper) element every time. Only fall back to the loose pattern
-    // when no exact quoted match exists.
+    // the wrong (wrapper) element every time. When `exact` is requested, the loose
+    // pattern is dropped entirely rather than kept as a fallback — snapshot LINES
+    // include ref/attribute noise (e.g. "[expanded=false, ref=e18]"), so a short,
+    // symbolic label like "X" (a close-icon glyph) can loosely match the letter
+    // "x" inside unrelated metadata on a completely different element (observed:
+    // a dismiss-overlay "X" click matching a "Demos" dropdown button's own
+    // `expanded=false` attribute text and opening/triggering unrelated navigation).
     const patterns =
       typeof intent.label === 'string'
         ? (() => {
             const escaped = intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            return [new RegExp(`"${escaped}"`, 'i'), new RegExp(escaped, 'i')];
+            const exactPattern = new RegExp(`"${escaped}"`, 'i');
+            return intent.exact ? [exactPattern] : [exactPattern, new RegExp(escaped, 'i')];
           })()
         : [intent.label];
 

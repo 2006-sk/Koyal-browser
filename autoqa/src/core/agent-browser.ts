@@ -522,8 +522,7 @@ export class AgentBrowser {
           return JSON.stringify(out);
         })();
       `);
-      const match = stdout.match(/\[[\s\S]*\]/);
-      return match ? (JSON.parse(match[0]) as string[]) : [];
+      return parseJsonArrayFromEvalStdout(stdout);
     } catch {
       return [];
     }
@@ -582,6 +581,42 @@ export class AgentBrowser {
       );
     }
   }
+}
+
+/**
+ * agent-browser's `eval` CLI prints `JSON.stringify(returnValue)` as its own stdout.
+ * Page-context scripts in this codebase return `JSON.stringify(array)` (a STRING)
+ * to get a reliably-shaped result, which means the value comes back DOUBLE
+ * JSON-encoded: `"[\"a\",\"b\"]"`. A naive `stdout.match(/\[.../)` + one `JSON.parse`
+ * grabs the substring between the first `[` and last `]` WITHOUT undoing that outer
+ * escaping, leaving literal backslash-quote sequences that are not valid JSON and
+ * throw — silently discarding every result via the surrounding try/catch. This was
+ * found live: a 90+-link homepage's free-edge crawl was silently returning 0 edges.
+ * Unwrap one JSON.parse layer first (the CLI's own encoding); only fall back to the
+ * old regex-extraction if that fails, for resilience against other output shapes.
+ */
+export function parseJsonArrayFromEvalStdout(stdout: string): string[] {
+  const trimmed = stdout.trim();
+  try {
+    const once: unknown = JSON.parse(trimmed);
+    if (Array.isArray(once)) return once as string[];
+    if (typeof once === 'string') {
+      const twice: unknown = JSON.parse(once);
+      if (Array.isArray(twice)) return twice as string[];
+    }
+  } catch {
+    // fall through
+  }
+  try {
+    const match = trimmed.match(/\[[\s\S]*\]/);
+    if (match) {
+      const parsed: unknown = JSON.parse(match[0]);
+      if (Array.isArray(parsed)) return parsed as string[];
+    }
+  } catch {
+    // give up — caller treats this as "nothing found"
+  }
+  return [];
 }
 
 export function refForInteractiveSnapshot(snapshot: string, pattern: RegExp): string | null {

@@ -231,9 +231,13 @@ Respond with JSON only:
 
 /**
  * Deterministic auth-gate heuristic; call the LLM only if genuinely ambiguous.
- * `hasPasswordInputInDom` (from a real DOM query) is an optional stronger signal for
- * forms whose <input type=password> carries no accessible name — the accessibility-tree
- * snapshot then shows only an unlabeled "textbox", which the text-only checks below miss.
+ * `hasPasswordInputInDom` (from a real DOM query) is authoritative when provided —
+ * a real password INPUT is unambiguous, whereas the bare-text fallback below
+ * (`snap.includes('password')`) false-positives on any page that merely mentions
+ * "password" in prose/links without showing a form (e.g. a QA practice site whose
+ * homepage lists demo pages named "Forgot Password Form", "Secure Password
+ * Checker" etc.). Only fall back to the text-only checks when the caller has no
+ * browser access to run the DOM query.
  */
 export function looksLikeAuthGate(
   url: string,
@@ -242,9 +246,9 @@ export function looksLikeAuthGate(
 ): boolean {
   const snap = interactiveSnapshot.toLowerCase();
   const hasPassword =
-    hasPasswordInputInDom === true ||
-    /textbox\s+"[^"]*password/i.test(interactiveSnapshot) ||
-    snap.includes('password');
+    hasPasswordInputInDom !== undefined
+      ? hasPasswordInputInDom
+      : /textbox\s+"[^"]*password/i.test(interactiveSnapshot) || snap.includes('password');
   const hasLoginWords = /log ?in|sign ?in|sign ?up/.test(snap) || /login|signin|auth/.test(url.toLowerCase());
   return hasPassword && hasLoginWords;
 }

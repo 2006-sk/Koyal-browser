@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import type { AgentBrowser } from './agent-browser.js';
+import { parseJsonArrayFromEvalStdout, type AgentBrowser } from './agent-browser.js';
 import { LlmClient, parseJsonFromLlm } from './llm/client.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'wait' | 'upload' | 'done' | 'fail';
@@ -354,8 +354,7 @@ export class Explorer {
           return JSON.stringify(out);
         })();
       `);
-      const match = stdout.match(/\[[^\]]*\]/);
-      return match ? (JSON.parse(match[0]) as string[]) : [];
+      return parseJsonArrayFromEvalStdout(stdout);
     } catch {
       return [];
     }

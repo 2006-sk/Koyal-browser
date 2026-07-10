@@ -244,9 +244,15 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
  * Negative-path goals (invalid/empty credentials) stay with the explorer.
  */
 function isLoginShapedGoal(goal: string): boolean {
+  // A milestone that just fills ONE password-labeled field (e.g. a widget-demo
+  // page's "Input: Password" text box, unrelated to real auth) must not route
+  // through ensureAuthenticated — require BOTH username+password together, or
+  // the word "credentials" (which implies a full login attempt by itself),
+  // never "password" in isolation.
   const wantsAuth =
     /\b(log ?in|sign ?in)\b/i.test(goal) ||
-    (/\b(enter|fill|type|submit)\b/i.test(goal) && /\b(username|password|credentials?)\b/i.test(goal));
+    (/\b(enter|fill|type|submit)\b/i.test(goal) &&
+      (/\bcredentials?\b/i.test(goal) || (/\busername\b/i.test(goal) && /\bpassword\b/i.test(goal))));
   const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);
   return wantsAuth && !negativePath;
 }
