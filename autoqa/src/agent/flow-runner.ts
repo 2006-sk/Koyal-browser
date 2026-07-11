@@ -23,7 +23,7 @@ import { Nav } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
-import { looksLikeAuthGate } from './page-classifier.js';
+import { looksLikeAuthGate, looksLikeSoft404 } from './page-classifier.js';
 
 const STEP_BASE: Partial<VerificationExpectation> = {
   allowPageErrors: true,
@@ -106,7 +106,15 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
     // deleted/renumbered. Verify we actually landed on the expected page kind
     // before trusting it; if not, fall through to the generic LLM-navigation
     // recovery below instead of silently proceeding on a dead/wrong page.
-    if (currentPageId(deps) === flow.entry.pageId) return;
+    // matchPage's plain-page identity is URL-PATTERN-ONLY (never content), so a
+    // URL that still matches the pattern but actually 404'd would otherwise fool
+    // this check (confirmed live: an LLM-proposed flow's entry.url for
+    // "add-remove-elements-flow" was "/add_remove_elements" — missing this site's
+    // required trailing slash — which rendered "Not Found", yet currentPageId()
+    // still returned the real page's id from the normalized pattern alone; the
+    // whole flow then ran every milestone against the 404 page instead of ever
+    // reaching the exampleUrl fallback below).
+    if (currentPageId(deps) === flow.entry.pageId && !looksLikeSoft404(browser.snapshotInteractive())) return;
     console.log(
       `[flow] pinned entry url for "${flow.entry.pageId}" looks stale — falling back to LLM navigation`,
     );
