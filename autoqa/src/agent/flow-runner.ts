@@ -112,9 +112,20 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
     );
   }
   const entryPage = state.sitemap.pages[flow.entry.pageId];
-  const directPattern = entryPage?.urlPatterns.find((p) => !p.includes(':id'));
-  if (directPattern) {
-    browser.open(`${state.sitemap.origin}${directPattern}`);
+  // Prefer the exact concrete URL that actually rendered this page over
+  // reconstructing from the normalized urlPattern — normalizePath deliberately
+  // strips trailing slashes (and masks ids) for PAGE-IDENTITY purposes, but some
+  // routing 404s on a path missing its trailing slash even though it's the "same"
+  // page for identity-matching (confirmed live on the-internet.herokuapp.com:
+  // urlPatterns held "/add_remove_elements", but only "/add_remove_elements/"
+  // — exampleUrl — actually renders; reconstructing from the pattern landed on a
+  // 404 "Not Found" page here too, same root cause as crawler.ts's deep-walk
+  // entry-builder).
+  const directUrl =
+    entryPage?.exampleUrl ?? entryPage?.urlPatterns.find((p) => !p.includes(':id'));
+  if (directUrl) {
+    const opened = directUrl.startsWith('http') ? directUrl : `${state.sitemap.origin}${directUrl}`;
+    browser.open(opened);
     browser.wait(2000);
     return;
   }

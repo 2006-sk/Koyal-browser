@@ -166,7 +166,16 @@ export async function explore(
   queue.push({ url: origin, depth: 0 });
   for (const page of Object.values(state.sitemap.pages)) {
     for (const pattern of page.urlPatterns) {
-      if (!pattern.includes(':id')) queue.push({ url: `${origin}${pattern}`, depth: 1 });
+      if (pattern.includes(':id')) continue;
+      // Prefer the exact concrete URL that last actually rendered this page over
+      // reconstructing from the identity-masked pattern — normalizePath strips
+      // trailing slashes for PAGE-IDENTITY purposes, but some routing 404s on a
+      // path missing its trailing slash even though it's the "same" page for
+      // matching (confirmed live: re-queuing "/add_remove_elements" without its
+      // slash on the-internet.herokuapp.com re-visited a 404 every re-explore).
+      const seedUrl =
+        page.exampleUrl && normalizePath(page.exampleUrl) === pattern ? page.exampleUrl : `${origin}${pattern}`;
+      queue.push({ url: seedUrl, depth: 1 });
     }
   }
 
@@ -190,7 +199,18 @@ export async function explore(
     const known = matchPage(state.sitemap, url, snapshot);
     if (known) {
       known.lastSeenAt = new Date().toISOString();
-      known.exampleUrl = url;
+      // matchPage identifies plain pages by URL PATTERN only, never content (by
+      // design — one shared chrome landmark must not decide identity). That means
+      // a URL that still matches the pattern can nonetheless have rendered an
+      // error page (confirmed live: a reconstructed entry URL missing its
+      // required trailing slash matched this page's normalized pattern but
+      // actually rendered "Not Found"). Blindly trusting `url` here overwrote
+      // exampleUrl — the one field every entry-URL fallback in this codebase
+      // relies on — with a URL that 404s. Only refresh it when the page doesn't
+      // look like an error/soft-404.
+      if (!looksLikeSoft404(snapshot)) {
+        known.exampleUrl = url;
+      }
       seenPageIds.add(known.id);
       const norm = normalizePath(url);
       if (!known.urlPatterns.includes(norm)) known.urlPatterns.push(norm);
@@ -249,81 +269,41 @@ export async function explore(
       continue;
     }
 
-    const page = await identifyCurrentPage();
-    pagesVisited++;
+    // A single problematic page during a probe (confirmed live: a click-probe
+    // that lands on a button wired to a native window.alert()/confirm()/prompt()
+    // wedges the agent-browser daemon — `get url` and even `dialog accept` hang
+    // indefinitely against it) must not be allowed to crash the WHOLE crawl.
+    // Before this try/catch, an uncaught timeout here propagated all the way to
+    // the CLI's top-level "fatal:" handler and killed the process, discarding
+    // every page still queued (and the deep-walk/flow-proposal phases that
+    // follow the crawl) — the single least-resilient spot in the whole explore
+    // pipeline, since browser.open() at the top of this loop already has its own
+    // catch. Recycle the daemon on a timeout-shaped error and move on to the
+    // next queue item instead.
+    try {
+      const page = await identifyCurrentPage();
+      pagesVisited++;
 
-    // free edges from live-DOM hrefs
-    for (const href of extractSameOriginLinks(browser, origin)) {
-      const hrefNorm = normalizePath(href);
-      if (!visitedThisRun.has(hrefNorm)) queue.push({ url: href, depth: item.depth + 1 });
-    }
-
-    // click probes for SPA nav (buttons/links without hrefs): nav-tagged first,
-    // then unknown-tagged as fallback — never destructive/submit/upload
-    const navTargets = page.interactives.filter((el) => el.category === 'nav' && !el.probed);
-    const unknownTargets = page.interactives.filter((el) => el.category === 'unknown' && !el.probed);
-    const probeTargets = [...navTargets, ...unknownTargets].slice(0, probesPerPage);
-
-    for (const el of probeTargets) {
-      el.probed = true;
-      const beforeUrl = browser.getUrl();
-      const role = el.role === 'button' || el.role === 'link' || el.role === 'tab' ? el.role : undefined;
-      const clicked = nav.click({ label: el.label, role, optional: true });
-      if (!clicked) continue;
-
-      // SPA route changes can lag the click — poll up to 5s
-      let afterUrl = browser.getUrl();
-      const navDeadline = Date.now() + 5000;
-      while (normalizePath(afterUrl) === normalizePath(beforeUrl) && Date.now() < navDeadline) {
-        browser.wait(1000);
-        afterUrl = browser.getUrl();
+      // free edges from live-DOM hrefs
+      for (const href of extractSameOriginLinks(browser, origin)) {
+        const hrefNorm = normalizePath(href);
+        if (!visitedThisRun.has(hrefNorm)) queue.push({ url: href, depth: item.depth + 1 });
       }
-      if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
-        if (isOffOrigin(afterUrl)) {
-          console.log(`[crawl] "${el.label}" led off-site (${afterUrl}) — not mapping, returning`);
-          try {
-            browser.open(item.url);
-            browser.wait(1500);
-            nav.dismissOverlays();
-          } catch {
-            break;
-          }
-          continue;
-        }
-        const landed = await identifyCurrentPage();
-        pagesVisited++;
-        el.targetPageId = landed.id;
-        if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === el.label)) {
-          state.sitemap.edges.push({ from: page.id, actionLabel: el.label, to: landed.id });
-        }
-        // return to the page we were probing
-        try {
-          browser.open(item.url);
-          browser.wait(1500);
-          nav.dismissOverlays();
-        } catch {
-          break;
-        }
-        if (pagesVisited >= maxPages) break;
-      } else {
-        // same URL — may have opened a modal; note it and dismiss
-        nav.dismissOverlays();
-      }
-    }
 
-    // SPA fallback: JS-routed clickables the LLM did NOT surface as interactives
-    // (e.g. demoqa's <div> cards with no href). Probe by visible text; skip
-    // anything destructive-looking. Fixes sites whose whole nav is anchor-less.
-    if (pagesVisited < maxPages) {
-      const knownLabels = new Set(page.interactives.map((e) => e.label.toLowerCase()));
-      const candidates = browser
-        .findClickableCandidates()
-        .filter((t) => !knownLabels.has(t.toLowerCase()))
-        .filter((t) => !DESTRUCTIVE_TEXT_RE.test(t))
-        .slice(0, probesPerPage);
-      for (const label of candidates) {
+      // click probes for SPA nav (buttons/links without hrefs): nav-tagged first,
+      // then unknown-tagged as fallback — never destructive/submit/upload
+      const navTargets = page.interactives.filter((el) => el.category === 'nav' && !el.probed);
+      const unknownTargets = page.interactives.filter((el) => el.category === 'unknown' && !el.probed);
+      const probeTargets = [...navTargets, ...unknownTargets].slice(0, probesPerPage);
+
+      for (const el of probeTargets) {
+        el.probed = true;
         const beforeUrl = browser.getUrl();
-        if (!browser.clickByText(label)) continue;
+        const role = el.role === 'button' || el.role === 'link' || el.role === 'tab' ? el.role : undefined;
+        const clicked = nav.click({ label: el.label, role, optional: true });
+        if (!clicked) continue;
+
+        // SPA route changes can lag the click — poll up to 5s
         let afterUrl = browser.getUrl();
         const navDeadline = Date.now() + 5000;
         while (normalizePath(afterUrl) === normalizePath(beforeUrl) && Date.now() < navDeadline) {
@@ -332,7 +312,7 @@ export async function explore(
         }
         if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
           if (isOffOrigin(afterUrl)) {
-            console.log(`[crawl] "${label}" led off-site (${afterUrl}) — not mapping, returning`);
+            console.log(`[crawl] "${el.label}" led off-site (${afterUrl}) — not mapping, returning`);
             try {
               browser.open(item.url);
               browser.wait(1500);
@@ -344,9 +324,11 @@ export async function explore(
           }
           const landed = await identifyCurrentPage();
           pagesVisited++;
-          if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === label)) {
-            state.sitemap.edges.push({ from: page.id, actionLabel: label, to: landed.id });
+          el.targetPageId = landed.id;
+          if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === el.label)) {
+            state.sitemap.edges.push({ from: page.id, actionLabel: el.label, to: landed.id });
           }
+          // return to the page we were probing
           try {
             browser.open(item.url);
             browser.wait(1500);
@@ -356,12 +338,69 @@ export async function explore(
           }
           if (pagesVisited >= maxPages) break;
         } else {
+          // same URL — may have opened a modal; note it and dismiss
           nav.dismissOverlays();
         }
       }
-    }
 
-    state.saveSitemap();
+      // SPA fallback: JS-routed clickables the LLM did NOT surface as interactives
+      // (e.g. demoqa's <div> cards with no href). Probe by visible text; skip
+      // anything destructive-looking. Fixes sites whose whole nav is anchor-less.
+      if (pagesVisited < maxPages) {
+        const knownLabels = new Set(page.interactives.map((e) => e.label.toLowerCase()));
+        const candidates = browser
+          .findClickableCandidates()
+          .filter((t) => !knownLabels.has(t.toLowerCase()))
+          .filter((t) => !DESTRUCTIVE_TEXT_RE.test(t))
+          .slice(0, probesPerPage);
+        for (const label of candidates) {
+          const beforeUrl = browser.getUrl();
+          if (!browser.clickByText(label)) continue;
+          let afterUrl = browser.getUrl();
+          const navDeadline = Date.now() + 5000;
+          while (normalizePath(afterUrl) === normalizePath(beforeUrl) && Date.now() < navDeadline) {
+            browser.wait(1000);
+            afterUrl = browser.getUrl();
+          }
+          if (normalizePath(afterUrl) !== normalizePath(beforeUrl)) {
+            if (isOffOrigin(afterUrl)) {
+              console.log(`[crawl] "${label}" led off-site (${afterUrl}) — not mapping, returning`);
+              try {
+                browser.open(item.url);
+                browser.wait(1500);
+                nav.dismissOverlays();
+              } catch {
+                break;
+              }
+              continue;
+            }
+            const landed = await identifyCurrentPage();
+            pagesVisited++;
+            if (!state.sitemap.edges.some((e) => e.from === page.id && e.actionLabel === label)) {
+              state.sitemap.edges.push({ from: page.id, actionLabel: label, to: landed.id });
+            }
+            try {
+              browser.open(item.url);
+              browser.wait(1500);
+              nav.dismissOverlays();
+            } catch {
+              break;
+            }
+            if (pagesVisited >= maxPages) break;
+          } else {
+            nav.dismissOverlays();
+          }
+        }
+      }
+
+      state.saveSitemap();
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`[crawl] error while processing ${item.url}: ${msg} — skipping to next page`);
+      if (/timed out|consecutiveTimeouts/i.test(msg) || browser.consecutiveTimeouts >= 2) {
+        browser.recycle();
+      }
+    }
   }
 
   console.log(
@@ -419,7 +458,17 @@ export async function explore(
       // live: automationintesting.online's room-reservation page, urlPattern
       // "/reservation/:id", was silently skipped here even after broadening the
       // checkout-ish keywords below).
-      const entryUrl = pattern ? `${origin}${pattern}` : page.exampleUrl;
+      // `pattern` comes from normalizePath, which deliberately masks ids AND strips
+      // trailing slashes for PAGE-IDENTITY purposes — but some routing (e.g. this
+      // Sinatra/Heroku app) 404s on a path missing its trailing slash even though
+      // it's the "same" page for identity-matching (confirmed live: /add_remove_elements
+      // without the slash returns "Not Found", /add_remove_elements/ returns 200;
+      // urlPatterns stored "/add_remove_elements", exampleUrl correctly kept the
+      // real "/add_remove_elements/" — reconstructing from `pattern` here silently
+      // 404'd the whole deep-walk entry). Prefer the exact URL that actually
+      // rendered the page; only reconstruct from the masked pattern when no
+      // concrete URL was ever recorded.
+      const entryUrl = page.exampleUrl ?? (pattern ? `${origin}${pattern}` : undefined);
       if (!entryUrl) continue;
       for (const el of page.interactives) {
         // The LLM classifies a form-submitting CTA as category 'submit' even when it
