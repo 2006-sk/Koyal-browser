@@ -48,6 +48,30 @@ export interface FlowRunnerDeps {
   statements: Statements;
 }
 
+/**
+ * agent-browser's page target can detach mid-transition, reading as about:blank
+ * (same condition core/explorer.ts and deep-walker.ts already guard against).
+ * Needed here because `currentPageId` collapses this into the generic 'unknown'
+ * sentinel, which the guard-phase/probe-drift checks below intentionally treat
+ * as "maybe still loading, don't panic" — correct for a page that simply hasn't
+ * been classified yet, but wrong for a genuinely dead target: confirmed live
+ * (this exact site, two separate flows) that a failed back-forward probe can
+ * leave the browser at about:blank, and the NEXT milestone's own achieveGoal
+ * call has no way to recover on its own — its blank-recovery logic anchors to
+ * `lastRealUrl` captured at the START of that call, which is about:blank itself
+ * when the call begins already-broken, so the condition to recover never fires
+ * and the milestone false-fails ("page remains blank after multiple waits").
+ */
+function isBlankState(browser: AgentBrowser): boolean {
+  try {
+    const url = browser.getUrl();
+    if (url.startsWith('about:')) return true;
+    return !browser.snapshotInteractive().trim();
+  } catch {
+    return false;
+  }
+}
+
 function currentPageId(deps: FlowRunnerDeps): string {
   // Called throughout this module (guard-phase checks, probe repositioning, KB
   // triage, fast-forward). If the browser daemon is wedged, getUrl/snapshot throw
@@ -401,6 +425,20 @@ async function runMilestone(
   const { browser, state, player, statements, interact } = deps;
   const decisionsBefore = interact.decisions.length;
   let pageId = currentPageId(deps);
+
+  // A genuinely dead/blank target (about:blank, empty snapshot — typically left
+  // behind by a failed probe from the PREVIOUS milestone) always resolves pageId
+  // to 'unknown', which the guard-phase check below deliberately treats as "give
+  // it a moment, might just not be classified yet" and skips repositioning for.
+  // That's correct for "not yet classified" but wrong for "actually dead" — the
+  // milestone's own achieveGoal call has no way to recover from this on its own
+  // (see isBlankState's doc comment), so it would just wait twice and false-fail.
+  // Reposition unconditionally here, regardless of whether guardPhases is set.
+  if (pageId === 'unknown' && isBlankState(browser)) {
+    console.log(`[flow] page is blank/dead entering "${milestone.id}" — replaying up to this milestone`);
+    await replayUpTo(deps, flow, milestoneIndex);
+    pageId = currentPageId(deps);
+  }
 
   // guard-phase check: poll first (processing lag ≠ off-track — restarting a wizard
   // from its entry mid-flow destroys the walk), then recover by REBUILDING position
