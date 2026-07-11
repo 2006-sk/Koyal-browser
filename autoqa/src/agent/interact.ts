@@ -59,6 +59,11 @@ export class Interact {
   private async askViaFile(question: string, defaultValue?: string): Promise<string> {
     const questionFile = path.join(this.inboxDir, 'QUESTION.txt');
     const answerFile = path.join(this.inboxDir, 'answer.txt');
+    // Clear any stale answer left over from a previous question BEFORE writing the new
+    // question file. Without this, a late/duplicate write to answer.txt for a PRIOR
+    // question can be consumed as the answer to THIS question (a real race observed live:
+    // a stale "success" answer leaked into a credential prompt, corrupting secrets.json).
+    fs.rmSync(answerFile, { force: true });
     fs.writeFileSync(
       questionFile,
       `${question}\n\nWrite your answer into: ${answerFile}\n`,

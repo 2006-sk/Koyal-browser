@@ -148,6 +148,8 @@ export class Explorer {
     let repeatCount = 0;
     let lastSignature = '';
     let processingWaitedMs = 0;
+    let lastRealUrl = this.browser.getUrl();
+    let blankRecoveryAttempts = 0;
 
     const goalForLog = this.redact(goal);
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
@@ -155,6 +157,33 @@ export class Explorer {
     for (let step = 0; step < maxSteps; step++) {
       let snapshot = this.browser.snapshotInteractive();
       let url = this.browser.getUrl();
+
+      // agent-browser's page target can detach mid-transition, reading as
+      // about:blank / an empty snapshot for a beat (confirmed live, reproduced
+      // 3x across separate runs: a "click a nav link" action lands here right
+      // after the click, then the LLM only has "wait" available and burns the
+      // WHOLE step budget on it since it never actively recovers — false-failing
+      // a milestone whose click actually worked fine). deep-walker.ts already
+      // has this exact recovery (reopen the last known real URL) for its own
+      // loop; the generic Explorer never did. Bounded to 2 attempts so a
+      // genuinely, persistently blank page still falls through to the normal
+      // LLM-driven "wait"/"fail" path rather than looping forever.
+      const isBlank = url.startsWith('about:') || !snapshot.trim();
+      if (isBlank && blankRecoveryAttempts < 2 && lastRealUrl && !lastRealUrl.startsWith('about:')) {
+        blankRecoveryAttempts++;
+        console.log(
+          `  [explorer] page went blank (${url || 'about:blank'}) — re-opening ${lastRealUrl} (recovery ${blankRecoveryAttempts}/2, no step consumed)`,
+        );
+        try {
+          this.browser.open(lastRealUrl);
+          this.browser.wait(2500);
+        } catch (error) {
+          stepsTaken.push(`blank-page recovery failed: ${error instanceof Error ? error.message : error}`);
+        }
+        snapshot = this.browser.snapshotInteractive();
+        url = this.browser.getUrl();
+      }
+      if (!isBlank || (url && !url.startsWith('about:'))) lastRealUrl = url || lastRealUrl;
 
       // Multi-minute server-side work (script engines, scene generation) renders as
       // spinner text on the same URL. Burning LLM steps on 1.5s "wait" actions

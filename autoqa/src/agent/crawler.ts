@@ -190,6 +190,7 @@ export async function explore(
     const known = matchPage(state.sitemap, url, snapshot);
     if (known) {
       known.lastSeenAt = new Date().toISOString();
+      known.exampleUrl = url;
       seenPageIds.add(known.id);
       const norm = normalizePath(url);
       if (!known.urlPatterns.includes(norm)) known.urlPatterns.push(norm);
@@ -214,6 +215,11 @@ export async function explore(
 
     console.log(`[crawl] classifying new page at ${url}`);
     const classified = await classifyPage(llm, url, snapshot);
+    // Per-item detail pages (a specific room/product — urlPattern like
+    // "/reservation/:id") have no stable direct URL; remember the exact concrete
+    // URL that actually rendered this page so callers needing one (the deep-walk
+    // entry-finder) have a fallback.
+    classified.exampleUrl = url;
     const merged = mergePage(state.sitemap, classified);
     seenPageIds.add(merged.id);
     try {
@@ -404,9 +410,32 @@ export async function explore(
       const kind = page.kind ?? 'page';
       if (kind !== 'page' && kind !== 'wizard-step') continue;
       const pattern = page.urlPatterns.find((u) => !u.includes(':id'));
-      if (!pattern) continue;
+      // Per-item detail pages (a specific room/product — every urlPattern has
+      // ":id") have no stable pattern to build a direct URL from — fall back to
+      // the exact concrete URL the crawler actually visited (`exampleUrl`).
+      // Without this, any create/checkout-ish action living one hop off a listing
+      // page (room/product/listing detail — a very common site shape) could never
+      // become a deep-walk entry, regardless of category/keyword matching (confirmed
+      // live: automationintesting.online's room-reservation page, urlPattern
+      // "/reservation/:id", was silently skipped here even after broadening the
+      // checkout-ish keywords below).
+      const entryUrl = pattern ? `${origin}${pattern}` : page.exampleUrl;
+      if (!entryUrl) continue;
       for (const el of page.interactives) {
-        const checkoutish = el.category === 'submit' && /check ?out|place order|start|begin/i.test(el.label);
+        // The LLM classifies a form-submitting CTA as category 'submit' even when it
+        // clearly CREATES something (e.g. "Reserve Now" on a hotel-booking site — a
+        // real reservation, not just a form post) — 'create' vs 'submit' is a judgment
+        // call the classifier makes inconsistently. This keyword fallback was written
+        // checkout-only-tuned (only "checkout|place order|start|begin"), so an entire
+        // app archetype — reservations/bookings/appointments/scheduling, not just
+        // e-commerce — never produced a single deep-walk entry regardless of how deep
+        // its real creation flow goes. Broadened to the equally-common creation verbs
+        // for that archetype (confirmed live: automationintesting.online's
+        // "Reserve Now" is category:'submit' and was the ONLY candidate on the whole
+        // site, so `walks` stayed permanently empty until this matched it).
+        const checkoutish =
+          el.category === 'submit' &&
+          /check ?out|place order|start|begin|reserve|\bbook(ing)?\b|schedule|enroll/i.test(el.label);
         if (el.category !== 'create' && el.category !== 'upload' && !checkoutish) continue;
         // wizard states resumed by direct URL need the fresh entry chain that
         // originally discovered them (e.g. projects → "Create …" → fork)
@@ -422,7 +451,7 @@ export async function explore(
             };
           }
         }
-        entries.push({ pageId: page.id, interactive: el, entryUrl: `${origin}${pattern}`, via });
+        entries.push({ pageId: page.id, interactive: el, entryUrl, via });
       }
     }
 

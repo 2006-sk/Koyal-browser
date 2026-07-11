@@ -55,6 +55,15 @@ export interface PageNode {
   screenshot?: string;
   firstSeenAt: string;
   lastSeenAt: string;
+  /**
+   * A concrete, directly-openable URL that actually rendered this page (the exact
+   * URL the crawler visited when it was classified). Per-item detail pages (a
+   * specific room/product/listing — e.g. "/reservation/:id") have NO stable,
+   * parameter-free urlPattern, so callers that need one direct URL to open this
+   * page (the deep-walker's entry-finder) fall back to this when every
+   * urlPattern includes ":id". Refreshed on every re-visit so it doesn't go stale.
+   */
+  exampleUrl?: string;
 }
 
 export interface WalkAction {
@@ -244,6 +253,7 @@ export function mergePage(sitemap: SiteMap, incoming: PageNode): PageNode {
 
   existing.lastSeenAt = incoming.lastSeenAt;
   if (incoming.kind && !existing.kind) existing.kind = incoming.kind;
+  if (incoming.exampleUrl) existing.exampleUrl = incoming.exampleUrl;
   for (const pattern of incoming.urlPatterns) {
     if (!existing.urlPatterns.includes(pattern)) existing.urlPatterns.push(pattern);
   }
