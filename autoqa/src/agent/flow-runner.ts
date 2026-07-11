@@ -484,7 +484,8 @@ async function runMilestone(
   // missed-successHint softening below), but a silent PASS that ignores an
   // explicit "I could not do this" hides a real gap in coverage as if the
   // milestone were proven.
-  if (explored && !explored.success && step.result.verdict === 'pass') {
+  const explorerFailureDowngrade = Boolean(explored && !explored.success && step.result.verdict === 'pass');
+  if (explorerFailureDowngrade && explored) {
     step.result.verdict = 'needs-review';
     step.result.reasons.push(
       `Explorer did not confirm goal completion: ${explored.error ?? 'unknown reason'}`,
@@ -536,8 +537,16 @@ async function runMilestone(
       ) {
         reVerdict = 'needs-review';
       }
+      // A needs-review caused by the explorer itself failing to confirm the goal
+      // (explorerFailureDowngrade above) has NOTHING to do with the deterministic
+      // signals — they were already clean, which is exactly why the downgrade
+      // fired. Re-evaluating those SAME signals against the SAME expectation here
+      // trivially comes back 'pass' again, silently erasing the downgrade on every
+      // single occurrence. Only let a genuinely NEW signal — a human-classified
+      // success statement actually observed on the page — resolve it back to pass;
+      // a bare re-check with no new evidence must not.
       let flipped: Verdict | null = null;
-      if (reVerdict === 'pass' || (reVerdict !== 'fail' && successSeen)) {
+      if ((reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen)) || (reVerdict !== 'fail' && successSeen)) {
         flipped = 'pass';
       } else if (reVerdict === 'fail' && step.result.verdict !== 'fail') {
         flipped = 'fail';
