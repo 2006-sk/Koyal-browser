@@ -78,9 +78,29 @@ async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; pa
 /**
  * Generic login: restore saved session → replay learned login recipe →
  * LLM-explore the login form. OTP challenges route through the human channel.
+ *
+ * `trustCurrentGate` (default true) governs whether "the browser already looks
+ * like it's on a real login gate right now" is trusted as-is, or whether that
+ * signal is ignored in favor of navigating to a known probe URL first. Callers
+ * that deliberately positioned the browser before calling this (a login-shaped
+ * MILESTONE after navigateToEntry/replayUpTo ran for THAT milestone) should
+ * leave it true. The generic per-flow-start call is different: at that point
+ * nothing has navigated anywhere for the flow about to run yet, so "the current
+ * page" is just whatever an unrelated PREVIOUS flow happened to leave on
+ * screen — confirmed live on ecommerce-playground.lambdatest.io, where a
+ * completed checkout flow left the browser on OpenCart's checkout "Account"
+ * step (which legitimately renders an optional returning-customer login form,
+ * i.e. a real password input, as ONE choice alongside guest checkout) and the
+ * NEXT flow ("Build a product comparison", entry = the unauthenticated home
+ * page, no login involved at all) misread that leftover form as "this site
+ * requires login," prompting for credentials no flow on this site needed.
  */
-export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
+export async function ensureAuthenticated(
+  ctx: AuthContext,
+  opts: { trustCurrentGate?: boolean } = {},
+): Promise<void> {
   const { browser, state } = ctx;
+  const trustCurrentGate = opts.trustCurrentGate ?? true;
 
   // A login-shaped MILESTONE calls this while already sitting on the real login
   // page (navigateToEntry took it straight there — e.g. a site whose whole auth
@@ -94,8 +114,9 @@ export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
   // silently skipped this way every run — credentials never entered, the
   // milestone never recorded PASS/FAIL, and the flow still reported an overall
   // "pass" despite authentication never being attempted. Trust the CURRENT page
-  // when it already looks like a genuine login gate, instead of bouncing away.
-  const alreadyOnRealLoginGate = isGated(browser);
+  // when it already looks like a genuine login gate, instead of bouncing away —
+  // UNLESS the caller has explicitly said not to (see `trustCurrentGate` above).
+  const alreadyOnRealLoginGate = trustCurrentGate && isGated(browser);
 
   // 1. Silent path: restore saved storage state
   const probeUrl = authProbeUrl(state);

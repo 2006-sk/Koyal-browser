@@ -149,14 +149,22 @@ const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
 const HEX_ID_RE = /\b[0-9a-f]{16,}\b/gi;
 const NUM_ID_RE = /\/\d+(?=\/|$)/g;
 
+/** Mask an id-looking query VALUE the same way path segments are masked. */
+function maskQueryValue(value: string): string {
+  const masked = value.replace(UUID_RE, ':id').replace(HEX_ID_RE, ':id');
+  return /^\d+$/.test(masked) ? ':id' : masked;
+}
+
 /** Mask volatile id segments so /project/123 and /project/456 are the same page. */
 export function normalizePath(url: string): string {
   let pathname: string;
   let hash = '';
+  let search = '';
   try {
     const parsed = new URL(url);
     pathname = parsed.pathname;
     hash = parsed.hash;
+    search = parsed.search;
   } catch {
     pathname = url;
   }
@@ -189,6 +197,21 @@ export function normalizePath(url: string): string {
     // was unreachable dead code — canonicalize the root explicitly instead.
     const route = maskedRoute === '#' ? '#/' : maskedRoute;
     return `${base}${route}`;
+  }
+  // Legacy front-controller MPAs (OpenCart, phpBB, MediaWiki, ...) route through a
+  // single bare pathname (e.g. "/index.php") and encode the ACTUAL page identity in
+  // the query string ("?route=product/category&path=25"). Dropping the query
+  // entirely collapsed every distinct route on such a site onto one pathname —
+  // observed live: home ("?route=common/home"), a category listing
+  // ("?route=product/category&path=25"), and checkout ("?route=checkout/cart") all
+  // normalized to "/index.php" and merged into a single sitemap page. Fold the query
+  // string into the identity, masking id-looking VALUES the same way path segments
+  // already are (so "path=25" vs "path=57" still collapse like /project/123 vs
+  // /project/456 do) and sorting keys for determinism.
+  if (search) {
+    const params = new URLSearchParams(search);
+    const maskedEntries = [...params.entries()].map(([k, v]) => `${k}=${maskQueryValue(v)}`).sort();
+    if (maskedEntries.length) return `${base}?${maskedEntries.join('&')}`;
   }
   return base;
 }

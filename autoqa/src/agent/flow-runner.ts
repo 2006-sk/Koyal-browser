@@ -526,6 +526,29 @@ async function runMilestone(
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 
+  // The explorer's own success/failure signal was previously consulted ONLY for
+  // the mid-flow auth-wall retry above — verifyAfterAction's deterministic health
+  // checks (console errors, blank page, 5xx, ...) can all pass even when the
+  // explorer gave up without completing the goal (exhausted its step budget,
+  // got stuck repeating an action, or explicitly returned action:'fail').
+  // Observed live: a milestone with no successHint ("click Laptops (75), then
+  // advance one screen") had the explorer ping-pong between two category-filter
+  // links for all 8 steps and return success:false with error "Exceeded max
+  // exploration steps (8)" — yet the milestone was still recorded PASS because
+  // the page it ended up on had no console errors or other objective breakage.
+  // Downgrade (never upgrade) a bare 'pass' to 'needs-review' in this case — the
+  // explorer's self-report isn't ground truth either (same reasoning as the
+  // missed-successHint softening below), but a silent PASS that ignores an
+  // explicit "I could not do this" hides a real gap in coverage as if the
+  // milestone were proven.
+  const explorerFailureDowngrade = Boolean(explored && !explored.success && step.result.verdict === 'pass');
+  if (explorerFailureDowngrade && explored) {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(
+      `Explorer did not confirm goal completion: ${explored.error ?? 'unknown reason'}`,
+    );
+  }
+
   // Everything below is POST-verdict bookkeeping (KB triage, human escalation,
   // recipe caching) — none of it should be able to lose the verdict `step`
   // already computed above. A browser hiccup here (the daemon wedging between
@@ -571,8 +594,16 @@ async function runMilestone(
       ) {
         reVerdict = 'needs-review';
       }
+      // A needs-review caused by the explorer itself failing to confirm the goal
+      // (explorerFailureDowngrade above) has NOTHING to do with the deterministic
+      // signals — they were already clean, which is exactly why the downgrade
+      // fired. Re-evaluating those SAME signals against the SAME expectation here
+      // trivially comes back 'pass' again, silently erasing the downgrade on every
+      // single occurrence. Only let a genuinely NEW signal — a human-classified
+      // success statement actually observed on the page — resolve it back to pass;
+      // a bare re-check with no new evidence must not.
       let flipped: Verdict | null = null;
-      if (reVerdict === 'pass' || (reVerdict !== 'fail' && successSeen)) {
+      if ((reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen)) || (reVerdict !== 'fail' && successSeen)) {
         flipped = 'pass';
       } else if (reVerdict === 'fail' && step.result.verdict !== 'fail') {
         flipped = 'fail';
@@ -658,7 +689,12 @@ export async function runFlows(
     };
 
     try {
-      await ensureAuthenticated(authCtx);
+      // Nothing has navigated anywhere for THIS flow yet at this point — the
+      // browser is wherever the PREVIOUS flow left it, which is unrelated to
+      // whether this flow's own entry requires login. Don't trust an incidental
+      // login-shaped page left over from that prior flow (see trustCurrentGate's
+      // doc comment in auth.ts for the confirmed live false-positive this fixes).
+      await ensureAuthenticated(authCtx, { trustCurrentGate: false });
       await navigateToEntry(deps, flow);
       await applyFreshEntryHint(deps, flow);
 
