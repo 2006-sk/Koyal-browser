@@ -1,0 +1,32 @@
+{
+  "name": "koyal-qa-agent",
+  "version": "0.1.0",
+  "description": "Phase 1 automated QA agent for beta.koyal.ai auth flow and app shell",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "qa:login": "tsx src/run-login.ts",
+    "qa": "tsx src/run.ts",
+    "qa:phase1": "tsx src/run.ts --skip-signup --skip-forgot",
+    "qa:forgot": "tsx src/run.ts --forgot-only",
+    "qa:signup": "tsx src/run.ts --signup-only",
+    "qa:validation": "tsx src/run.ts --validation-only",
+    "qa:back-forth": "tsx src/run.ts --back-forth-only",
+    "qa:app-shell": "tsx src/run.ts --app-shell-only",
+    "discover": "tsx src/discover.ts",
+    "probe:script": "tsx src/probe-script-path.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "agent-browser": "^0.31.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

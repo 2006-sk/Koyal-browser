@@ -1,0 +1,31 @@
+{
+  "name": "koyal-qa-audio",
+  "version": "0.1.0",
+  "description": "Agentic E2E QA for Koyal audio upload happy flow",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "qa": "tsx src/run.ts",
+    "qa:wav": "tsx src/run.ts --wav-only",
+    "qa:mp3": "tsx src/run.ts --mp3-only",
+    "qa:all": "tsx src/run.ts",
+    "qa:full": "tsx src/run.ts --wav-only",
+    "qa:complete": "tsx src/run.ts --wav-only",
+    "qa:e2e": "tsx src/run.ts --wav-only",
+    "qa:back-forth": "echo 'Merged into qa:wav (audio-complete-wav)' && tsx src/run.ts --wav-only",
+    "qa:wizard-nav": "echo 'Merged into qa:wav (audio-complete-wav)' && tsx src/run.ts --wav-only"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "agent-browser": "^0.31.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
