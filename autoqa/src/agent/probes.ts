@@ -271,12 +271,28 @@ export async function rapidToggleProbe(
     ctx.nav.click({ label: pair.canonical, exact: true, optional: true });
     ctx.browser.wait(600);
 
+    // Some 2-member "toggles" are actually two nav links that transition to a
+    // DIFFERENT page/state (e.g. a role selector like "Customer Login" /
+    // "Bank Manager Login" that navigates to a customer- or manager-only
+    // screen) rather than switching an in-place UI control on the same page.
+    // Requiring the clicked label's own text to still be visible after a real
+    // navigation always false-fails — that label was left behind on the page
+    // that's no longer displayed, even though the click correctly navigated.
+    // Only require the label-visible check for a TRUE in-place toggle (same
+    // page before/after); otherwise just assert the page didn't end up broken
+    // (PROBE_BASE's page-error/console-error checks still apply either way).
+    const current = pageIdNow(ctx);
+    const stayedOnPage = current === 'unknown' || current === page.id;
+    const expectation: VerificationExpectation = stayedOnPage
+      ? { ...PROBE_BASE, description: 'optional: rapid toggle stability', snapshotIncludesAny: [pair.canonical] }
+      : { ...PROBE_BASE, description: 'optional: rapid toggle stability (settled via navigation, not an in-place toggle)' };
+
     const step = await recordProbe(
       ctx,
       `${workflowPrefix}:rapid-toggle`,
       `rapidly alternate "${pair.memberLabels.join('" / "')}" 5x, settle on "${pair.canonical}"`,
       'UI stays stable, no crash',
-      { ...PROBE_BASE, description: 'optional: rapid toggle stability', snapshotIncludesAny: [pair.canonical] },
+      expectation,
     );
     return { probe: 'rapid-toggle', step };
   } catch {

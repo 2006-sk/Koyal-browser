@@ -38,6 +38,14 @@ function writeJsonAtomic(filePath: string, data: unknown): void {
 export class SiteState {
   readonly hostname: string;
   readonly dir: string;
+  /**
+   * The exact URL passed via --url/AUTOQA_URL, including path/query/hash —
+   * distinct from `sitemap.origin` (protocol+host only). Deep-linked targets
+   * (e.g. a hash-routed SPA's "#/login") need this to seed the very first
+   * navigation; `sitemap.origin` alone would silently discard the path/hash
+   * and land the agent on the bare site root instead of the requested screen.
+   */
+  readonly startUrl: string;
 
   sitemap: SiteMap;
   statements: StatementEntry[];
@@ -47,6 +55,7 @@ export class SiteState {
 
   constructor(baseUrl: string) {
     this.hostname = new URL(baseUrl).hostname;
+    this.startUrl = baseUrl;
     this.dir = path.join(config.stateRoot, this.hostname);
     fs.mkdirSync(this.screensDir, { recursive: true });
     fs.mkdirSync(this.inboxDir, { recursive: true });

@@ -103,8 +103,13 @@ export class AgentBrowser {
     // A transient CDP stall on a heavy page often clears on a second try. Auto-retry
     // ONCE, but only for idempotent read/navigation commands — never for mutating
     // actions (click/fill/upload) where a retry could double-act.
+    // NOTE: getUrl()/getTitle()/etc. invoke the two-word CLI form `get url`/`get title`,
+    // so the distinguishing word is args[0]="get", not "url"/"title" — those two entries
+    // never actually matched anything (dead list entries), silently excluding the most-
+    // called read commands from the retry and turning one transient CDP stall into an
+    // immediate fatal crash of the whole run instead of a self-healed retry.
     const cmd = args[0] ?? '';
-    const retrySafe = ['open', 'snapshot', 'url', 'title', 'errors', 'console', 'network', 'screenshot'].includes(cmd);
+    const retrySafe = ['open', 'get', 'snapshot', 'errors', 'console', 'network', 'screenshot'].includes(cmd);
     let result = spawnSync(this.binary, fullArgs, {
       encoding: 'utf8',
       maxBuffer: 20 * 1024 * 1024,

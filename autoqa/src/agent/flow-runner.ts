@@ -168,28 +168,29 @@ async function ensureLoggedOutForEntry(
 
 /**
  * Some create/upload entry points resume prior state (e.g. Koyal's "Create Your
- * Next Video" always resumes the last draft) instead of landing on milestone 1's
- * expected guard phase. Ask once for the label of a "start fresh" control, persist
+ * Next Video" always resumes the last draft) instead of landing where entry
+ * navigation should. Ask once for the label of a "start fresh" control, persist
  * it on the flow (or persist "none" to stop asking), and apply it going forward.
  * Only called at true flow start — never during replayUpTo repositioning, where
  * clicking "start fresh" again would blow away the progress being rebuilt.
+ *
+ * NOTE: the expected post-entry-navigation page is `flow.entry.pageId` — "the page
+ * id where the flow starts" (see page-classifier.ts's entryPageId prompt field) —
+ * NOT `flow.milestones[0].guardPhases`. Those two coincide only for deep-walked
+ * flows, where milestone 1 acts ON the already-reached entry page. For the far
+ * more common case of an LLM-proposed flow whose milestone 1 is itself a
+ * *navigation* step (goal: "click X to reach Y"), guardPhases holds Y — the
+ * DESTINATION milestone 1 is about to create, not the page entry navigation
+ * alone should have already produced. Comparing against guardPhases there
+ * always mismatches (since nothing has navigated to Y yet), asking a bogus
+ * "did this resume stale state?" question on the very first run of virtually
+ * every non-deep-walked flow on any site.
  */
 async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
-  const firstGuardPhases = flow.milestones[0]?.guardPhases;
-  if (!firstGuardPhases?.length) return;
+  const expectedEntryPageId = flow.entry.pageId;
+  if (!expectedEntryPageId) return;
 
-  // "Where should entry navigation land?" is the flow's OWN declared entry page,
-  // not milestone 1's guardPhases — those describe the state AFTER m1 executes,
-  // which is a different page whenever m1 is a navigate-type step (e.g. "Click
-  // Sign In" landing on entry.pageId="products-list" with guardPhases=["login"]).
-  // Comparing entry landing against guardPhases was a false-positive generator on
-  // ANY flow shaped this way (verified live on bstackdemo.com: a completely normal
-  // "click Sign In then log in" flow triggered two consecutive "resumed stale
-  // state" prompts purely because m1 is a navigate step) — fall back to
-  // firstGuardPhases only when the flow has no entry.pageId to compare against.
-  const expectedEntryIds = flow.entry.pageId ? [flow.entry.pageId] : firstGuardPhases;
-
-  const needsAnonEntry = firstGuardPhases.some(looksLikeAuthEntryPageId);
+  const needsAnonEntry = looksLikeAuthEntryPageId(expectedEntryPageId);
   const hereIdEarly = currentPageId(deps);
   // Page-id mismatch is the common signal. 'unknown' counts as a mismatch too —
   // a same-session redirect right after navigateToEntry can land somewhere the
@@ -223,9 +224,9 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
     Boolean(logoutCtrl) &&
     logoutCtrl !== 'none' &&
     deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
-  const pageIdLooksStillAuthed = needsAnonEntry && !expectedEntryIds.includes(hereIdEarly);
+  const pageIdLooksStillAuthed = needsAnonEntry && hereIdEarly !== expectedEntryPageId;
   if (pageIdLooksStillAuthed || logoutControlVisible) {
-    if (await ensureLoggedOutForEntry(deps, flow, firstGuardPhases)) return;
+    if (await ensureLoggedOutForEntry(deps, flow, [expectedEntryPageId])) return;
   }
 
   if (flow.entry.freshEntryHint) {
@@ -237,10 +238,10 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   }
 
   const hereId = currentPageId(deps);
-  if (expectedEntryIds.includes(hereId) || hereId === 'unknown') return;
+  if (hereId === expectedEntryPageId || hereId === 'unknown') return;
 
   const answer = await deps.interact.ask(
-    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${expectedEntryIds.join('/')}) — ` +
+    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step "${expectedEntryPageId}" — ` +
       `looks like it resumed stale state (e.g. a draft). Paste the exact label of a "start fresh/new" control to click here, or "none" if this is expected.`,
     { default: 'none' },
   );
@@ -278,8 +279,18 @@ function isLoginShapedGoal(goal: string): boolean {
   // through ensureAuthenticated — require BOTH username+password together, or
   // the word "credentials" (which implies a full login attempt by itself),
   // never "password" in isolation.
+  //
+  // Same discipline applies to "log in"/"sign in" itself: the LLM quotes a
+  // clicked control's label verbatim (e.g. "Click 'Bank Manager Login' to enter
+  // the manager dashboard" or "Click 'Customer Login' to reach the customer
+  // selection screen") — a nav button/link whose LABEL merely contains the word
+  // "Login"/"Sign in" is not an instruction to authenticate, just to navigate.
+  // Strip quoted spans before checking for the bare phrase so only an
+  // authentication verb appearing OUTSIDE a clicked label's own quoted text
+  // counts.
+  const unquoted = goal.replace(/['"][^'"]*['"]/g, '');
   const wantsAuth =
-    /\b(log ?in|sign ?in)\b/i.test(goal) ||
+    /\b(log ?in|sign ?in)\b/i.test(unquoted) ||
     (/\b(enter|fill|type|submit)\b/i.test(goal) &&
       (/\bcredentials?\b/i.test(goal) || (/\busername\b/i.test(goal) && /\bpassword\b/i.test(goal))));
   const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);

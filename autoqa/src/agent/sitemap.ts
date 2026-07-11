@@ -152,18 +152,32 @@ const NUM_ID_RE = /\/\d+(?=\/|$)/g;
 /** Mask volatile id segments so /project/123 and /project/456 are the same page. */
 export function normalizePath(url: string): string {
   let pathname: string;
+  let hash = '';
   try {
-    pathname = new URL(url).pathname;
+    const parsed = new URL(url);
+    pathname = parsed.pathname;
+    hash = parsed.hash;
   } catch {
     pathname = url;
   }
-  return (
+  const base =
     pathname
       .replace(UUID_RE, ':id')
       .replace(HEX_ID_RE, ':id')
       .replace(NUM_ID_RE, '/:id')
-      .replace(/\/+$/, '') || '/'
-  );
+      .replace(/\/+$/, '') || '/';
+  // Hash-ROUTED SPAs (AngularJS ngRoute, hash-mode Vue/React routers, ...) encode
+  // the actual client-side route in the fragment, conventionally "#/some/path" —
+  // dropping it collapsed every distinct app state onto one identity (every route
+  // in an app like an AngularJS ngRoute banking demo shares one bare pathname).
+  // Plain in-page anchors ("#section2") don't follow the "#/" convention, so they
+  // stay excluded — folding them in would spuriously multiply otherwise-identical
+  // pages on ordinary anchor-link sites.
+  if (/^#\//.test(hash)) {
+    const route = hash.replace(/\/+$/, '') || '#/';
+    return `${base}${route}`;
+  }
+  return base;
 }
 
 function isPlainPage(page: PageNode): boolean {
