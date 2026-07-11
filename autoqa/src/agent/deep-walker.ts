@@ -60,6 +60,26 @@ function isBlankState(url: string, snapshot: string): boolean {
   return url.startsWith('about:') || snapshot.trim() === '';
 }
 
+/**
+ * Same-origin guard, mirroring crawler.ts's `isOffOrigin` — a footer/CTA link to
+ * a related marketing/checkout site (a different (sub)domain) is common, and the
+ * crawler already refuses to map or click-probe such destinations. The deep
+ * walker had no equivalent check: confirmed live on GreenKart's parent domain
+ * (rahulshettyacademy.com), an "all-access-subscription" walk entry followed a
+ * "JOIN NOW" → "ENROLL NOW" chain off-site to a REAL third-party checkout page
+ * (sso.teachable.com, behind Cloudflare "verify you are human"), where the walker
+ * then spent LLM steps trying to click through the Cloudflare challenge and was
+ * about to enter a 300s processing-wait for someone else's real payment flow.
+ * Not a hypothetical: this is a genuine safety/scope leak, not just wasted budget.
+ */
+function isOffOrigin(url: string, origin: string): boolean {
+  try {
+    return new URL(url).origin !== origin;
+  } catch {
+    return false;
+  }
+}
+
 function advanceGoal(page: PageNode, marker: string): string {
   if (config.probes.exhaustive) {
     // DEEP mode: don't just click through — actually USE the step's features so we
@@ -166,6 +186,13 @@ export async function deepWalk(
     }
     if (isBlankState(url, snapshot)) {
       throw new Error(`page stuck at ${url} after blank-state recovery attempts`);
+    }
+    // Never classify/map a third-party domain — abort the walk instead (same
+    // policy the crawler already enforces on its own click-probes).
+    if (isOffOrigin(url, state.sitemap.origin)) {
+      throw new Error(
+        `walk navigated off-site to ${url} (expected origin ${state.sitemap.origin}) — aborting, not mapping third-party domains`,
+      );
     }
     lastRealUrl = url;
     let page = matchPage(state.sitemap, url, snapshot);
