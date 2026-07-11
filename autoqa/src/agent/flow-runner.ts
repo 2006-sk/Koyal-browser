@@ -177,6 +177,17 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   const firstGuardPhases = flow.milestones[0]?.guardPhases;
   if (!firstGuardPhases?.length) return;
 
+  // "Where should entry navigation land?" is the flow's OWN declared entry page,
+  // not milestone 1's guardPhases — those describe the state AFTER m1 executes,
+  // which is a different page whenever m1 is a navigate-type step (e.g. "Click
+  // Sign In" landing on entry.pageId="products-list" with guardPhases=["login"]).
+  // Comparing entry landing against guardPhases was a false-positive generator on
+  // ANY flow shaped this way (verified live on bstackdemo.com: a completely normal
+  // "click Sign In then log in" flow triggered two consecutive "resumed stale
+  // state" prompts purely because m1 is a navigate step) — fall back to
+  // firstGuardPhases only when the flow has no entry.pageId to compare against.
+  const expectedEntryIds = flow.entry.pageId ? [flow.entry.pageId] : firstGuardPhases;
+
   const needsAnonEntry = firstGuardPhases.some(looksLikeAuthEntryPageId);
   const hereIdEarly = currentPageId(deps);
   // Page-id mismatch is the common signal. 'unknown' counts as a mismatch too —
@@ -194,7 +205,7 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
     Boolean(logoutCtrl) &&
     logoutCtrl !== 'none' &&
     deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
-  const pageIdLooksStillAuthed = needsAnonEntry && !firstGuardPhases.includes(hereIdEarly);
+  const pageIdLooksStillAuthed = needsAnonEntry && !expectedEntryIds.includes(hereIdEarly);
   if (pageIdLooksStillAuthed || logoutControlVisible) {
     if (await ensureLoggedOutForEntry(deps, flow, firstGuardPhases)) return;
   }
@@ -208,10 +219,10 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   }
 
   const hereId = currentPageId(deps);
-  if (firstGuardPhases.includes(hereId) || hereId === 'unknown') return;
+  if (expectedEntryIds.includes(hereId) || hereId === 'unknown') return;
 
   const answer = await deps.interact.ask(
-    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${firstGuardPhases.join('/')}) — ` +
+    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step (${expectedEntryIds.join('/')}) — ` +
       `looks like it resumed stale state (e.g. a draft). Paste the exact label of a "start fresh/new" control to click here, or "none" if this is expected.`,
     { default: 'none' },
   );
@@ -267,6 +278,26 @@ function isSearchShapedGoal(goal: string): boolean {
   return /\bsearch\b/i.test(goal);
 }
 
+/**
+ * A random marker string can only be verified if it was TYPED into a free-text
+ * field. A milestone that chooses/toggles a PRESET option (checkbox, native
+ * <select>, dropdown, radio, toggle) has no text field to type it into, so the
+ * injected "use exactly: <marker>" instruction is unsatisfiable and the
+ * milestone false-fails on the marker-presence check regardless of whether the
+ * real action succeeded. Verified live on bstackdemo.com: "Open the Order By
+ * sorting control and choose Price - Highest to Lowest" correctly selected the
+ * option (confirmed via the explorer's own snapshot check) but still failed
+ * with "Expected snapshot to include one of: <marker>". Only exempted when the
+ * goal doesn't ALSO ask to type/enter/fill something (a compound goal that
+ * really does need the marker).
+ */
+function isSelectionShapedGoal(goal: string): boolean {
+  return (
+    /\b(select|choose|checkbox|dropdown|combobox|toggle|checked|radio|option)\b/i.test(goal) &&
+    !/\b(type|enter|fill|write)\b/i.test(goal)
+  );
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -298,9 +329,10 @@ async function runMilestone(
   // explicit edit milestones (a 'create' click may involve no text field at all)
   const loginShaped = isLoginShapedGoal(milestone.goal);
   const searchShaped = isSearchShapedGoal(milestone.goal);
+  const selectionShaped = isSelectionShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped && !searchShaped) {
+  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
@@ -512,11 +544,21 @@ export async function runFlows(
         const milestone = flow.milestones[mi];
 
         // wizard drafts can resume mid-flow: if we're already on a LATER
-        // milestone's page, fast-forward instead of failing the earlier ones
+        // milestone's page, fast-forward instead of failing the earlier ones.
+        // But the flow's own entry page is never a valid fast-forward TARGET —
+        // a later milestone's guardPhases can legitimately equal entry.pageId
+        // (e.g. "log in" flows that start AND end on the same storefront page,
+        // just in a different auth state a page id alone can't see). Verified
+        // live on bstackdemo.com: entry.pageId="products-list" also happens to
+        // be m4 AND m5's guardPhase, so on the very first check of m1 — right
+        // after fresh entry navigation, nothing has run yet — this matched and
+        // skipped straight to m4, silently false-PASSing the entire
+        // username/password/login-click sequence.
         const hereId = currentPageId(deps);
-        const aheadIdx = flow.milestones.findIndex(
-          (m, j) => j > mi && m.guardPhases?.includes(hereId),
-        );
+        const isEntryPage = hereId !== 'unknown' && hereId === flow.entry.pageId;
+        const aheadIdx = isEntryPage
+          ? -1
+          : flow.milestones.findIndex((m, j) => j > mi && m.guardPhases?.includes(hereId));
         if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
           console.log(
             `[flow] resumed mid-wizard on "${hereId}" — fast-forwarding ${aheadIdx - mi} milestone(s)`,

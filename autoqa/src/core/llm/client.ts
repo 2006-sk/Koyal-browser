@@ -25,6 +25,7 @@ export class LlmClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly model: string;
+  private readonly timeoutMs: number;
 
   /** Cumulative calls across all clients this process */
   static callCount = 0;
@@ -41,6 +42,7 @@ export class LlmClient {
     this.apiKey = options?.apiKey ?? config.llm.apiKey;
     this.baseUrl = (options?.baseUrl ?? config.llm.baseUrl) || defaultLlmBaseUrl(this.provider);
     this.model = options?.model ?? config.llm.model;
+    this.timeoutMs = config.llm.requestTimeoutMs;
   }
 
   async complete(options: LlmCompletionOptions): Promise<string> {
@@ -80,6 +82,7 @@ export class LlmClient {
             ...(this.provider === 'openrouter' ? { 'X-Title': 'autoqa' } : {}),
           },
           body,
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
 
         if (!response.ok) {
@@ -128,6 +131,7 @@ export class LlmClient {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.timeoutMs),
         });
 
         if (!response.ok) {

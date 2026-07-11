@@ -84,6 +84,11 @@ export const config = {
     snapshotMaxChars: Number(process.env.AUTOQA_SNAPSHOT_MAX_CHARS ?? '8000'),
     /** Hard cap on LLM calls per run; 0 = unlimited */
     callBudget: Number(process.env.AUTOQA_LLM_BUDGET ?? '0'),
+    /** Per-attempt network timeout for LLM HTTP calls; a stalled connection must
+     *  fail fast and let the existing 3x retry/backoff (and callers' try/catch,
+     *  e.g. proposeFlows "must never kill the run") actually run, instead of the
+     *  whole explore/test process hanging forever on an un-timed-out fetch(). */
+    requestTimeoutMs: Number(process.env.AUTOQA_LLM_TIMEOUT_MS ?? '60000'),
   },
 
   projectRoot,

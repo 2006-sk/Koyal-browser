@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { parseJsonArrayFromEvalStdout, type AgentBrowser } from './agent-browser.js';
 import { LlmClient, parseJsonFromLlm } from './llm/client.js';
 
-export type ExplorerActionType = 'click' | 'fill' | 'wait' | 'upload' | 'done' | 'fail';
+export type ExplorerActionType = 'click' | 'fill' | 'select' | 'wait' | 'upload' | 'done' | 'fail';
 
 export interface ExplorerAction {
   action: ExplorerActionType;
@@ -63,6 +63,7 @@ Rules:
 - Only use refs that appear in the current snapshot.
 - Prefer semantic matches (button names, field labels) over guessing.
 - For fill actions, use the exact value provided in the goal when filling credentials.
+- For a native <select> dropdown (snapshot shows "combobox" with nested "option" lines, NOT a custom-styled widget), use action "select" with the ref of the combobox itself and "value" set to the exact visible text of the target option — do NOT use "click" on the option, clicking native select options is unreliable.
 - If the goal requires attaching a local file, respond with action "upload" (you cannot attach files yourself; the harness will do it mechanically). Include a "selector" if a file input's CSS id/selector is apparent.
 - Use action "done" when the goal is clearly achieved in the current snapshot/URL.
 - Use action "fail" only if the goal is impossible (e.g. element missing after reasonable attempt).
@@ -71,9 +72,9 @@ Rules:
 ${hints}
 JSON schema:
 {
-  "action": "click" | "fill" | "wait" | "upload" | "done" | "fail",
+  "action": "click" | "fill" | "select" | "wait" | "upload" | "done" | "fail",
   "ref": "@eN",
-  "value": "string for fill only",
+  "value": "string for fill/select only",
   "selector": "CSS selector for upload only (optional)",
   "reason": "brief explanation"
 }`;
@@ -314,6 +315,12 @@ export class Explorer {
           throw new Error('Explorer fill missing ref or value');
         }
         this.browser.fillVisible(decision.ref, decision.value);
+        break;
+      case 'select':
+        if (!decision.ref || decision.value === undefined) {
+          throw new Error('Explorer select missing ref or value');
+        }
+        this.browser.select(decision.ref, decision.value);
         break;
       case 'upload': {
         if (!this.hooks.onUploadRequested) {
