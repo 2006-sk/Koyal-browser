@@ -101,7 +101,15 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
   if (flow.entry.url) {
     browser.open(`${state.sitemap.origin}${flow.entry.url.replace(state.sitemap.origin, '')}`);
     browser.wait(2000);
-    return;
+    // A pinned per-item URL (crawler.ts's exampleUrl fallback for pages whose only
+    // urlPatterns contain ':id') can go stale — the item may since have been
+    // deleted/renumbered. Verify we actually landed on the expected page kind
+    // before trusting it; if not, fall through to the generic LLM-navigation
+    // recovery below instead of silently proceeding on a dead/wrong page.
+    if (currentPageId(deps) === flow.entry.pageId) return;
+    console.log(
+      `[flow] pinned entry url for "${flow.entry.pageId}" looks stale — falling back to LLM navigation`,
+    );
   }
   const entryPage = state.sitemap.pages[flow.entry.pageId];
   const directPattern = entryPage?.urlPatterns.find((p) => !p.includes(':id'));
@@ -187,11 +195,37 @@ async function ensureLoggedOutForEntry(
  * every non-deep-walked flow on any site.
  */
 async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
-  const expectedEntryPageId = flow.entry.pageId;
+  // page-classifier.ts sets entry.pageId from the LLM's JSON directly (defaulting
+  // to '' if the LLM omitted entryPageId) — the old guardPhases-based check ran
+  // even in that case, so skipping entirely here would leave a flow with zero
+  // draft-resume protection instead of the weaker-but-nonzero prior fallback.
+  // Only fall back to milestones[0].guardPhases when milestone 1 is NOT a
+  // navigate-type step — that's the exact condition under which guardPhases[0]
+  // legitimately describes the entry page itself rather than a destination
+  // milestone 1 hasn't reached yet (the original bug this function fixes).
+  const firstMilestone = flow.milestones[0];
+  const expectedEntryPageId =
+    flow.entry.pageId ||
+    (firstMilestone?.kind !== 'navigate' ? firstMilestone?.guardPhases?.[0] : undefined);
   if (!expectedEntryPageId) return;
 
   const needsAnonEntry = looksLikeAuthEntryPageId(expectedEntryPageId);
-  const hereIdEarly = currentPageId(deps);
+  // One shared url+snapshot round-trip for all three checks below (page id,
+  // real-login-gate, logout-control-visible) instead of each independently
+  // re-querying the browser — nothing changes the page between them, so a
+  // second and third capture just cost extra subprocess round-trips (and,
+  // under this project's documented CDP-stall conditions, extra surface area
+  // for one of those calls to hang).
+  let urlEarly = '';
+  let snapshotEarly = '';
+  let hereIdEarly = 'unknown';
+  try {
+    urlEarly = deps.browser.getUrl();
+    snapshotEarly = deps.browser.snapshotInteractive();
+    hereIdEarly = matchPage(deps.state.sitemap, urlEarly, snapshotEarly)?.id ?? 'unknown';
+  } catch {
+    // wedged daemon — treat like the existing 'unknown' case below
+  }
   // Page-id mismatch is the common signal. 'unknown' counts as a mismatch too —
   // a same-session redirect right after navigateToEntry can land somewhere the
   // sitemap hasn't classified yet, and requiring a resolved id previously let
@@ -217,13 +251,13 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
   // present a live password field to log in with.
   const currentlyOnRealLoginGate =
     needsAnonEntry &&
-    looksLikeAuthGate(deps.browser.getUrl(), deps.browser.snapshotInteractive(), deps.browser.hasVisiblePasswordInput());
+    looksLikeAuthGate(urlEarly, snapshotEarly, deps.browser.hasVisiblePasswordInput());
   const logoutControlVisible =
     needsAnonEntry &&
     !currentlyOnRealLoginGate &&
     Boolean(logoutCtrl) &&
     logoutCtrl !== 'none' &&
-    deps.browser.snapshotInteractive().toLowerCase().includes(logoutCtrl!.toLowerCase());
+    snapshotEarly.toLowerCase().includes(logoutCtrl!.toLowerCase());
   const pageIdLooksStillAuthed = needsAnonEntry && hereIdEarly !== expectedEntryPageId;
   if (pageIdLooksStillAuthed || logoutControlVisible) {
     if (await ensureLoggedOutForEntry(deps, flow, [expectedEntryPageId])) return;
@@ -288,11 +322,17 @@ function isLoginShapedGoal(goal: string): boolean {
   // Strip quoted spans before checking for the bare phrase so only an
   // authentication verb appearing OUTSIDE a clicked label's own quoted text
   // counts.
-  const unquoted = goal.replace(/['"][^'"]*['"]/g, '');
+  // Only strip a quoted span when its delimiters look like real quotation marks —
+  // preceded by whitespace/start-of-string and followed by whitespace/punctuation/
+  // end-of-string — not a stray possessive apostrophe (e.g. "user's"), which sits
+  // directly between two letters with no such boundary. A naive quote-to-next-quote
+  // strip would otherwise mis-pair "user's" with a LATER real quoted label and
+  // swallow genuine unquoted auth wording in between.
+  const unquoted = goal.replace(/(?<=^|\s)(['"])[^'"]*\1(?=\s|[.,;:!?]|$)/g, '');
   const wantsAuth =
     /\b(log ?in|sign ?in)\b/i.test(unquoted) ||
-    (/\b(enter|fill|type|submit)\b/i.test(goal) &&
-      (/\bcredentials?\b/i.test(goal) || (/\busername\b/i.test(goal) && /\bpassword\b/i.test(goal))));
+    (/\b(enter|fill|type|submit)\b/i.test(unquoted) &&
+      (/\bcredentials?\b/i.test(unquoted) || (/\busername\b/i.test(unquoted) && /\bpassword\b/i.test(unquoted))));
   const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);
   return wantsAuth && !negativePath;
 }
@@ -318,12 +358,16 @@ function isSearchShapedGoal(goal: string): boolean {
  * option (confirmed via the explorer's own snapshot check) but still failed
  * with "Expected snapshot to include one of: <marker>". Only exempted when the
  * goal doesn't ALSO ask to type/enter/fill something (a compound goal that
- * really does need the marker).
+ * really does need the marker) — the exclusion list covers both the ACTION verbs
+ * (type/enter/fill/write) and common free-text-field NOUNS (comment/note/
+ * instructions/feedback/message/describe/explain/details), since a goal like
+ * "Select the delivery option and add special delivery instructions" contains
+ * "option" but no action verb, even though it also has a genuine text field.
  */
 function isSelectionShapedGoal(goal: string): boolean {
   return (
     /\b(select|choose|checkbox|dropdown|combobox|toggle|checked|radio|option)\b/i.test(goal) &&
-    !/\b(type|enter|fill|write)\b/i.test(goal)
+    !/\b(type|enter|fill|write|comment|note|instructions?|feedback|message|describe|explain|details?)\b/i.test(goal)
   );
 }
 
@@ -584,7 +628,12 @@ export async function runFlows(
         // skipped straight to m4, silently false-PASSing the entire
         // username/password/login-click sequence.
         const hereId = currentPageId(deps);
-        const isEntryPage = hereId !== 'unknown' && hereId === flow.entry.pageId;
+        // Only guard the exact scenario above: the FIRST check (mi===0), right after
+        // fresh entry navigation, before anything has run. For any LATER check
+        // (mi>0), landing back on entry.pageId can legitimately BE a resumed later
+        // milestone's position (not just the unstarted flow start) — unconditionally
+        // disabling fast-forward for every iteration would block that legitimate case.
+        const isEntryPage = mi === 0 && hereId !== 'unknown' && hereId === flow.entry.pageId;
         const aheadIdx = isEntryPage
           ? -1
           : flow.milestones.findIndex((m, j) => j > mi && m.guardPhases?.includes(hereId));

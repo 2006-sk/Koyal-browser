@@ -435,7 +435,11 @@ export async function explore(
         // site, so `walks` stayed permanently empty until this matched it).
         const checkoutish =
           el.category === 'submit' &&
-          /check ?out|place order|start|begin|reserve|\bbook(ing)?\b|schedule|enroll/i.test(el.label);
+          // Wrap the whole alternation in one \b...\b pair — a per-alternative \b
+          // (as 'book(ing)?' alone had) doesn't extend to its siblings, so bare
+          // words like "reserve"/"schedule"/"enroll" matched as substrings inside
+          // unrelated words (e.g. "Preserve My Settings" contains "reserve").
+          /\b(check ?out|place order|start|begin|reserve|book(ing)?|schedule|enroll)\b/i.test(el.label);
         if (el.category !== 'create' && el.category !== 'upload' && !checkoutish) continue;
         // wizard states resumed by direct URL need the fresh entry chain that
         // originally discovered them (e.g. projects → "Create …" → fork)

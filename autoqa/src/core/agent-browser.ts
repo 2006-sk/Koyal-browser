@@ -261,10 +261,27 @@ export class AgentBrowser {
     const cx = Math.round(box.x + box.width / 2);
     const cy = Math.round(box.y + box.height / 2);
     try {
-      this.run(['mouse', 'move', String(cx), String(cy)]);
-      this.run(['mouse', 'down']);
-      this.run(['mouse', 'up']);
-      return true;
+      // A coordinate-based click bypasses the ref-based overlap guard entirely, so
+      // refuse it when the element actually at this point looks like a genuine
+      // blocking overlay (an <iframe> — the shape of an ad/cookie-consent/modal — or
+      // something covering most of the viewport) rather than a same-widget layer like
+      // a react-select placeholder sitting directly over its own backing input.
+      // Clicking through a real overlay silently activates IT instead of the intended
+      // target, with no error — exactly the false-success this check exists to avoid.
+      const coverInfo = this.evalScript(
+        `(function(){var el=document.elementFromPoint(${cx},${cy});if(!el)return 'none';var r=el.getBoundingClientRect();var big=r.width>window.innerWidth*0.5&&r.height>window.innerHeight*0.3;return el.tagName+'|'+(big?'large':'small');})()`,
+        { skipEnsure: true },
+      ).trim();
+      if (coverInfo.startsWith('IFRAME') || coverInfo.endsWith('|large')) {
+        console.log(`[browser] refusing coordinate-based click on ${ref} — covering element looks like a real overlay (${coverInfo})`);
+        return false;
+      }
+      const moveResult = this.run(['mouse', 'move', String(cx), String(cy)]);
+      if (moveResult.exitCode !== 0) return false;
+      const downResult = this.run(['mouse', 'down']);
+      if (downResult.exitCode !== 0) return false;
+      const upResult = this.run(['mouse', 'up']);
+      return upResult.exitCode === 0;
     } catch {
       return false;
     }

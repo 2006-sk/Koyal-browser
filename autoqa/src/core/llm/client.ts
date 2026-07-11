@@ -82,7 +82,11 @@ export class LlmClient {
             ...(this.provider === 'openrouter' ? { 'X-Title': 'autoqa' } : {}),
           },
           body,
-          signal: AbortSignal.timeout(this.timeoutMs),
+          // Scale the timeout per attempt — a legitimately slow (not stalled) call
+          // that needs longer than the base timeout would otherwise abort identically
+          // on all 3 attempts for the same underlying reason (genuine latency), turning
+          // a call that used to succeed (pre-timeout) into a deterministic failure.
+          signal: AbortSignal.timeout(this.timeoutMs * attempt),
         });
 
         if (!response.ok) {
@@ -131,7 +135,11 @@ export class LlmClient {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(this.timeoutMs),
+          // Scale the timeout per attempt — a legitimately slow (not stalled) call
+          // that needs longer than the base timeout would otherwise abort identically
+          // on all 3 attempts for the same underlying reason (genuine latency), turning
+          // a call that used to succeed (pre-timeout) into a deterministic failure.
+          signal: AbortSignal.timeout(this.timeoutMs * attempt),
         });
 
         if (!response.ok) {

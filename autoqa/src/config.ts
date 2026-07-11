@@ -87,8 +87,11 @@ export const config = {
     /** Per-attempt network timeout for LLM HTTP calls; a stalled connection must
      *  fail fast and let the existing 3x retry/backoff (and callers' try/catch,
      *  e.g. proposeFlows "must never kill the run") actually run, instead of the
-     *  whole explore/test process hanging forever on an un-timed-out fetch(). */
-    requestTimeoutMs: Number(process.env.AUTOQA_LLM_TIMEOUT_MS ?? '60000'),
+     *  whole explore/test process hanging forever on an un-timed-out fetch().
+     *  `||` (not `??`) so a blank env value (e.g. `AUTOQA_LLM_TIMEOUT_MS=` left
+     *  over from an .env template) falls back to the default instead of coercing
+     *  to Number('')===0, which would abort every LLM call immediately. */
+    requestTimeoutMs: Number(process.env.AUTOQA_LLM_TIMEOUT_MS || '60000'),
   },
 
   projectRoot,

@@ -106,7 +106,15 @@ export async function ensureAuthenticated(ctx: AuthContext): Promise<void> {
     } catch {
       // corrupted state — fall through to fresh login
     }
-    if (!alreadyOnRealLoginGate) browser.open(probeUrl);
+    // stateLoad() only applies cookies via CDP — it never reloads/re-renders the
+    // current page, so the visible DOM stays whatever it was BEFORE the cookies
+    // landed. Skipping navigation entirely here (as the earlier version did) left
+    // waitForAuthenticated polling a static, stale, pre-restore document that could
+    // never change, guaranteeing "expired — logging in fresh" every time even with a
+    // perfectly valid session. Reload the CURRENT url (not probeUrl) when already on
+    // a real login gate, so the cookies take visible effect without bouncing away to
+    // an ungated probe page.
+    browser.open(alreadyOnRealLoginGate ? browser.getUrl() : probeUrl);
     if (waitForAuthenticated(browser, alreadyOnRealLoginGate ? 5000 : 15000)) {
       console.log('[auth] session restored silently');
       return;

@@ -281,8 +281,15 @@ export async function rapidToggleProbe(
     // Only require the label-visible check for a TRUE in-place toggle (same
     // page before/after); otherwise just assert the page didn't end up broken
     // (PROBE_BASE's page-error/console-error checks still apply either way).
+    // 'unknown' means matchPage couldn't classify wherever we ended up — which is
+    // exactly what happens when settling navigates to a genuinely new, not-yet-
+    // crawled page (e.g. a role-selector toggle whose members are real nav links,
+    // not an in-place control). Treating 'unknown' as "stayed" reproduces the same
+    // false-fail this check exists to avoid: requiring the OLD label's text on a
+    // page it was never on. Only a POSITIVE match to the same page id counts as
+    // having stayed; anything else falls back to the safer base checks.
     const current = pageIdNow(ctx);
-    const stayedOnPage = current === 'unknown' || current === page.id;
+    const stayedOnPage = current === page.id;
     const expectation: VerificationExpectation = stayedOnPage
       ? { ...PROBE_BASE, description: 'optional: rapid toggle stability', snapshotIncludesAny: [pair.canonical] }
       : { ...PROBE_BASE, description: 'optional: rapid toggle stability (settled via navigation, not an in-place toggle)' };

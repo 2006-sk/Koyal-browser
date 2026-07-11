@@ -67,7 +67,7 @@ export interface PageNode {
 }
 
 export interface WalkAction {
-  type: 'click' | 'fill' | 'upload' | 'wait-processing';
+  type: 'click' | 'fill' | 'select' | 'upload' | 'wait-processing';
   label?: string;
   role?: string;
   selector?: string;
@@ -174,7 +174,20 @@ export function normalizePath(url: string): string {
   // stay excluded — folding them in would spuriously multiply otherwise-identical
   // pages on ordinary anchor-link sites.
   if (/^#\//.test(hash)) {
-    const route = hash.replace(/\/+$/, '') || '#/';
+    // Apply the SAME id-masking regexes used for `base` — a hash route like
+    // "#/account/1013529310" needs "/account/:id" just as much as a pathname
+    // does, or every distinct account/item id spawns its own page identity,
+    // defeating this function's own contract for the exact SPA archetype
+    // (id-in-hash routing) this branch exists to support.
+    const maskedRoute = hash
+      .replace(UUID_RE, ':id')
+      .replace(HEX_ID_RE, ':id')
+      .replace(NUM_ID_RE, '/:id')
+      .replace(/\/+$/, '');
+    // Trimming trailing slashes off the bare root hash "#/" leaves "#" (the
+    // leading '#' isn't itself a slash), so the naive `|| '#/'` fallback below
+    // was unreachable dead code — canonicalize the root explicitly instead.
+    const route = maskedRoute === '#' ? '#/' : maskedRoute;
     return `${base}${route}`;
   }
   return base;
