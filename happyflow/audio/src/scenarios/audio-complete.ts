@@ -2,7 +2,7 @@
  * Test 1 of 2 — complete audio path (short WAV): every control, real edits, nav, download.
  */
 import { config } from '../config.js';
-import { audioSelectors } from '../lib/audio-selectors.js';
+import { audioSelectors, isDownloadReady } from '../lib/audio-selectors.js';
 import {
   editFinalVideoNote,
   editSceneDescription,
@@ -59,8 +59,24 @@ export async function runAudioCompleteFlow(
 
   await session.loginOrRestoreSession();
 
+  // agent-browser `record start` navigates authenticated pages to /login — re-auth after recording begins.
+  browser.startRecordingIfQueued();
+  let snapAfterRecord = browser.snapshotInteractive();
+  if (/\/login/i.test(browser.getUrl()) || /sign up|full name\*/i.test(snapAfterRecord)) {
+    session.loginFresh();
+  }
+
   // ── UPLOAD ────────────────────────────────────────────────────
   wizard.openFreshUploadFork();
+  let uploadSnap = browser.snapshotInteractive();
+  if (/\/login/i.test(browser.getUrl()) || /sign up|full name\*/i.test(uploadSnap)) {
+    session.loginFresh();
+    wizard.openFreshUploadFork();
+    uploadSnap = browser.snapshotInteractive();
+    if (/\/login/i.test(browser.getUrl()) || /sign up|full name\*/i.test(uploadSnap)) {
+      throw new Error(`Not authenticated after login retry (url=${browser.getUrl()})`);
+    }
+  }
   steps.push(
     await probeStep(ctx(), repro, 'upload-fork', 'Open upload fork', 'Start with Audio visible', {
       description: 'Upload fork',
@@ -74,7 +90,8 @@ export async function runAudioCompleteFlow(
   steps.push(
     await probeStep(ctx(), repro, 'audio-screen', 'Start with Audio', 'Upload options visible', {
       description: 'Audio upload screen',
-      snapshotIncludesAny: ['Upload File', 'Drop your audio', 'Record Audio', 'Select Sample'],
+      snapshotIncludesAny: ['Drop your audio', 'button "Upload File"'],
+      snapshotExcludes: ['How would you like to start?'],
       ...STEP_BASE,
     }),
   );
@@ -98,12 +115,28 @@ export async function runAudioCompleteFlow(
       }),
     );
     nav.dismissOverlays();
+    wizard.ensureAudioUploadScreen();
     wizard.ensureUploadFileTab();
     nav.click({ label: 'Upload File', exact: true, optional: true });
     browser.wait(800);
   }
 
-  wizard.uploadAudioFile(options.audioPath);
+  const uploadAudio = (): void => {
+    wizard.uploadAudioFile(options.audioPath);
+  };
+
+  try {
+    uploadAudio();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('REAUTH_REQUIRED') && !message.includes('about:blank')) throw error;
+    session.loginFresh();
+    wizard.openFreshUploadFork();
+    wizard.startWithAudio();
+    wizard.ensureUploadFileTab();
+    uploadAudio();
+  }
+
   steps.push(
     await probeStep(ctx(), repro, 'file-uploaded', `Upload ${options.formatLabel}`, 'Plan or processing', {
       description: 'File uploaded',
@@ -118,7 +151,8 @@ export async function runAudioCompleteFlow(
   steps.push(
     await probeStep(ctx(), repro, 'plan-standard', 'Select Standard plan', 'Plan modal closed', {
       description: 'Standard plan',
-      snapshotExcludes: ['Select Your Plan'],
+      snapshotExcludes: ['Select Your Plan', 'How would you like to start?'],
+      snapshotIncludesAny: ['Choose Audio Type', 'Uploading audio', 'Analyzing Audio'],
       ...STEP_BASE,
     }),
   );
@@ -381,7 +415,9 @@ export async function runAudioCompleteFlow(
       config.finalWaitMs,
     ),
   );
-  wizard.waitForDownloadReady();
+  if (!isDownloadReady(browser.snapshotInteractive())) {
+    wizard.waitForDownloadReady();
+  }
   nav.click({ label: 'Close', optional: true });
   nav.click({ label: 'Cancel', optional: true });
   nav.dismissOverlays();
@@ -441,13 +477,14 @@ export async function runAudioCompleteFlow(
 export async function testAudioComplete(
   browser: AgentBrowser,
   evidenceDir: string,
+  runOptions: { record?: boolean } = {},
 ): Promise<ScenarioResult> {
   return runAudioCompleteFlow(browser, evidenceDir, {
     audioPath: config.audio.shortWav,
     formatLabel: 'WAV (short)',
     scenarioId: 'audio-complete-wav',
     scenarioName: 'Audio complete — WAV short clip, full path + real edits',
-    probeUploadAlternates: true,
+    probeUploadAlternates: !runOptions.record,
     probeAudioTypeMatrix: true,
     probeStyleMatrix: true,
     probeSidebarRoundTrip: true,

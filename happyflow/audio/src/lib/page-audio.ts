@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { audioSelectors, isAudioUploadScreen, isCreateVideoReady, isDownloadReady, isPlanModalOpen, isTranscriptReady, isUploadFileTabReady } from './audio-selectors.js';
+import { audioSelectors, isAudioUploadScreen, isCreateVideoReady, isDownloadReady, isPlanModalOpen, isTranscriptReady, isUploadFileTabReady, isUploadForkSnapshot } from './audio-selectors.js';
 import {
   AgentBrowser,
   isButtonDisabled,
@@ -81,25 +81,37 @@ export class AudioWizardPage {
     let snap = this.browser.snapshotInteractive();
     if (isAudioUploadScreen(snap)) return;
 
-    let btn = refForInteractiveSnapshot(snap, audioSelectors.uploadFork.startWithAudio);
-    if (!btn) {
-      snap = this.browser.snapshotFull();
-      btn = refForInteractiveSnapshot(snap, audioSelectors.uploadFork.startWithAudio);
-    }
-    if (btn) {
-      this.browser.clickVisible(btn);
-      this.browser.wait(1500);
-      return;
-    }
+    const deadline = Date.now() + config.verificationMaxWaitMs;
+    while (Date.now() < deadline) {
+      snap = this.browser.snapshotInteractive();
+      if (isAudioUploadScreen(snap)) return;
 
-    if (snapshotIncludes(snap, 'Start with Audio')) {
-      this.browser.clickButtonByText('Start with Audio');
-      this.browser.wait(1500);
-      return;
+      let btn = refForInteractiveSnapshot(snap, audioSelectors.uploadFork.startWithAudio);
+      if (!btn) {
+        snap = this.browser.snapshotFull();
+        btn = refForInteractiveSnapshot(snap, audioSelectors.uploadFork.startWithAudio);
+      }
+
+      if (btn) {
+        this.browser.clickVisible(btn);
+      } else if (snapshotIncludes(snap, 'Start with Audio')) {
+        if (!this.browser.clickButtonByText('Start with Audio')) {
+          throw new Error(`Start with Audio button not found. URL=${this.browser.getUrl()}`);
+        }
+      } else {
+        throw new Error(`Start with Audio button not found. URL=${this.browser.getUrl()}`);
+      }
+
+      const settleDeadline = Date.now() + 8000;
+      while (Date.now() < settleDeadline) {
+        this.browser.wait(500);
+        snap = this.browser.snapshotInteractive();
+        if (isAudioUploadScreen(snap)) return;
+      }
     }
 
     throw new Error(
-      `Start with Audio button not found. URL=${this.browser.getUrl()}`,
+      `Start with Audio did not reach audio upload screen. URL=${this.browser.getUrl()}`,
     );
   }
 
@@ -155,6 +167,18 @@ export class AudioWizardPage {
     }
 
     for (let attempt = 0; attempt < 4; attempt++) {
+      const url = this.browser.getUrl();
+      if (url === 'about:blank' || !/koyal\.ai/i.test(url)) {
+        this.browser.open(this.uploadUrl());
+        this.browser.wait(2000);
+        if (/\/login/i.test(this.browser.getUrl())) {
+          throw new Error('REAUTH_REQUIRED');
+        }
+        if (!isAudioUploadScreen(this.browser.snapshotInteractive())) {
+          this.startWithAudio();
+        }
+      }
+
       this.ensureUploadFileTab();
       const snap = this.browser.snapshotInteractive();
       if (!audioSelectors.audioUpload.dropZone.test(snap)) {
@@ -201,7 +225,12 @@ export class AudioWizardPage {
     const deadline = Date.now() + config.verificationMaxWaitMs;
     while (Date.now() < deadline) {
       const snap = this.browser.snapshotInteractive();
-      if (!isPlanModalOpen(snap)) return;
+      if (!isPlanModalOpen(snap)) {
+        if (isUploadForkSnapshot(snap)) {
+          throw new Error(`Plan modal missing — still on upload fork at ${this.browser.getUrl()}`);
+        }
+        return;
+      }
 
       const label =
         plan === 'Standard'
@@ -377,8 +406,10 @@ export class AudioWizardPage {
   }
 
   waitForDownloadReady(): void {
+    const snap = this.browser.snapshotInteractive();
+    if (isDownloadReady(snap)) return;
     this.waitForSnapshotCondition(
-      (snap) => isDownloadReady(snap),
+      (s) => isDownloadReady(s),
       config.finalWaitMs,
       'final video Download enabled',
     );

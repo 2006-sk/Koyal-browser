@@ -15,7 +15,7 @@ import { AgentBrowser } from '../lib/agent-browser.js';
 import { SessionPage } from '../lib/page-session.js';
 import { ScriptNavigator } from '../lib/script-navigator.js';
 import { ScriptNav, waitUntil } from '../lib/script-nav.js';
-import { isFinalVideoVisible } from '../lib/script-selectors.js';
+import { isDownloadReady, isFinalVideoVisible } from '../lib/script-selectors.js';
 import { assertNoStepFailures, probeStep, STEP_BASE } from '../lib/script-scenario-helpers.js';
 import type { StepContext } from '../lib/scenario-runner.js';
 import type { ScenarioResult, TestStep } from '../lib/types.js';
@@ -63,7 +63,8 @@ export async function runScriptCompleteFlow(
       {
         description: 'Script upload fork',
         urlIncludes: '/upload',
-        snapshotIncludesAny: ['Upload Your Script', 'Choose PDF', 'How would you like to start'],
+        snapshotIncludesAny: ['Upload Your Script', 'Choose PDF'],
+        snapshotExcludes: ['How would you like to start?'],
         ...STEP_BASE,
       },
       undefined,
@@ -81,7 +82,8 @@ export async function runScriptCompleteFlow(
       ctx(), repro, 'file-uploaded', `Upload ${options.formatLabel}`, 'Plan or processing',
       {
         description: 'PDF uploaded',
-        snapshotIncludesAny: ['Select Your Plan', 'Standard', 'Processing', 'Story Type'],
+        snapshotIncludesAny: ['Select Your Plan', 'Processing', 'Story Type', 'Edit Script'],
+        snapshotExcludes: ['How would you like to start?'],
         ...STEP_BASE,
       },
       undefined,
@@ -98,7 +100,8 @@ export async function runScriptCompleteFlow(
         ctx(), repro, 'plan-standard', 'Standard plan', 'Past plan modal',
         {
           description: 'Standard plan',
-          snapshotExcludes: ['Select Your Plan'],
+          snapshotExcludes: ['Select Your Plan', 'How would you like to start?'],
+          snapshotIncludesAny: ['Story Type', 'Concept Driven', 'Character Driven', 'Edit Script', 'Processing'],
           ...STEP_BASE,
         },
         undefined,
@@ -472,10 +475,13 @@ export async function runScriptCompleteFlow(
   );
 
   let finalExplore = null;
-  try {
-    nav.wizard.waitForDownloadReady();
-  } catch {
-    finalExplore = await nav.completeFinalVideo();
+  const finalSnap = browser.snapshotInteractive();
+  if (!isDownloadReady(finalSnap) && !isFinalVideoVisible(finalSnap, browser.getUrl())) {
+    try {
+      nav.wizard.waitForDownloadReady();
+    } catch {
+      finalExplore = await nav.completeFinalVideo();
+    }
   }
   uiNav.dismissOverlays();
   uiNav.clickIfEnabled('Download Video');

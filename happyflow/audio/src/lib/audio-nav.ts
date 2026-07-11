@@ -117,7 +117,7 @@ export class AudioNav {
   }
 
   dismissOverlays(): void {
-    for (const label of ['✕', '×', 'X', 'Cancel']) {
+    for (const label of ['✕', '×', 'Cancel']) {
       if (this.click({ label, exact: true, optional: true })) {
         this.browser.wait(400);
       }

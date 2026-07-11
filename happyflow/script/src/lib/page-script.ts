@@ -15,6 +15,7 @@ import {
   isScriptUploadScreen,
   isStyleStep,
   isThemeStep,
+  isUploadFork,
 } from './script-selectors.js';
 
 export class ScriptWizardPage {
@@ -41,7 +42,7 @@ export class ScriptWizardPage {
       let dismissed = false;
 
       if (snapHas(snap, 'Report a Bug')) {
-        for (const pat of [/button "Cancel"/i, /button "×"/i, /button "✕"/i, /button "X"/i]) {
+        for (const pat of [/button "Cancel"/i, /button "×"/i, /button "✕"/i]) {
           const btn = refForInteractiveSnapshot(snap, pat);
           if (this.safeClick(btn)) {
             this.browser.wait(500);
@@ -161,6 +162,7 @@ export class ScriptWizardPage {
 
   selectPlanStandard(): boolean {
     const snap = this.browser.snapshotInteractive();
+    if (isUploadFork(snap)) return false;
     if (!snapHas(snap, 'Select Your Plan', 'Standard')) return false;
     const standard = refForInteractiveSnapshot(snap, /Standard/i);
     if (standard) {
@@ -285,8 +287,11 @@ export class ScriptWizardPage {
   }
 
   waitForDownloadReady(): void {
+    const snap = this.browser.snapshotInteractive();
+    const url = this.browser.getUrl();
+    if (isDownloadReady(snap) || isFinalVideoVisible(snap, url)) return;
     this.waitForSnapshotCondition(
-      (snap, url) => isDownloadReady(snap) || isFinalVideoVisible(snap, url),
+      (s, u) => isDownloadReady(s) || isFinalVideoVisible(s, u),
       config.finalWaitMs,
       'final video download or preview',
     );
@@ -302,8 +307,7 @@ export class ScriptWizardPage {
     }
     const close =
       refForInteractiveSnapshot(snap, /button "×"/i) ??
-      refForInteractiveSnapshot(snap, /button "✕"/i) ??
-      refForInteractiveSnapshot(snap, /button "X"/i);
+      refForInteractiveSnapshot(snap, /button "✕"/i);
     if (this.safeClick(close)) this.browser.wait(800);
   }
 

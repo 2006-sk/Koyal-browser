@@ -112,6 +112,38 @@ export class AgentBrowser {
     this.cursorInjected = false;
   }
 
+  recycle(): boolean {
+    console.log('[browser] recycling wedged daemon (force-kill + respawn)');
+    let killedSpecific = false;
+    try {
+      const infoResult = spawnSync(
+        this.binary,
+        ['--session', this.session, 'session', 'info', '--json'],
+        { encoding: 'utf8', timeout: 8_000 },
+      );
+      const parsed = this.tryParseJson((infoResult.stdout ?? '').trim());
+      const pid = (parsed?.data as { pid?: number } | undefined)?.pid;
+      if (pid) {
+        spawnSync('pkill', ['-9', '-P', String(pid)], { timeout: 5_000 });
+        spawnSync('kill', ['-9', String(pid)], { timeout: 5_000 });
+        killedSpecific = true;
+      }
+    } catch {
+      // fall through
+    }
+    if (!killedSpecific) {
+      try {
+        spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
+        spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
+      } catch {
+        // best-effort
+      }
+    }
+    spawnSync('sleep', ['3']);
+    this.cursorInjected = false;
+    return true;
+  }
+
   ensureCursorOverlay(): void {
     if (!this.showCursor) return;
     const script = readCursorScript();
@@ -121,7 +153,47 @@ export class AgentBrowser {
 
   click(ref: string): void {
     if (this.showCursor) this.ensureCursorOverlay();
+
+    let urlBefore = '';
+    try {
+      urlBefore = this.getUrl();
+      this.evalScript(
+        `window.__abClickLanded=0;window.addEventListener('click',function(){window.__abClickLanded=1;},{capture:true,once:true});'armed'`,
+        { skipEnsure: true },
+      );
+    } catch {
+      // probe is best-effort
+    }
+
     this.assertOk(this.run(['click', ref]), `click ${ref}`);
+
+    try {
+      const landed = this.evalScript('window.__abClickLanded', { skipEnsure: true }).trim();
+      if (landed !== '0') return;
+      if (urlBefore && this.getUrl() !== urlBefore) return;
+      console.log(`[browser] trusted click on ${ref} never reached the page — DOM activation fallback`);
+      this.domActivate(ref);
+    } catch {
+      // eval failing here usually means mid-navigation — the click worked
+    }
+  }
+
+  private domActivate(ref: string): void {
+    const box = this.getBox(ref);
+    if (box) {
+      const cx = Math.round(box.x + box.width / 2);
+      const cy = Math.round(box.y + box.height / 2);
+      const out = this.evalScript(
+        `(function(){var el=document.elementFromPoint(${cx},${cy});if(el){el.click();return 'clicked';}return 'miss';})()`,
+        { skipEnsure: true },
+      );
+      if (out.includes('clicked')) return;
+    }
+    this.assertOk(this.run(['focus', ref]), `focus ${ref}`);
+    this.evalScript(
+      `(function(){var el=document.activeElement;if(el&&el!==document.body)el.click();})()`,
+      { skipEnsure: true },
+    );
   }
 
   fill(ref: string, value: string): void {
@@ -130,7 +202,7 @@ export class AgentBrowser {
   }
 
   clickVisible(ref: string): void {
-    if (config.showCursor) {
+    if (this.showCursor) {
       this.pointAtRef(ref);
       this.click(ref);
       return;
@@ -139,7 +211,7 @@ export class AgentBrowser {
   }
 
   fillVisible(ref: string, value: string): void {
-    if (config.showCursor) {
+    if (this.showCursor) {
       this.pointAtRef(ref);
       this.fill(ref, value);
       return;
@@ -188,7 +260,7 @@ export class AgentBrowser {
     );
   }
 
-  evalScript(script: string, options: { skipEnsure?: boolean } = {}): void {
+  evalScript(script: string, options: { skipEnsure?: boolean } = {}): string {
     if (this.showCursor && !options.skipEnsure) this.ensureCursorOverlay();
     const fullArgs = [
       '--session',
@@ -202,10 +274,12 @@ export class AgentBrowser {
       encoding: 'utf8',
       maxBuffer: 10 * 1024 * 1024,
       env: process.env,
+      timeout: 30_000,
     });
     if (result.status !== 0) {
       throw new Error(`agent-browser eval failed: ${result.stderr || result.stdout}`);
     }
+    return (result.stdout ?? '').trim();
   }
 
   upload(selector: string, filePath: string): void {
@@ -241,7 +315,10 @@ export class AgentBrowser {
   }
 
   wait(ms: number): void {
-    this.assertOk(this.run(['wait', String(ms)]), `wait ${ms}`);
+    const result = this.run(['wait', String(ms)]);
+    if (result.exitCode !== 0) {
+      spawnSync('sleep', [String(Math.max(1, Math.ceil(ms / 1000)))]);
+    }
   }
 
   waitForUrl(pattern: string, timeoutMs = 10000): void {
@@ -345,18 +422,19 @@ export class AgentBrowser {
 
   clickButtonByText(text: string, exact = false): boolean {
     const escaped = text.replace(/'/g, "\\'");
-    this.evalScript(`
+    const stdout = this.evalScript(`
       (function() {
         const buttons = [...document.querySelectorAll('button,a,[role=button],label')];
         for (const b of buttons) {
           const t = (b.textContent || '').trim();
           const match = ${exact ? `t === '${escaped}'` : `t.includes('${escaped}')`};
-          if (match && !b.disabled) { b.scrollIntoView({block:'center'}); b.click(); return; }
+          if (match && !b.disabled) { b.scrollIntoView({block:'center'}); b.click(); return 'CLICKED'; }
         }
+        return 'NO_MATCH';
       })();
     `);
     this.wait(config.actionDelayMs);
-    return true;
+    return !stdout.includes('NO_MATCH');
   }
 
   clickNextIfEnabled(): boolean {

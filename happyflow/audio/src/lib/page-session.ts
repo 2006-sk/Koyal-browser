@@ -13,8 +13,14 @@ export class SessionPage {
 
   private isAuthenticated(): boolean {
     const url = this.browser.getUrl();
+    if (/\/login/i.test(url)) return false;
     const snap = this.browser.snapshotInteractive();
-    return POST_AUTH_URL.test(url) || snapshotIncludes(snap, 'link "Projects"');
+    if (/sign up|full name\*|textbox "full name/i.test(snap)) return false;
+    const onApp =
+      snapshotIncludes(snap, 'link "Projects"') ||
+      snapshotIncludes(snap, 'Create Your Next Video') ||
+      snapshotIncludes(snap, 'Good afternoon');
+    return onApp && (POST_AUTH_URL.test(url) || /\/projects/i.test(url));
   }
 
   private waitForAuthenticated(maxMs = config.verificationMaxWaitMs): boolean {
@@ -33,14 +39,13 @@ export class SessionPage {
       try {
         this.browser.stateLoad(config.loginStatePath);
         this.browser.wait(500);
+        this.browser.open(projectsUrl);
+        this.browser.wait(2000);
+        if (this.isAuthenticated()) return;
       } catch {
         // fall through to fresh login
       }
     }
-
-    this.browser.open(projectsUrl);
-    this.browser.wait(2000);
-    if (this.waitForAuthenticated(30_000)) return;
 
     requireCredentials();
     this.loginFresh();

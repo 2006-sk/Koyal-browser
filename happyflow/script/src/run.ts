@@ -30,6 +30,7 @@ async function runScenario(
     report.scenarios.push(await fn(browser, evidence));
   } finally {
     browser.close();
+    browser.recycle();
   }
 }
 

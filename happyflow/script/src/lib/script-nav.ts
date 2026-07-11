@@ -94,7 +94,7 @@ export class ScriptNav {
   }
 
   dismissOverlays(): void {
-    for (const label of ['Close', 'Cancel', '✕', '×', 'X']) {
+    for (const label of ['Close', 'Cancel', '✕', '×']) {
       if (this.click({ label, exact: true, optional: true })) {
         this.browser.wait(400);
       }
