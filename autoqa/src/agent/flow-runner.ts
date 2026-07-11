@@ -23,7 +23,7 @@ import { Nav } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
-import { looksLikeAuthGate } from './page-classifier.js';
+import { looksLikeAuthGate, looksLikeSoft404 } from './page-classifier.js';
 
 const STEP_BASE: Partial<VerificationExpectation> = {
   allowPageErrors: true,
@@ -106,15 +106,34 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
     // deleted/renumbered. Verify we actually landed on the expected page kind
     // before trusting it; if not, fall through to the generic LLM-navigation
     // recovery below instead of silently proceeding on a dead/wrong page.
-    if (currentPageId(deps) === flow.entry.pageId) return;
+    // matchPage's plain-page identity is URL-PATTERN-ONLY (never content), so a
+    // URL that still matches the pattern but actually 404'd would otherwise fool
+    // this check (confirmed live: an LLM-proposed flow's entry.url for
+    // "add-remove-elements-flow" was "/add_remove_elements" — missing this site's
+    // required trailing slash — which rendered "Not Found", yet currentPageId()
+    // still returned the real page's id from the normalized pattern alone; the
+    // whole flow then ran every milestone against the 404 page instead of ever
+    // reaching the exampleUrl fallback below).
+    if (currentPageId(deps) === flow.entry.pageId && !looksLikeSoft404(browser.snapshotInteractive())) return;
     console.log(
       `[flow] pinned entry url for "${flow.entry.pageId}" looks stale — falling back to LLM navigation`,
     );
   }
   const entryPage = state.sitemap.pages[flow.entry.pageId];
-  const directPattern = entryPage?.urlPatterns.find((p) => !p.includes(':id'));
-  if (directPattern) {
-    browser.open(`${state.sitemap.origin}${directPattern}`);
+  // Prefer the exact concrete URL that actually rendered this page over
+  // reconstructing from the normalized urlPattern — normalizePath deliberately
+  // strips trailing slashes (and masks ids) for PAGE-IDENTITY purposes, but some
+  // routing 404s on a path missing its trailing slash even though it's the "same"
+  // page for identity-matching (confirmed live on the-internet.herokuapp.com:
+  // urlPatterns held "/add_remove_elements", but only "/add_remove_elements/"
+  // — exampleUrl — actually renders; reconstructing from the pattern landed on a
+  // 404 "Not Found" page here too, same root cause as crawler.ts's deep-walk
+  // entry-builder).
+  const directUrl =
+    entryPage?.exampleUrl ?? entryPage?.urlPatterns.find((p) => !p.includes(':id'));
+  if (directUrl) {
+    const opened = directUrl.startsWith('http') ? directUrl : `${state.sitemap.origin}${directUrl}`;
+    browser.open(opened);
     browser.wait(2000);
     return;
   }
