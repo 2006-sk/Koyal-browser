@@ -623,7 +623,12 @@ export async function runFlows(
     };
 
     try {
-      await ensureAuthenticated(authCtx);
+      // Nothing has navigated anywhere for THIS flow yet at this point — the
+      // browser is wherever the PREVIOUS flow left it, which is unrelated to
+      // whether this flow's own entry requires login. Don't trust an incidental
+      // login-shaped page left over from that prior flow (see trustCurrentGate's
+      // doc comment in auth.ts for the confirmed live false-positive this fixes).
+      await ensureAuthenticated(authCtx, { trustCurrentGate: false });
       await navigateToEntry(deps, flow);
       await applyFreshEntryHint(deps, flow);
 
