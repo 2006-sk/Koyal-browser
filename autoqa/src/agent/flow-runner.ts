@@ -491,8 +491,20 @@ async function runMilestone(
 
   if (!replayOk && !loginShaped) {
     explored = await deps.explorer.achieveGoal(goal);
-    // mid-flow auth wall → re-login once and retry
-    if (!explored.success && /log ?in|password/i.test(explored.finalSnapshot.slice(0, 2000))) {
+    // mid-flow auth wall → re-login once and retry. This used to be a bare
+    // `/log ?in|password/i` regex over the snapshot text — a much weaker,
+    // duplicate version of looksLikeAuthGate's own OLD false-positive bug that
+    // never got the same fix: any milestone that failed for ANY reason on a
+    // content-dense page containing a decorative login/password widget
+    // ANYWHERE (confirmed live on webdriveruniversity.com's "AI Testing
+    // Playground") triggered a pointless re-authenticate + re-navigate cycle
+    // every time, totally unrelated to the actual (often unrelated, e.g. a
+    // flaky-by-design demo widget) failure reason. Reuse the same, already
+    // hardened looksLikeAuthGate() check instead of a second, weaker heuristic.
+    if (
+      !explored.success &&
+      looksLikeAuthGate(deps.browser.getUrl(), explored.finalSnapshot, deps.browser.hasVisiblePasswordInput())
+    ) {
       console.log('[flow] hit an auth wall mid-flow — re-authenticating');
       await ensureAuthenticated(authCtx);
       await navigateToEntry(deps, flow);
