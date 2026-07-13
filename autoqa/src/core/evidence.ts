@@ -108,6 +108,43 @@ export async function captureStepArtifacts(
   return files;
 }
 
+/**
+ * Patch just the Verdict/Reasons lines of an ALREADY-WRITTEN step-summary.md.
+ *
+ * `recordVerifiedStep` (scenario-runner.ts) writes this file with the raw,
+ * immediate deterministic verdict and returns — but `flow-runner.ts`'s
+ * `runMilestone` goes on to mutate `step.result.verdict` in-memory several
+ * times AFTER that point (explorer-failure downgrade, KB-statement verdict
+ * flip, human-escalation override). Those mutations correctly flow into the
+ * final aggregate report (same in-memory `TestStep` object), but nothing ever
+ * went back and updated the per-step file already on disk — confirmed live on
+ * webdriveruniversity.com: a to-do-list milestone whose explorer never
+ * confirmed the goal (no Enter-key action available, see the `press` explorer
+ * action fix) got its file written as "Verdict: pass" with no reasons, then
+ * downgraded to needs-review and left there after human triage — the file
+ * kept saying "pass" forever, disagreeing with both the console's later human
+ * escalation and the correct final count. Call this once the verdict is truly
+ * final, only when it actually changed from what was originally written.
+ */
+export function patchStepSummaryVerdict(artifactDir: string, verdict: string, reasons?: string[]): void {
+  const filePath = path.join(artifactDir, 'step-summary.md');
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const reasonsLine = reasons?.length ? `**Reasons:** ${reasons.join('; ')}` : '';
+    let updated = content.replace(/\*\*Verdict:\*\*.*/, `**Verdict:** ${verdict}`);
+    if (/^\*\*Reasons:\*\*.*/m.test(updated)) {
+      updated = reasonsLine
+        ? updated.replace(/^\*\*Reasons:\*\*.*/m, reasonsLine)
+        : updated.replace(/\n\*\*Reasons:\*\*.*/, '');
+    } else if (reasonsLine) {
+      updated = updated.replace(/(\*\*Verdict:\*\*.*)/, `$1\n${reasonsLine}`);
+    }
+    fs.writeFileSync(filePath, updated, 'utf8');
+  } catch {
+    // best-effort — never let report-patching break an otherwise-successful run
+  }
+}
+
 export function captureNetworkAll(
   stepDir: string,
   networkAll: unknown[],

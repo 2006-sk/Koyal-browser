@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import type { AgentBrowser } from '../core/agent-browser.js';
 import { randomEditMarker } from '../core/edits.js';
 import type { Explorer, ExplorerResult } from '../core/explorer.js';
-import { writeJson } from '../core/evidence.js';
+import { patchStepSummaryVerdict, writeJson } from '../core/evidence.js';
 import { scenarioEvidenceDir } from '../core/report.js';
 import { recordVerifiedStep, type StepContext } from '../core/scenario-runner.js';
 import type {
@@ -526,6 +526,14 @@ async function runMilestone(
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 
+  // recordVerifiedStep() already wrote step-summary.md to disk with THIS verdict
+  // and printed it — but everything below (explorer-failure downgrade, KB
+  // verdict flip, human escalation) can still change step.result.verdict in
+  // memory. Remember what was actually persisted so we can patch the file back
+  // into agreement once the verdict is truly final (see patchStepSummaryVerdict).
+  const writtenVerdict = step.result.verdict;
+  const writtenReasons = [...step.result.reasons];
+
   // The explorer's own success/failure signal was previously consulted ONLY for
   // the mid-flow auth-wall retry above — verifyAfterAction's deterministic health
   // checks (console errors, blank page, 5xx, ...) can all pass even when the
@@ -646,6 +654,14 @@ async function runMilestone(
     console.warn(
       `[flow] post-verdict bookkeeping failed (keeping the already-computed "${step.result.verdict}" verdict): ${error instanceof Error ? error.message : error}`,
     );
+  }
+
+  if (
+    step.artifactDir &&
+    (step.result.verdict !== writtenVerdict ||
+      JSON.stringify(step.result.reasons) !== JSON.stringify(writtenReasons))
+  ) {
+    patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
   }
 
   return { step, marker };
