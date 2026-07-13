@@ -523,6 +523,7 @@ async function runMilestone(
       maxWaitMs: milestone.maxWaitMs ?? MILESTONE_WAIT_MS[milestone.kind],
       pollMs: milestone.maxWaitMs && milestone.maxWaitMs > 60000 ? 5000 : 2000,
     },
+    explorerSteps: explored?.stepsTaken,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 

@@ -28,6 +28,8 @@ export async function recordVerifiedStep(
     expected: string;
     expectation: VerificationExpectation;
     waitOptions?: { maxWaitMs?: number; pollMs?: number };
+    /** LLM/explorer step log for this milestone, if the explorer ran (not a recipe replay/probe). */
+    explorerSteps?: string[];
   },
 ): Promise<TestStep> {
   const result = await ctx.verification.verifyAfterAction(meta.expectation, meta.waitOptions);
@@ -38,6 +40,13 @@ export async function recordVerifiedStep(
   const slug = `${String(ctx.stepsToReproduce.length).padStart(2, '0')}-${slugify(meta.workflow)}`;
   const stepDir = path.join(ctx.evidenceDir, slug);
 
+  // meta.explorerSteps used to be silently dropped here — captureStepArtifacts
+  // DOES accept it (StepArtifactMeta.explorerSteps), but no caller ever passed
+  // it, so step-summary.md's "Explorer / agent actions" section always
+  // rendered "_No LLM explorer steps recorded_" even when the explorer had
+  // just run a real multi-step sequence (fills, clicks, the new "press"
+  // action, ...). The caller (flow-runner.ts) only set it on the RETURNED
+  // TestStep object, AFTER this function had already written the file.
   const files = await captureStepArtifacts(
     ctx.evidenceDir,
     slug,
@@ -48,6 +57,7 @@ export async function recordVerifiedStep(
       action: meta.action,
       verdict: result.verdict,
       reasons: result.reasons,
+      explorerSteps: meta.explorerSteps,
     },
     (filePath) => ctx.browser.screenshotAnnotated(path.resolve(filePath)),
   );
@@ -64,6 +74,7 @@ export async function recordVerifiedStep(
     expected: meta.expected,
     result,
     stepsToReproduce: [...ctx.stepsToReproduce],
+    explorerSteps: meta.explorerSteps,
   };
 
   const withEvidence = attachEvidenceToStep(step, ctx.evidenceDir, files);
