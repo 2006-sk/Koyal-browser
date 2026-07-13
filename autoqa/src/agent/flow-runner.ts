@@ -431,9 +431,21 @@ function isSelectionShapedGoal(goal: string): boolean {
  * Deliberately narrow (requires the word "value" right before the quote, not
  * just any quoted string) so a goal quoting a FIELD LABEL instead of a value
  * — e.g. "Type text into the 'Comments' field" — still gets the marker.
+ *
+ * A SECOND, differently-phrased regeneration of the same flow (re-proposed
+ * from a fresh explore) confirmed the "value '...'" phrasing isn't the LLM's
+ * only way to express this: "Type exactly 7 characters (abcdefg) into the
+ * input value field" has no quotes at all — the literal sits in parentheses,
+ * and "value" describes the FIELD ("input value field"), not the literal.
+ * Both phrasings share a more decisive tell: an explicit "exactly/precisely N
+ * character(s)" length constraint, which only shows up when the goal is
+ * testing a fixed-length format/validation rule (a random marker's length is
+ * unpredictable and would violate it) — as opposed to a generic MINIMUM/
+ * maximum length hint ("at least 10 characters"), which a marker can usually
+ * still satisfy, so that phrasing deliberately does NOT match here.
  */
 function isLiteralValueShapedGoal(goal: string): boolean {
-  return /\bvalue\s*['"]/i.test(goal);
+  return /\bvalue\s*['"]/i.test(goal) || /\b(exactly|precisely)\s+\d+[- ]?character/i.test(goal);
 }
 
 async function runMilestone(
