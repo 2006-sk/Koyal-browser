@@ -54,6 +54,24 @@ const OUTCOME_KEYWORDS =
 
 const ROLE_HINT = /^\s*-?\s*(alert|status|dialog|heading|banner|toast|alertdialog)\b/i;
 
+/**
+ * A CONTROL's own label (what you'd click/type into) can never itself be an
+ * outcome statement, no matter what words it contains — confirmed live on
+ * webdriveruniversity.com's "AI Testing Playground": an unrelated demo widget
+ * ("18. Network States") has three buttons literally labelled "Success",
+ * "Error", "Timeout" for SIMULATING network responses. `button "Error"` isn't
+ * a status/alert/heading role, so ROLE_HINT correctly didn't match it — but
+ * OUTCOME_KEYWORDS matched the bare word "Error" regardless, so the
+ * role-based check below was bypassed entirely and it got asked about as if
+ * it were an observed outcome message, with the question text itself giving
+ * a human reviewer zero indication it was actually a clickable button's own
+ * label, not a report of anything happening. Excluded outright, unconditional
+ * on OUTCOME_KEYWORDS, since a control's label is structurally never a
+ * "message" — it's a THING TO ACT ON, not a result to observe.
+ */
+const INTERACTIVE_CONTROL_HINT =
+  /^\s*-?\s*(button|link|tab|menuitem|checkbox|radio|textbox|combobox|switch|slider)\b/i;
+
 /** Pull quoted accessible names out of a snapshot line. */
 function quotedTexts(line: string): string[] {
   const out: string[] = [];
@@ -87,9 +105,11 @@ export function extractCandidates(
     if (!isNew && before) continue;
 
     const roleHit = ROLE_HINT.test(line);
+    const isInteractiveControl = INTERACTIVE_CONTROL_HINT.test(line);
     for (const text of quotedTexts(line)) {
       if (text.length < 4 || text.length > 140) continue;
       if (!/[a-z]/i.test(text)) continue;
+      if (isInteractiveControl) continue;
       if (!roleHit && !OUTCOME_KEYWORDS.test(text)) continue;
       const norm = normalizeStatement(text);
       if (norm.length < 4 || seen.has(norm)) continue;
