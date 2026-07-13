@@ -491,8 +491,24 @@ async function runMilestone(
 
   if (!replayOk && !loginShaped) {
     explored = await deps.explorer.achieveGoal(goal);
-    // mid-flow auth wall → re-login once and retry
-    if (!explored.success && /log ?in|password/i.test(explored.finalSnapshot.slice(0, 2000))) {
+    // mid-flow auth wall → re-login once and retry. Live-reproduced on
+    // testpages.eviltester.com: the bare `/log ?in|password/i` substring test
+    // matched the persistent Docsy sidebar nav's "Cookie Controlled Login" link
+    // (present on EVERY /apps/* page, well within the first 2000 chars of the
+    // INTERACTIVE snapshot the explorer actually uses — confirmed at char offset
+    // ~789) — so a completely unrelated milestone failure (the Triangle app's
+    // own "Identify Triangle Type" submit repeatedly failing form validation,
+    // nothing to do with auth) was misdiagnosed as an auth wall, triggering a
+    // pointless re-authenticate + re-navigate-to-entry that burned extra LLM
+    // calls and masked the real failure reason. Reuse the same DOM-verified,
+    // already-hardened `looksLikeAuthGate` check every other auth-wall
+    // detection in this codebase uses (requires an ACTUAL visible password
+    // input, not just the word "login" anywhere in the snapshot) instead of
+    // this one-off, looser substring test.
+    if (
+      !explored.success &&
+      looksLikeAuthGate(deps.browser.getUrl(), explored.finalSnapshot, deps.browser.hasVisiblePasswordInput())
+    ) {
       console.log('[flow] hit an auth wall mid-flow — re-authenticating');
       await ensureAuthenticated(authCtx);
       await navigateToEntry(deps, flow);
