@@ -82,6 +82,24 @@ Category guidance: "nav" = pure navigation; "create" = creates content; "edit" =
       // malformed url — leave urlIncludes as-is
     }
   }
+  // Live-reproduced on testpages.eviltester.com: a directory/index-style plain page
+  // (e.g. "/apps/") is legitimately its own distinctive URL, so the LLM (reasonably)
+  // returns that same path as its "distinctive fragment" — but matchPage's PASS 2
+  // does substring inclusion, not exact matching, so that same fragment ALSO matches
+  // every deeper sibling URL under it ("/apps/basiccart", "/apps/button-calculator",
+  // "/apps/canvas-draw", ...). Those are genuinely distinct micro-apps, not the index
+  // page, yet all seven collapsed into ONE "apps-index" page node (7 different
+  // urlPatterns accreted onto it) because the persistent Docsy sidebar nav — which
+  // lists every app's name on every page — trivially satisfies PASS 2's snapshotAnyOf
+  // corroboration too. A urlIncludes equal to the page's OWN normalized path adds zero
+  // matching value beyond PASS 1's existing exact-path match (which already recognizes
+  // this exact URL) and is actively dangerous as a substring fragment against deeper
+  // URLs — so drop it whenever it's just a restatement of the page's own address.
+  if (urlIncludes) {
+    const ownPath = normalizePath(url).toLowerCase();
+    const fragment = urlIncludes.toLowerCase().replace(/\/+$/, '') || '/';
+    if (fragment === ownPath) urlIncludes = undefined;
+  }
 
   return {
     id: (parsed.id || 'page').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
