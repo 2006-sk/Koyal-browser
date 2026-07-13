@@ -249,6 +249,43 @@ export class Explorer {
         lastSignature = signature;
       }
       if (repeatCount >= 2) {
+        // Before honestly giving up, check once whether the goal was actually
+        // already achieved — live-reproduced on testpages.eviltester.com's
+        // Triangle app: the goal was "verify an equilateral result is shown",
+        // the app correctly computed and displayed "Equilateral" in a plain
+        // <p> after the FIRST click, yet the explorer kept re-clicking
+        // "Identify Triangle Type" and aborted as stuck. Root cause: this
+        // decision loop's `snapshot` is ALWAYS snapshotInteractive() — by
+        // design, for prompt-size/cost, since ref-addressable click/fill
+        // targets only need interactive elements — but that means any
+        // non-interactive confirmation/result/validation text (extremely
+        // common: computed values, success banners, inline validation
+        // messages) is structurally INVISIBLE to every decision this loop
+        // makes, including "am I done?". A goal whose success criterion is
+        // exactly that kind of static text can never be recognized, no matter
+        // how many times the action is retried. Rather than widening every
+        // step's snapshot (real prompt-size/cost tradeoff across every site,
+        // out of scope to re-validate broadly here), give the loop ONE bounded
+        // extra look at the full snapshot only in this narrow "about to abort
+        // as stuck" case, reusing the same decision machinery — if it now says
+        // "done", the goal really was already satisfied; anything else falls
+        // through to the original honest abort unchanged.
+        try {
+          const fullSnapshot = this.browser.snapshotFull();
+          const recheck = await this.decideNextAction(goal, url, fullSnapshot, [
+            ...stepsTaken,
+            'note: the interactive view showed no change after repeating this action — check the FULL page content below for a non-interactive result/confirmation you may have missed before giving up.',
+          ]);
+          if (recheck.action === 'done') {
+            stepsTaken.push(
+              `note: full-snapshot recheck confirmed the goal was already satisfied (a non-interactive result was present) — ${recheck.reason ?? ''}`.trim(),
+            );
+            return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: fullSnapshot };
+          }
+        } catch {
+          // recheck itself failed (e.g. LLM/browser hiccup) — fall through to the
+          // original abort rather than letting a diagnostic-only step crash the run
+        }
         return {
           goal,
           success: false,

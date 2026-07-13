@@ -564,6 +564,33 @@ export async function explore(
       `[crawl] flow proposal failed (${error instanceof Error ? error.message : error}) — continuing with walk-generated flows only`,
     );
   }
+  // proposeFlows only sees a flattened TEXT summary of the sitemap, not the real
+  // page objects, so its `entryPageId` is a free-text guess with no guarantee it
+  // actually matches the page that `entryUrl` resolves to. Live-reproduced on
+  // testpages.eviltester.com: "7 character validation check" got entryUrl
+  // "/apps/7-char-val" (correct, specific) but entryPageId "apps-index" (the
+  // parent index, not the actual "7-char-val" page) — navigateToEntry's
+  // stale-pinned-URL check (`currentPageId(deps) === flow.entry.pageId`) then
+  // legitimately found a mismatch after opening the correct URL, treated it as
+  // stale, and fell back to navigating to whatever "apps-index" resolves to —
+  // silently steering milestone 1 away from the real target page entirely (the
+  // explorer ended up on a wrong, generically-similar page and never found the
+  // real "Check Input" button downstream). Correct entryPageId deterministically
+  // against the URL it's paired with, using the same exact urlPattern lookup
+  // matchPage's PASS 1 uses for plain pages, whenever they disagree.
+  for (const flow of proposed) {
+    if (!flow.entry.url) continue;
+    const normalized = normalizePath(
+      flow.entry.url.startsWith('http') ? flow.entry.url : `${state.sitemap.origin}${flow.entry.url}`,
+    );
+    const owner = Object.values(state.sitemap.pages).find((p) => p.urlPatterns.includes(normalized));
+    if (owner && owner.id !== flow.entry.pageId) {
+      console.warn(
+        `[flow] "${flow.id}" entryPageId "${flow.entry.pageId}" doesn't match entryUrl "${flow.entry.url}" — correcting to "${owner.id}"`,
+      );
+      flow.entry.pageId = owner.id;
+    }
+  }
   const existingIds = new Set(state.sitemap.flows.map((f) => f.id));
   const llmFresh = proposed.filter((f) => !existingIds.has(f.id));
 

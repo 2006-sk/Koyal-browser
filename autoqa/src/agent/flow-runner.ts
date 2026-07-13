@@ -414,6 +414,40 @@ function isSelectionShapedGoal(goal: string): boolean {
   );
 }
 
+/**
+ * Some milestones already specify the EXACT literal value to type, because the
+ * app under test validates that specific value — live-reproduced on
+ * testpages.eviltester.com's "7 Char Val" length-validation micro-app, whose
+ * flow milestone read "Type the value 'abcdefg' (exactly 7 characters) into
+ * the first input field". Appending the usual "When entering test text, use
+ * exactly: <random marker>" on top of that creates two contradictory
+ * instructions — the explorer correctly typed the app-required literal value
+ * (typing a random marker instead would defeat the entire point of a
+ * length-validation milestone), then failed verification because the marker
+ * it was told to check for was never typed. Detect the narrow "value '...'"
+ * phrasing this project's own goal-authoring uses for exactly this situation
+ * and skip marker injection, the same way isSearchShapedGoal/
+ * isSelectionShapedGoal already exempt their own unsatisfiable-marker shapes.
+ * Deliberately narrow (requires the word "value" right before the quote, not
+ * just any quoted string) so a goal quoting a FIELD LABEL instead of a value
+ * — e.g. "Type text into the 'Comments' field" — still gets the marker.
+ *
+ * A SECOND, differently-phrased regeneration of the same flow (re-proposed
+ * from a fresh explore) confirmed the "value '...'" phrasing isn't the LLM's
+ * only way to express this: "Type exactly 7 characters (abcdefg) into the
+ * input value field" has no quotes at all — the literal sits in parentheses,
+ * and "value" describes the FIELD ("input value field"), not the literal.
+ * Both phrasings share a more decisive tell: an explicit "exactly/precisely N
+ * character(s)" length constraint, which only shows up when the goal is
+ * testing a fixed-length format/validation rule (a random marker's length is
+ * unpredictable and would violate it) — as opposed to a generic MINIMUM/
+ * maximum length hint ("at least 10 characters"), which a marker can usually
+ * still satisfy, so that phrasing deliberately does NOT match here.
+ */
+function isLiteralValueShapedGoal(goal: string): boolean {
+  return /\bvalue\s*['"]/i.test(goal) || /\b(exactly|precisely)\s+\d+[- ]?character/i.test(goal);
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -460,9 +494,10 @@ async function runMilestone(
   const loginShaped = isLoginShapedGoal(milestone.goal);
   const searchShaped = isSearchShapedGoal(milestone.goal);
   const selectionShaped = isSelectionShapedGoal(milestone.goal);
+  const literalValueShaped = isLiteralValueShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped) {
+  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped && !literalValueShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
@@ -494,13 +529,18 @@ async function runMilestone(
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
     // duplicate version of looksLikeAuthGate's own OLD false-positive bug that
-    // never got the same fix: any milestone that failed for ANY reason on a
-    // content-dense page containing a decorative login/password widget
-    // ANYWHERE (confirmed live on webdriveruniversity.com's "AI Testing
-    // Playground") triggered a pointless re-authenticate + re-navigate cycle
-    // every time, totally unrelated to the actual (often unrelated, e.g. a
-    // flaky-by-design demo widget) failure reason. Reuse the same, already
-    // hardened looksLikeAuthGate() check instead of a second, weaker heuristic.
+    // never got the same fix. Independently live-reproduced on two different
+    // sites in the same batch: webdriveruniversity.com's content-dense "AI
+    // Testing Playground" (a decorative login/password widget sitting among
+    // ~20 unrelated demo cards) and testpages.eviltester.com (the persistent
+    // Docsy sidebar's "Cookie Controlled Login" link, present on every
+    // /apps/* page). Either way, ANY milestone failing for an unrelated
+    // reason on a page merely containing the word "login"/"password"
+    // anywhere got misdiagnosed as an auth wall, triggering a pointless
+    // re-authenticate + re-navigate-to-entry that burned LLM calls and masked
+    // the real failure. Reuse the same DOM-verified, already-hardened
+    // looksLikeAuthGate() check (requires an ACTUAL visible password input)
+    // instead of this one-off, looser substring test.
     if (
       !explored.success &&
       looksLikeAuthGate(deps.browser.getUrl(), explored.finalSnapshot, deps.browser.hasVisiblePasswordInput())
