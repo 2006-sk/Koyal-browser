@@ -143,7 +143,25 @@ export class Nav {
   }
 
   private afterClick(): void {
-    this.browser.wait(config.actionDelayMs);
+    // The wait() BEFORE resolveBlockingDialog used to be unconditional — if the
+    // click just opened a native dialog, this wait() call itself throws ("A
+    // JavaScript dialog is blocking the page"), which propagates straight out
+    // of afterClick() UNCAUGHT (this method has no try/catch of its own) —
+    // Nav.click()'s outer try/catch swallows it as a generic "fall through to
+    // the next fallback method," but the dialog is NEVER resolved, so every
+    // subsequent fallback attempt (findAndClick, clickButtonByText, ...) fails
+    // for the exact same reason, and the caller (e.g. a recipe replay) moves on
+    // with the dialog left open — confirmed live: this exact gap left a
+    // prompt() dialog open long enough to wedge the daemon and trigger
+    // recycle()'s broad-kill fallback (real, observed collateral risk to any
+    // OTHER concurrently-running session, not just a theoretical one). Resolve
+    // first, THEN wait — and don't let a wait() failure escape either.
+    resolveBlockingDialog(this.browser);
+    try {
+      this.browser.wait(config.actionDelayMs);
+    } catch {
+      resolveBlockingDialog(this.browser);
+    }
     // Was an unconditional dialogAccept() — a real confirm()/prompt() dialog's
     // message was never inspected, silently bypassing the destructive-action
     // guard entirely (a confirm() reading "permanently delete X" would be
