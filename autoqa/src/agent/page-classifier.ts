@@ -238,6 +238,21 @@ Respond with JSON only:
  * homepage lists demo pages named "Forgot Password Form", "Secure Password
  * Checker" etc.). Only fall back to the text-only checks when the caller has no
  * browser access to run the DOM query.
+ *
+ * A real password input + "login" wording is STILL not sufficient on its own —
+ * observed live on webdriveruniversity.com's "AI Testing Playground": a genuine,
+ * visible, top-level `<input type=password>` (a "localStorage session" demo
+ * widget) plus several buttons literally labelled "Login", sitting among ~20
+ * other, completely unrelated practice-challenge cards on one content-dense
+ * page. `looksLikeAuthGate` returned true for it, and the deep-walker's entry
+ * check ("entry landed on a login wall") then aborted two full walk attempts
+ * trying to "re-authenticate" against a page with no real site-wide gate at
+ * all. A real, page-blocking login gate is a minimal, dedicated screen (0-2
+ * headings: confirmed live — ParaBank's real gate has 2, this site's own real
+ * Login-Portal has 0); a practice hub with a decorative login widget buried in
+ * it has dozens (confirmed live: 28). Only trust the text/DOM signal when the
+ * URL itself is unambiguously a login route — a much stronger, independent
+ * signal than any word appearing among many unrelated headings.
  */
 export function looksLikeAuthGate(
   url: string,
@@ -250,7 +265,14 @@ export function looksLikeAuthGate(
       ? hasPasswordInputInDom
       : /textbox\s+"[^"]*password/i.test(interactiveSnapshot) || snap.includes('password');
   const hasLoginWords = /log ?in|sign ?in|sign ?up/.test(snap) || /login|signin|auth/.test(url.toLowerCase());
-  return hasPassword && hasLoginWords;
+  if (!hasPassword || !hasLoginWords) return false;
+
+  const urlSaysLogin = /login|signin|auth/.test(url.toLowerCase());
+  if (!urlSaysLogin) {
+    const headingCount = (interactiveSnapshot.match(/\bheading\b/gi) || []).length;
+    if (headingCount > 10) return false;
+  }
+  return true;
 }
 
 /** Is the site currently asking for an emailed code / OTP? */
