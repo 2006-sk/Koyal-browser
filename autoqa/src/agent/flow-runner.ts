@@ -414,6 +414,28 @@ function isSelectionShapedGoal(goal: string): boolean {
   );
 }
 
+/**
+ * Some milestones already specify the EXACT literal value to type, because the
+ * app under test validates that specific value — live-reproduced on
+ * testpages.eviltester.com's "7 Char Val" length-validation micro-app, whose
+ * flow milestone read "Type the value 'abcdefg' (exactly 7 characters) into
+ * the first input field". Appending the usual "When entering test text, use
+ * exactly: <random marker>" on top of that creates two contradictory
+ * instructions — the explorer correctly typed the app-required literal value
+ * (typing a random marker instead would defeat the entire point of a
+ * length-validation milestone), then failed verification because the marker
+ * it was told to check for was never typed. Detect the narrow "value '...'"
+ * phrasing this project's own goal-authoring uses for exactly this situation
+ * and skip marker injection, the same way isSearchShapedGoal/
+ * isSelectionShapedGoal already exempt their own unsatisfiable-marker shapes.
+ * Deliberately narrow (requires the word "value" right before the quote, not
+ * just any quoted string) so a goal quoting a FIELD LABEL instead of a value
+ * — e.g. "Type text into the 'Comments' field" — still gets the marker.
+ */
+function isLiteralValueShapedGoal(goal: string): boolean {
+  return /\bvalue\s*['"]/i.test(goal);
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -460,9 +482,10 @@ async function runMilestone(
   const loginShaped = isLoginShapedGoal(milestone.goal);
   const searchShaped = isSearchShapedGoal(milestone.goal);
   const selectionShaped = isSelectionShapedGoal(milestone.goal);
+  const literalValueShaped = isLiteralValueShapedGoal(milestone.goal);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped) {
+  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped && !literalValueShaped) {
     marker = randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
