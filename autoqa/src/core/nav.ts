@@ -5,6 +5,7 @@ import {
   isButtonDisabled,
   refForEnabledButton,
   refForInteractiveSnapshot,
+  resolveBlockingDialog,
   snapshotIncludes,
 } from './agent-browser.js';
 
@@ -138,12 +139,18 @@ export class Nav {
         this.browser.wait(400);
       }
     }
-    this.browser.dialogAccept();
+    resolveBlockingDialog(this.browser);
   }
 
   private afterClick(): void {
     this.browser.wait(config.actionDelayMs);
-    this.browser.dialogAccept();
+    // Was an unconditional dialogAccept() — a real confirm()/prompt() dialog's
+    // message was never inspected, silently bypassing the destructive-action
+    // guard entirely (a confirm() reading "permanently delete X" would be
+    // blindly OK'd like any benign one). resolveBlockingDialog checks the
+    // dialog's actual message against the same destructive-keyword floor the
+    // click guard uses and dismisses (never accepts) anything that matches.
+    resolveBlockingDialog(this.browser);
   }
 }
 

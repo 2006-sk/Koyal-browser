@@ -13,6 +13,7 @@ export type RecipeStep =
   | { kind: 'click'; label: string; role?: string }
   | { kind: 'fill'; hint: string; value: string; secretRef?: 'email' | 'password' }
   | { kind: 'select'; hint: string; value: string }
+  | { kind: 'press'; key: string }
   | { kind: 'upload'; assetPath: string; selector?: string }
   | { kind: 'waitFor'; urlIncludes?: string; textIncludes?: string; maxMs: number };
 
@@ -52,6 +53,8 @@ export function recordFromExplorer(
       steps.push(step);
     } else if (action.action === 'select' && action.resolvedLabel && action.value !== undefined) {
       steps.push({ kind: 'select', hint: action.resolvedLabel, value: action.value });
+    } else if (action.action === 'press' && action.value !== undefined) {
+      steps.push({ kind: 'press', key: action.value });
     } else if (action.action === 'upload' && action.uploadedPath) {
       steps.push({ kind: 'upload', assetPath: action.uploadedPath, selector: action.selector });
     } else if (action.action === 'click' || action.action === 'fill' || action.action === 'select') {
@@ -187,6 +190,8 @@ export class RecipePlayer {
           const ref = line?.match(/\[ref=(e\d+)\]/)?.[1];
           if (!ref) throw new Error(`could not find select "${step.hint}"`);
           this.browser.select(`@${ref}`, step.value);
+        } else if (step.kind === 'press') {
+          this.browser.press(step.key);
         } else if (step.kind === 'upload') {
           const assetPath = config.uploadFileOverride || step.assetPath;
           if (!fs.existsSync(assetPath)) {

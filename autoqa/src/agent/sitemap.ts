@@ -67,7 +67,7 @@ export interface PageNode {
 }
 
 export interface WalkAction {
-  type: 'click' | 'fill' | 'select' | 'upload' | 'wait-processing';
+  type: 'click' | 'fill' | 'select' | 'press' | 'upload' | 'wait-processing';
   label?: string;
   role?: string;
   selector?: string;

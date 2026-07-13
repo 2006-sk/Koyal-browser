@@ -1,8 +1,8 @@
 import { config } from '../config.js';
-import { parseJsonArrayFromEvalStdout, type AgentBrowser } from './agent-browser.js';
+import { parseJsonArrayFromEvalStdout, resolveBlockingDialog, type AgentBrowser } from './agent-browser.js';
 import { LlmClient, parseJsonFromLlm } from './llm/client.js';
 
-export type ExplorerActionType = 'click' | 'fill' | 'select' | 'wait' | 'upload' | 'done' | 'fail';
+export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
 export interface ExplorerAction {
   action: ExplorerActionType;
@@ -64,6 +64,7 @@ Rules:
 - Prefer semantic matches (button names, field labels) over guessing.
 - For fill actions, use the exact value provided in the goal when filling credentials.
 - For a native <select> dropdown (snapshot shows "combobox" with nested "option" lines, NOT a custom-styled widget), use action "select" with the ref of the combobox itself and "value" set to the exact visible text of the target option — do NOT use "click" on the option, clicking native select options is unreliable.
+- If a field must be submitted with a keyboard key (e.g. a search/todo/tag input with NO visible submit button, only responds to pressing Enter), first "fill" the field with the text, THEN issue a SEPARATE action "press" with "value" set to the key name (e.g. "Enter") as the very next step — do NOT put a key name into a "fill" value, "fill" only ever sets the field's text content, it can never submit anything.
 - If the goal requires attaching a local file, respond with action "upload" (you cannot attach files yourself; the harness will do it mechanically). Include a "selector" if a file input's CSS id/selector is apparent.
 - Use action "done" when the goal is clearly achieved in the current snapshot/URL.
 - Use action "fail" only if the goal is impossible (e.g. element missing after reasonable attempt).
@@ -72,9 +73,9 @@ Rules:
 ${hints}
 JSON schema:
 {
-  "action": "click" | "fill" | "select" | "wait" | "upload" | "done" | "fail",
+  "action": "click" | "fill" | "select" | "press" | "wait" | "upload" | "done" | "fail",
   "ref": "@eN",
-  "value": "string for fill/select only",
+  "value": "string for fill/select/press (press: key name e.g. Enter, Tab, Escape)",
   "selector": "CSS selector for upload only (optional)",
   "reason": "brief explanation"
 }`;
@@ -155,6 +156,20 @@ export class Explorer {
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
 
     for (let step = 0; step < maxSteps; step++) {
+      // A native alert/confirm/prompt dialog freezes the page target — snapshot
+      // and getUrl below both silently come back empty in that state (confirmed
+      // live: `agent-browser snapshot` exits non-zero with "A JavaScript
+      // confirm dialog is blocking the page"). Resolve it FIRST — otherwise the
+      // isBlank check just below misreads an active dialog as a transient blank
+      // page, burns the whole blank-recovery budget re-opening a URL that can
+      // never actually clear a pending dialog, and the LLM never even learns a
+      // dialog existed. `resolveBlockingDialog` itself works even while a
+      // dialog is open (it queries the daemon's own listener state, not the
+      // frozen page).
+      if (resolveBlockingDialog(this.browser)) {
+        stepsTaken.push('resolved a native browser dialog blocking the page (no step consumed)');
+      }
+
       let snapshot = this.browser.snapshotInteractive();
       let url = this.browser.getUrl();
 
@@ -278,7 +293,19 @@ export class Explorer {
         stepsTaken.push(`action failed: ${msg}`);
         console.warn(`  [explorer] action failed (will re-snapshot): ${msg}`);
       }
-      this.browser.wait(config.actionDelayMs);
+      // A click can open a native dialog synchronously — confirmed live: the
+      // click command itself succeeds, but this VERY NEXT wait() call then
+      // throws ("A JavaScript confirm dialog is blocking the page"), which is
+      // uncaught here and would abort achieveGoal entirely before the loop-top
+      // dialog check ever runs. Resolve it right away, before waiting.
+      resolveBlockingDialog(this.browser);
+      try {
+        this.browser.wait(config.actionDelayMs);
+      } catch {
+        // a dialog may have appeared between the check above and this wait
+        // (rare timing edge) — resolve once more and move on regardless.
+        resolveBlockingDialog(this.browser);
+      }
     }
 
     return {
@@ -350,6 +377,10 @@ export class Explorer {
           throw new Error('Explorer select missing ref or value');
         }
         this.browser.select(decision.ref, decision.value);
+        break;
+      case 'press':
+        if (!decision.value) throw new Error('Explorer press missing value (key name)');
+        this.browser.press(decision.value);
         break;
       case 'upload': {
         if (!this.hooks.onUploadRequested) {

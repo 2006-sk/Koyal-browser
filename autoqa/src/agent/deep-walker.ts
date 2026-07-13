@@ -123,6 +123,8 @@ function collectActions(explored: ExplorerResult): WalkAction[] {
       out.push({ type: 'fill', label: a.resolvedLabel, value: a.value });
     } else if (a.action === 'select' && a.resolvedLabel && a.value !== undefined) {
       out.push({ type: 'select', label: a.resolvedLabel, value: a.value });
+    } else if (a.action === 'press' && a.value !== undefined) {
+      out.push({ type: 'press', value: a.value });
     } else if (a.action === 'click' && a.resolvedLabel) {
       out.push({ type: 'click', label: a.resolvedLabel, role: a.resolvedRole });
     }
@@ -618,6 +620,8 @@ export function recordWalkRecipes(state: SiteState, flow: Flow, trail: WalkTrail
         recipeSteps.push({ kind: 'fill', hint: action.label, value: action.value });
       } else if (action.type === 'select' && action.label && action.value) {
         recipeSteps.push({ kind: 'select', hint: action.label, value: action.value });
+      } else if (action.type === 'press' && action.value) {
+        recipeSteps.push({ kind: 'press', key: action.value });
       } else if (action.type === 'upload' && action.assetPath) {
         recipeSteps.push({ kind: 'upload', assetPath: action.assetPath, selector: action.selector });
       }

@@ -542,6 +542,20 @@ export class AgentBrowser {
     this.run(['dialog', 'dismiss']);
   }
 
+  /** Real state of any open native alert/confirm/prompt dialog, incl. its message text. */
+  dialogStatus(): { hasDialog: boolean; message: string; type: string } | null {
+    const result = this.run(['dialog', 'status'], { json: true });
+    const data = result.parsed?.data as { hasDialog?: boolean; message?: string; type?: string } | undefined;
+    if (!data) return null;
+    return { hasDialog: Boolean(data.hasDialog), message: data.message ?? '', type: data.type ?? '' };
+  }
+
+  /** Presses a key (or modifier combo, e.g. "Control+a") on whatever currently has focus. */
+  press(key: string): void {
+    this.assertOk(this.run(['press', key]), `press ${key}`);
+    this.wait(config.actionDelayMs);
+  }
+
   clearSignals(): void {
     this.run(['errors', '--clear']);
     this.run(['console', '--clear']);
@@ -726,4 +740,46 @@ export function snapshotIncludesAny(snapshot: string, texts: string[]): boolean 
 export function isButtonDisabled(snapshot: string, label: string): boolean {
   const line = snapshot.split('\n').find((l) => new RegExp(`button "${label}"`, 'i').test(l));
   return line ? /\[disabled/.test(line) : true;
+}
+
+/**
+ * Resolve any native alert/confirm/prompt dialog currently blocking the page.
+ *
+ * Two real bugs, found live on webdriveruniversity.com's "Popup Alerts" demo
+ * (a confirm() box triggered from the core Explorer.achieveGoal() loop, not
+ * via Nav):
+ *
+ * 1. The Explorer's own loop had ZERO dialog awareness. A blocked dialog makes
+ *    `snapshot`/`get url` fail (confirmed live: `agent-browser snapshot` exits
+ *    non-zero with "A JavaScript confirm dialog is blocking the page"), which
+ *    `snapshotInteractive()`/`getUrl()` both silently turn into `''` — the
+ *    achieveGoal loop then misread this as a transient "page went blank" and
+ *    burned its whole 2-attempt blank-page-recovery budget re-opening the same
+ *    URL, which never resolves an active dialog, before falling through to the
+ *    LLM with an empty snapshot and no idea a dialog exists.
+ * 2. Nav.afterClick()/dismissOverlays() DID already call dialogAccept() after
+ *    every click — but blindly, with zero visibility into what the dialog
+ *    actually said, bypassing the entire destructive-action guard (a
+ *    confirm() reading "This will permanently delete X" would be silently
+ *    OK'd exactly like a benign one).
+ *
+ * This checks the dialog's REAL message (agent-browser exposes it via
+ * `dialog status --json`, confirmed live) against the same destructive-
+ * keyword floor the click guard already uses, and dismisses (never accepts)
+ * anything that matches — closing the guard-bypass and giving the caller a
+ * single place to resolve a dialog before it silently masquerades as
+ * something else.
+ */
+export function resolveBlockingDialog(browser: AgentBrowser): boolean {
+  const status = browser.dialogStatus();
+  if (!status?.hasDialog) return false;
+  const destructive = config.destructiveKeywords.test(status.message);
+  console.log(
+    `[browser] native ${status.type || 'dialog'} blocked the page: "${status.message}" — ${
+      destructive ? 'DISMISSING (matches destructive-keyword floor)' : 'accepting'
+    }`,
+  );
+  if (destructive) browser.dialogDismiss();
+  else browser.dialogAccept();
+  return true;
 }
