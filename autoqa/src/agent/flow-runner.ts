@@ -345,6 +345,27 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
 }
 
 /**
+ * True only if at least one milestone before `milestoneIndex` has a recorded
+ * recipe. On a flow's very first pass (freshly proposed, never run before),
+ * NONE do — so replayUpTo would navigate all the way back to the flow's
+ * entry and then skip every single intermediate milestone (the `if
+ * (!deps.player.has(recipeId)) continue` above), stranding the browser at
+ * square one instead of wherever the previous milestone's own actions
+ * actually, correctly left it. Live-reproduced on saucedemo (exhaustive
+ * mode, 2026-07-14): a guardPhases string not exactly matching the live
+ * page classification on a later milestone's very first run triggered this
+ * every time, forcing the explorer to re-derive login→cart→checkout from
+ * scratch on top of its own goal, reliably exhausting the step budget
+ * before the milestone's real action (e.g. "click Continue") ever ran.
+ */
+function hasAnyPriorRecipe(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): boolean {
+  for (let j = 0; j < milestoneIndex; j++) {
+    if (deps.player.has(`flow:${flow.id}:${flow.milestones[j].id}`)) return true;
+  }
+  return false;
+}
+
+/**
  * Milestone goals never carry secrets, so the generic explorer can only guess
  * credentials — or worse, type the run marker into the password field ("Epic
  * sadface"). Positive-path auth milestones must route through the auth module.
@@ -480,8 +501,14 @@ async function runMilestone(
   if (milestone.guardPhases?.length && !milestone.guardPhases.includes(pageId) && pageId !== 'unknown') {
     pageId = waitForGuardPhase(deps, milestone.guardPhases, 30000);
     if (!milestone.guardPhases.includes(pageId)) {
-      console.log(`[flow] off-track (on "${pageId}", expected ${milestone.guardPhases.join('/')}) — replaying up to this milestone`);
-      await replayUpTo(deps, flow, milestoneIndex);
+      if (hasAnyPriorRecipe(deps, flow, milestoneIndex)) {
+        console.log(`[flow] off-track (on "${pageId}", expected ${milestone.guardPhases.join('/')}) — replaying up to this milestone`);
+        await replayUpTo(deps, flow, milestoneIndex);
+      } else {
+        console.log(
+          `[flow] guard-phase mismatch (on "${pageId}", expected ${milestone.guardPhases.join('/')}) but no prior milestone has a recorded recipe yet — repositioning would strand the browser at the flow's entry for no benefit; proceeding from the current, real position instead`,
+        );
+      }
     }
   }
 
