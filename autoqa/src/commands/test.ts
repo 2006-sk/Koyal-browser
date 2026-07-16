@@ -9,6 +9,7 @@ import {
   finalizeRunReport,
   writeRunReport,
 } from '../core/report.js';
+import { notifyKoyalBugsToSlack } from '../core/slack-bugs.js';
 import { bootstrap, teardown, type Session } from './shared.js';
 
 export async function testCommand(
@@ -45,6 +46,22 @@ export async function testCommand(
     console.log(`\n[autoqa] ${pass} PASS / ${failed} FAIL / ${review} NEEDS REVIEW`);
     console.log(`[autoqa] report → ${path.join(runDir, 'report.md')}`);
     console.log(`[autoqa] LLM calls this run: ${LlmClient.callCount}`);
+
+    // Post genuine product bugs (failed milestones with real site-emitted error
+    // evidence) to the Slack bugs channel — Bug/Inputs/Reproduction/Error-log
+    // only, nothing else, and nothing at all when there are zero product bugs.
+    // Never lets a notify failure affect teardown/exit.
+    try {
+      await notifyKoyalBugsToSlack({
+        report: finalized,
+        hostname: state.hostname,
+        credentialsType: state.authenticatedThisRun
+          ? 'email/password test account (secrets omitted)'
+          : 'none (unauthenticated)',
+      });
+    } catch (err) {
+      console.warn(`[autoqa] slack bug notify skipped: ${err instanceof Error ? err.message : err}`);
+    }
 
     if (!opts.keepOpen) teardown(session);
   }

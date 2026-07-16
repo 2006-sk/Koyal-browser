@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 
-const LOGOUT_RE = /log ?out|sign ?out/i;
+export const LOGOUT_RE = /log ?out|sign ?out/i;
 
 /**
  * Destructive-action gate — the single choke point invoked before every click,

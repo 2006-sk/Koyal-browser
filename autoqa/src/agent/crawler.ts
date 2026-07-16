@@ -6,6 +6,7 @@ import type { LlmClient } from '../core/llm/client.js';
 import { Nav } from '../core/nav.js';
 import { deepWalk, type DeepWalkEntry } from './deep-walker.js';
 import { classifyPage, looksLikeSoft404, proposeFlows } from './page-classifier.js';
+import { LOGOUT_RE } from './guard.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import {
@@ -338,7 +339,34 @@ export async function explore(
           }
           if (pagesVisited >= maxPages) break;
         } else {
-          // same URL — may have opened a modal; note it and dismiss
+          // Same URL — may have opened a modal/dropdown. Before dismissing it,
+          // check whether this click just revealed a Logout/Sign out control
+          // that wasn't visible before (a collapsed user-menu/avatar toggle is
+          // exactly this shape — confirmed live on beta.koyal.ai: clicking the
+          // profile block reveals Profile/Pricing/Transactions/Billing/Logout).
+          // Auto-learning this here, as a side effect of exploration this crawl
+          // was already doing anyway, means the ask-once question in
+          // flow-runner.ts often never needs to fire at all — no dedicated
+          // "hunt for logout" task, no extra risk of clicking something
+          // unrelated in that same menu (this only ever fires on a click the
+          // crawler was already going to make regardless).
+          if (state.sitemap.learnedLogoutControl === undefined) {
+            const afterClickSnapshot = browser.snapshotInteractive();
+            const knownBefore = new Set(page.interactives.map((i) => i.label.toLowerCase()));
+            const revealedLogoutLine = afterClickSnapshot
+              .split('\n')
+              .find((line) => LOGOUT_RE.test(line) && !knownBefore.has(line.trim().toLowerCase()));
+            if (revealedLogoutLine) {
+              const labelMatch = revealedLogoutLine.match(/"([^"]+)"/);
+              const discoveredLabel = labelMatch?.[1] ?? revealedLogoutLine.trim();
+              state.sitemap.learnedLogoutControl = discoveredLabel;
+              state.sitemap.learnedLogoutMenuOpener = el.label;
+              state.saveSitemap();
+              console.log(
+                `[crawl] auto-discovered logout control while exploring: "${el.label}" > "${discoveredLabel}"`,
+              );
+            }
+          }
           nav.dismissOverlays();
         }
       }
@@ -388,6 +416,29 @@ export async function explore(
             }
             if (pagesVisited >= maxPages) break;
           } else {
+            // Same auto-discovery as the main click-probe loop above — this
+            // fallback is exactly the path that catches a profile/avatar block
+            // rendered as a plain anchor-less <div> (confirmed live on
+            // beta.koyal.ai: "Shresth" has no accessible button/link role, so
+            // it never appears in page.interactives and only this JS-routed
+            // fallback ever clicks it).
+            if (state.sitemap.learnedLogoutControl === undefined) {
+              const afterClickSnapshot = browser.snapshotInteractive();
+              const knownBefore = new Set(page.interactives.map((i) => i.label.toLowerCase()));
+              const revealedLogoutLine = afterClickSnapshot
+                .split('\n')
+                .find((line) => LOGOUT_RE.test(line) && !knownBefore.has(line.trim().toLowerCase()));
+              if (revealedLogoutLine) {
+                const labelMatch = revealedLogoutLine.match(/"([^"]+)"/);
+                const discoveredLabel = labelMatch?.[1] ?? revealedLogoutLine.trim();
+                state.sitemap.learnedLogoutControl = discoveredLabel;
+                state.sitemap.learnedLogoutMenuOpener = label;
+                state.saveSitemap();
+                console.log(
+                  `[crawl] auto-discovered logout control while exploring: "${label}" > "${discoveredLabel}"`,
+                );
+              }
+            }
             nav.dismissOverlays();
           }
         }

@@ -143,6 +143,14 @@ export interface SiteMap {
   siteHints: string[];
   /** Learned once: label of a site-wide "Logout"/"Sign out" control, or 'none' if there isn't one — reused by every flow that needs to start from an unauthenticated page. */
   learnedLogoutControl?: string;
+  /**
+   * Some sites (confirmed live on beta.koyal.ai and previously on OrangeHRM)
+   * hide the real Logout control inside a collapsed user-menu/avatar dropdown —
+   * a single click on the Logout label itself does nothing until that menu has
+   * been opened first. When set, click this control BEFORE learnedLogoutControl.
+   * Left unset for sites where Logout is directly clickable with no menu.
+   */
+  learnedLogoutMenuOpener?: string;
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;

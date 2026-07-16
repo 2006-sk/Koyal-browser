@@ -187,30 +187,47 @@ async function ensureLoggedOutForEntry(
   const sitemap = deps.state.sitemap;
   if (sitemap.learnedLogoutControl === undefined) {
     const answer = await deps.interact.ask(
-      `Flow "${flow.title}" needs to start on an unauthenticated page (${firstGuardPhases.join('/')}) but the session is currently logged in (likely left over from an earlier flow). Paste the exact label of a "Logout"/"Sign out" control to click, or "none" if there's no way to log out.`,
+      `Flow "${flow.title}" needs to start on an unauthenticated page (${firstGuardPhases.join('/')}) but the session is currently logged in (likely left over from an earlier flow). Paste the exact label of a "Logout"/"Sign out" control to click, or "none" if there's no way to log out. ` +
+        `If Logout is hidden inside a collapsed user-menu/avatar dropdown that needs opening first (common — e.g. a "Shresth"/profile block you must click before Logout appears), paste BOTH labels separated by " > ", menu-opener first: e.g. "Shresth > Logout".`,
       { default: 'none' },
     );
-    const label = answer.trim();
-    sitemap.learnedLogoutControl = label && label.toLowerCase() !== 'none' ? label : 'none';
+    const raw = answer.trim();
+    if (!raw || raw.toLowerCase() === 'none') {
+      sitemap.learnedLogoutControl = 'none';
+    } else if (raw.includes('>')) {
+      const [opener, logout] = raw.split('>').map((s) => s.trim());
+      sitemap.learnedLogoutMenuOpener = opener || undefined;
+      sitemap.learnedLogoutControl = logout || 'none';
+    } else {
+      sitemap.learnedLogoutControl = raw;
+    }
     deps.state.saveSitemap();
   }
   if (sitemap.learnedLogoutControl && sitemap.learnedLogoutControl !== 'none') {
     const nav = new Nav(deps.browser);
     const stillAuthed = () => !firstGuardPhases.includes(currentPageId(deps));
-    // The click is `optional` (never throws) and some sites hide the actual
+    const opener = sitemap.learnedLogoutMenuOpener;
+    // The clicks are `optional` (never throw) and some sites hide the actual
     // control inside a collapsed user-menu the first click only opens — verify
     // it actually landed us on the expected anon page before trusting it, one
     // retry, rather than silently declaring success on a no-op click.
-    nav.click({ label: sitemap.learnedLogoutControl, optional: true });
+    const attemptLogoutClick = () => {
+      if (opener) {
+        nav.click({ label: opener, optional: true });
+        deps.browser.wait(500);
+      }
+      nav.click({ label: sitemap.learnedLogoutControl!, optional: true });
+    };
+    attemptLogoutClick();
     deps.browser.wait(1500);
     if (!stillAuthed()) return true;
     deps.browser.wait(800);
-    nav.click({ label: sitemap.learnedLogoutControl, optional: true });
+    attemptLogoutClick();
     deps.browser.wait(1500);
     if (!stillAuthed()) return true;
     console.warn(
-      `[flow] logout control "${sitemap.learnedLogoutControl}" didn't change page state — ` +
-        `still looks authenticated (it may be hidden inside a menu that needs opening first)`,
+      `[flow] logout control "${opener ? `${opener} > ` : ''}${sitemap.learnedLogoutControl}" didn't change page state — ` +
+        `still looks authenticated${opener ? '' : ' (it may be hidden inside a menu that needs opening first)'}`,
     );
     return false;
   }
