@@ -32,7 +32,17 @@ export class AudioNav {
   click(intent: ClickIntent): boolean {
     const patterns =
       typeof intent.label === 'string'
-        ? [new RegExp(intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')]
+        ? intent.exact
+          ? [
+              // Prefer exact accessible-name button/link lines when exact=true
+              // (avoids "Music" matching "Music Icon", "No" matching unrelated text).
+              new RegExp(
+                `(?:button|link|tab)\\s+"${intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`,
+                'i',
+              ),
+              new RegExp(`"${intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`, 'i'),
+            ]
+          : [new RegExp(intent.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')]
         : [intent.label];
 
     for (const pattern of patterns) {
@@ -81,7 +91,9 @@ export class AudioNav {
   }
 
   clickNext(): void {
-    this.dismissOverlays();
+    // Do not click × here — that closes the wizard chrome. Credit modals use dismissCreditModal on PageAudio.
+    this.browser.dialogAccept();
+    waitUntilNextEnabled(this.browser, config.verificationMaxWaitMs);
     const snap = this.browser.snapshotInteractive();
     const next = refForEnabledButton(snap, 'Next');
     if (next) {
@@ -131,7 +143,7 @@ export class AudioNav {
   }
 }
 
-/** Wait until predicate or timeout */
+/** Wait until predicate or timeout. Logs every 10s so long waits aren't silent. */
 export function waitUntil(
   browser: AgentBrowser,
   predicate: (url: string, snap: string) => boolean,
@@ -139,10 +151,17 @@ export function waitUntil(
   label: string,
 ): void {
   const deadline = Date.now() + maxMs;
+  let lastLog = 0;
   while (Date.now() < deadline) {
     const url = browser.getUrl();
     const snap = browser.snapshotInteractive();
     if (predicate(url, snap)) return;
+    const now = Date.now();
+    if (now - lastLog >= 10_000) {
+      const left = Math.max(0, Math.round((deadline - now) / 1000));
+      console.log(`[wait] ${label} — still waiting (${left}s left) url=${url}`);
+      lastLog = now;
+    }
     browser.wait(config.verificationPollMs);
   }
   throw new Error(
@@ -150,11 +169,65 @@ export function waitUntil(
   );
 }
 
+/**
+ * Wait for Next to enable. Use short maxMs for UI gates (theme/style).
+ * Do NOT pass transcript/scene processing budgets here — that looks like a hang.
+ */
 export function waitUntilNextEnabled(browser: AgentBrowser, maxMs: number): void {
   waitUntil(
     browser,
     (_u, snap) => !isButtonDisabled(snap, 'Next'),
     maxMs,
     'Next enabled',
+  );
+}
+
+/** On Theme: Next stays disabled until fields are Saved. Retry Save; fail fast. */
+export function advanceFromThemePage(
+  browser: AgentBrowser,
+  clickNext: () => void,
+  dismiss: () => void,
+  maxMs = 30_000,
+): void {
+  const deadline = Date.now() + maxMs;
+  let lastLog = 0;
+  while (Date.now() < deadline) {
+    dismiss();
+    const snap = browser.snapshotInteractive();
+    if (!isButtonDisabled(snap, 'Next') && refForEnabledButton(snap, 'Next')) {
+      clickNext();
+      return;
+    }
+    // Click Save buttons if present (theme fields require Save before Next enables)
+    const saves = snap.split('\n').filter((l) => /button "Save"/i.test(l) && !/\[disabled/.test(l));
+    for (const line of saves) {
+      const ref = line.match(/\[ref=(e\d+)\]/)?.[1];
+      if (ref) {
+        try {
+          browser.clickVisible(`@${ref}`);
+          browser.wait(600);
+        } catch {
+          // try next
+        }
+      }
+    }
+    browser.evalScript(`
+      (function(){
+        for (const b of document.querySelectorAll('button')) {
+          if (/^\\s*Save\\s*$/i.test(b.textContent||'') && !b.disabled) b.click();
+        }
+      })();
+    `);
+    browser.wait(800);
+    const now = Date.now();
+    if (now - lastLog >= 8_000) {
+      console.log(
+        `[theme] Next still disabled — retrying Save (${Math.round((deadline - now) / 1000)}s left)`,
+      );
+      lastLog = now;
+    }
+  }
+  throw new Error(
+    `Theme: Next stayed disabled for ${maxMs}ms at ${browser.getUrl()} — Save may have failed or theme fields empty`,
   );
 }

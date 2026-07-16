@@ -186,13 +186,27 @@ export class ScriptNavigator {
   async advanceFromTheme(): Promise<ExploreRecord | null> {
     this.wizard.dismissOverlays();
     this.wizard.dismissEditPanels();
-    await this.waitUntilNextEnabled(config.scriptProcessingWaitMs);
+    // Theme Next is a UI gate after Save — do not burn SCRIPT_PROCESSING_WAIT_MS (300s) idle here.
+    try {
+      await this.waitUntilNextEnabled(30_000);
+    } catch {
+      // Retry Save then short wait once more
+      this.browser.evalScript(`
+        (function(){
+          for (const b of document.querySelectorAll('button')) {
+            if (/^\\s*Save\\s*$/i.test(b.textContent||'') && !b.disabled) b.click();
+          }
+        })();
+      `);
+      this.browser.wait(1000);
+      await this.waitUntilNextEnabled(20_000);
+    }
     this.wizard.dismissOverlays();
     if (this.wizard.advanceToStyle()) {
       return null;
     }
     return this.explore(
-      `On Story Theme: dismiss any Create New Theme dialog (×). Click Next when enabled. Mark done on Style (Choose art style).`,
+      `On Story Theme: dismiss any Create New Theme dialog (×). Ensure Visual Style/Narrative are Saved. Click Next when enabled. Mark done on Style (Choose art style).`,
       6,
     );
   }
@@ -554,9 +568,19 @@ export class ScriptNavigator {
   }
 
   async editFieldViaLlm(fieldLabel: string, value: string): Promise<ExploreRecord> {
+    const [visual, narrative] = value.includes('|||') ? value.split('|||') : [value, ''];
+    if (narrative) {
+      return this.explore(
+        `On Story Theme (/selectTheme): edit BOTH fields and click their Save buttons. ` +
+          `1) Click the Visual Style textbox, replace ALL text with exactly: "${visual}". Click the Save button next to Visual Style. ` +
+          `2) Click the Visual Narrative textbox, replace ALL text with exactly: "${narrative}". Click the Save button next to Visual Narrative. ` +
+          `Mark done only when BOTH strings appear in the page snapshot.`,
+        12,
+      );
+    }
     return this.explore(
       `Edit the "${fieldLabel}" field to contain this exact text: "${value}". ` +
-        `Click the field or Edit Text if needed, type or paste the value, confirm/save if required. ` +
+        `Click the field or Edit Text if needed, type or paste the value, click Save if a Save button is shown. ` +
         `Mark done when the text appears in the page.`,
       10,
     );

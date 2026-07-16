@@ -1,0 +1,421 @@
+COFFEE SHOP HEIST
+A Short Film
+
+Written for Koyal QA manual testing
+Format: Plain text screenplay (.txt)
+
+================================================================================
+FADE IN:
+
+EXT. DOWNTOWN STREET - MORNING
+
+Rain hammers the pavement. Commuters rush under umbrellas. A yellow taxi splashes through a puddle.
+
+A woman in a red coat, MAYA (32), checks her phone, then ducks into a coffee shop.
+
+================================================================================
+
+INT. BEAN & BREW COFFEE SHOP - CONTINUOUS
+
+Warm light. Jazz plays low. The espresso machine hisses.
+
+MAYA shakes rain from her coat and joins the line. Three customers ahead of her.
+
+Behind the counter: LEO (28), barista, tired eyes, name tag slightly crooked.
+
+CUSTOMER #1, an older man with a newspaper, steps forward.
+
+CUSTOMER #1
+Large black coffee. No room for nonsense today.
+
+LEO
+Coming right up, sir.
+
+Leo pours. Maya glances at the clock on the wall: 8:47 AM.
+
+CUSTOMER #2, a teenager with headphones, speaks without removing them.
+
+CUSTOMER #2
+Can I get a caramel thing? The big one. Extra caramel.
+
+LEO
+Venti caramel macchiato, extra caramel. Got it.
+
+CUSTOMER #2
+You're a legend.
+
+Maya smiles despite herself. Her phone buzzes. She reads a text, jaw tightening.
+
+INSERT - PHONE SCREEN
+
+Message from "ALEX": "They moved the meet. 9:15. Same place. Don't be late."
+
+BACK TO SCENE
+
+CUSTOMER #3, a businesswoman, orders quickly.
+
+CUSTOMER #3
+Oat milk latte. Double shot. To go.
+
+LEO
+Name for the cup?
+
+CUSTOMER #3
+Sarah.
+
+Maya steps up. For a moment, she and Leo lock eyes.
+
+MAYA
+Medium americano. And whatever pastry isn't sad.
+
+LEO
+That narrows it down to two. Almond croissant or blueberry muffin?
+
+MAYA
+Surprise me.
+
+LEO
+Risky before nine in the morning.
+
+MAYA
+I've had worse mornings.
+
+Leo rings her up. The register beeps.
+
+LEO
+That'll be six-forty.
+
+Maya taps her card. DECLINED.
+
+MAYA
+Try again.
+
+Second tap. DECLINED.
+
+MAYA (CONT'D)
+(quietly)
+You've got to be kidding me.
+
+Leo hesitates, then lowers his voice.
+
+LEO
+Look, the muffin is on me. Just take it.
+
+MAYA
+I don't need charity.
+
+LEO
+Then call it professional courtesy. You look like you're about to fight someone.
+
+MAYA
+Maybe I am.
+
+A door chime rings. A man enters: ALEX (35), leather jacket, scanning the room.
+
+Alex spots Maya. His expression hardens.
+
+ALEX
+We need to talk. Outside. Now.
+
+MAYA
+I'm getting coffee.
+
+ALEX
+You can get coffee after you explain why our buyer thinks we're selling fake data.
+
+Customers turn. Leo watches, uneasy.
+
+MAYA
+Keep your voice down.
+
+ALEX
+Then stop stalling. You said you had the drive at eight.
+
+Maya pulls a small encrypted drive from her bag.
+
+MAYA
+I have it. But the decryption key isn't on here. It's in the safe deposit box.
+
+ALEX
+Then why are we in a coffee shop and not a bank?
+
+MAYA
+Because banks open at nine, Alex. And because you moved the meet twice.
+
+Leo slides Maya's americano across the counter.
+
+LEO
+Medium americano. Almond croissant on the house.
+
+Alex eyes Leo.
+
+ALEX
+Who's this?
+
+MAYA
+Nobody.
+
+LEO
+Actually, I'm Leo. I make coffee. I also hear everything, so maybe take the corporate espionage outside.
+
+Alex steps closer to Leo.
+
+ALEX
+Mind your business.
+
+LEO
+Sir, this is a place of caffeine and mild jazz. Please step back.
+
+Maya puts a hand on Alex's chest.
+
+MAYA
+Stop. He's right. We're drawing attention.
+
+A barista in the back, PRIYA (26), calls out.
+
+PRIYA
+Leo, we need more oat milk up front!
+
+Leo doesn't look away from Alex.
+
+LEO
+One second, Priya.
+
+(to Alex)
+Sir, I'm going to ask you once to lower your volume.
+
+ALEX
+Or what? You'll foam me to death?
+
+MAYA
+Alex. Enough.
+
+Alex exhales, steps back. Maya grabs her coffee.
+
+MAYA (CONT'D)
+(to Leo)
+Thank you. For the croissant.
+
+LEO
+Try the bank at nine. And maybe update your payment info.
+
+Maya almost laughs.
+
+MAYA
+I'll add it to my list.
+
+She heads for the door. Alex follows.
+
+================================================================================
+
+EXT. COFFEE SHOP - ALLEY BESIDE ENTRANCE - MOMENTS LATER
+
+Rain lighter now. Maya and Alex stand under a narrow awning.
+
+ALEX
+The buyer lands at ten-thirty. If the key isn't real, we lose everything.
+
+MAYA
+The key is real. I copied it last night from the server room.
+
+ALEX
+You copied it alone?
+
+MAYA
+You were "busy" sending threatening texts.
+
+ALEX
+I was covering our tracks.
+
+MAYA
+You were covering your ego.
+
+Alex rubs his temples.
+
+ALEX
+Fine. What do you need from me?
+
+MAYA
+Trust. And a car that doesn't smell like fast food.
+
+ALEX
+I can do one of those.
+
+Maya sips her americano.
+
+MAYA
+Then drive. Bank opens in twelve minutes.
+
+They hurry toward the street.
+
+================================================================================
+
+INT. FIRST NATIONAL BANK - LOBBY - LATER
+
+Bright fluorescent lights. Security guard at the desk. Maya and Alex approach.
+
+SECURITY GUARD
+Good morning. How can I help you?
+
+MAYA
+Safe deposit access. Box 441. Maya Chen.
+
+SECURITY GUARD
+ID, please.
+
+Maya hands over her ID. The guard checks it, nods.
+
+SECURITY GUARD (CONT'D)
+Sign here. Your associate will wait in the lobby.
+
+ALEX
+I'm not her associate. I'm her—
+
+MAYA
+Backup.
+
+Alex crosses his arms. The guard buzzes them through.
+
+================================================================================
+
+INT. SAFE DEPOSIT VAULT - CONTINUOUS
+
+Rows of metal boxes. Maya enters with a bank clerk, CLERK (40s).
+
+CLERK
+Box 441. Take your time.
+
+The clerk steps away. Maya inserts her key, turns. Click.
+
+Inside: an envelope labeled "KOYAL - PHASE 2".
+
+Maya opens it. A single index card with handwritten numbers.
+
+MAYA
+(reading)
+"Voice map seed: 7A-19-Falcon."
+
+She photographs the card with her phone.
+
+ALEX (O.S.)
+(from doorway)
+Did you get it?
+
+MAYA
+I got it. And if you follow me into the vault again without clearance, I'll leave you at the coffee shop.
+
+ALEX
+You'd miss me.
+
+MAYA
+I'd miss the croissant.
+
+================================================================================
+
+INT. BEAN & BREW COFFEE SHOP - AFTERNOON
+
+The lunch rush. Maya returns alone, sits at a corner table, laptop open.
+
+Leo delivers a fresh cup.
+
+LEO
+Second americano. You look like the bank went well.
+
+MAYA
+How do you know I went to a bank?
+
+LEO
+You said "twelve minutes" and left like someone in a heist movie.
+
+MAYA
+Maybe I am in a heist movie.
+
+LEO
+Then I'm the guy who gives the hero caffeine in act two.
+
+Maya smiles. Genuine this time.
+
+MAYA
+Act two is when everything breaks.
+
+LEO
+Act two is when the hero fixes it.
+
+Priya leans in from the counter.
+
+PRIYA
+Leo, table four wants decaf but "with energy."
+
+LEO
+That's just hope in a cup.
+
+(to Maya)
+Good luck with your... movie.
+
+Leo walks off. Maya types on her laptop.
+
+ON SCREEN - She uploads files to a folder named "Project - Coffee Shop Heist".
+
+MAYA
+(to herself)
+Let's see if you can turn this into a film.
+
+Her phone rings. ALEX.
+
+MAYA (CONT'D)
+(answering)
+We have the key. Meet at the office.
+
+ALEX (V.O.)
+(filtered)
+Buyer wants a preview scene by tonight. Dialogue-heavy. One location.
+
+MAYA
+Coffee shop?
+
+ALEX (V.O.)
+Coffee shop works.
+
+Maya looks around Bean & Brew: customers, steam, rain on the window.
+
+MAYA
+Yeah. Coffee shop works.
+
+She closes the laptop. The jazz track swells.
+
+================================================================================
+
+EXT. BEAN & BREW COFFEE SHOP - DUSK
+
+Neon sign flickers on: "OPEN LATE."
+
+Through the window, Maya and Leo talk at the counter. She gestures like she's directing a scene.
+
+Leo nods, amused, and wipes the espresso machine.
+
+FADE OUT.
+
+================================================================================
+THE END
+
+CAST LIST (for reference)
+- MAYA CHEN - Lead. Cool under pressure.
+- ALEX REED - Partner. Impatient but loyal.
+- LEO - Barista. Observer with dry humor.
+- PRIYA - Barista. Practical, busy.
+- CUSTOMER #1 - Older man, newspaper.
+- CUSTOMER #2 - Teenager, headphones.
+- CUSTOMER #3 - Businesswoman, Sarah.
+- SECURITY GUARD - Bank lobby.
+- CLERK - Safe deposit room.
+
+LOCATIONS
+1. Downtown street (rain)
+2. Bean & Brew Coffee Shop (morning + afternoon)
+3. Alley beside coffee shop
+4. First National Bank lobby
+5. Safe deposit vault
+
+ESTIMATED RUNTIME: 8-10 minutes
+DIALOGUE HEAVY: Yes
+PRIMARY SET: Coffee shop interior

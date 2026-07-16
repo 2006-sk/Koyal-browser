@@ -24,8 +24,9 @@ export const audioSelectors = {
   },
   storyType: {
     heading: /concept driven or character driven/i,
-    conceptDriven: /button "Concept Driven"/i,
-    characterDriven: /button "Character Driven"/i,
+    // Accessible names include the description after the title — do not require a closing quote.
+    conceptDriven: /button "Concept Driven/i,
+    characterDriven: /button "Character Driven/i,
     goBackAudio: /Go back to upload audio/i,
   },
   transcript: {

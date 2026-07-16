@@ -21,7 +21,15 @@ export function detectWizardPhase(url: string, snap: string): WizardPhase {
   if (/how would you like to start|start with audio/i.test(snap)) return 'upload-fork';
   if (/select your plan/i.test(s)) return 'plan-modal';
   if (/choose audio type/i.test(s)) return 'audio-type';
-  if (u.includes('selectstorytype') || /concept driven or character driven/i.test(s)) return 'story-type';
+  // Live UI heading: "…concept driven or character driven?" — also match the two option cards
+  // (accessible names are long: "Concept Driven Scenes are built…").
+  if (
+    u.includes('selectstorytype') ||
+    /concept driven or character driven/i.test(s) ||
+    (/concept driven/i.test(s) && /character driven/i.test(s) && !/choose audio type/i.test(s))
+  ) {
+    return 'story-type';
+  }
   if (u.includes('lyricedit') || /audio transcript/i.test(s)) return 'transcript';
   if (u.includes('selecttheme') || /story theme/i.test(s)) return 'theme';
   if (u.includes('selectstyle') || /choose art style/i.test(s)) return 'style';

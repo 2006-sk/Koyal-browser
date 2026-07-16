@@ -6,14 +6,14 @@ Automated browser QA for [beta.koyal.ai](https://beta.koyal.ai), organized by pr
 
 | Folder | Scope |
 |--------|--------|
-| [`logjn/`](logjn/) | Login, signup, forgot-password (Phase 1) |
+| [`login/`](login/) | Login, signup, forgot-password (Phase 1) |
 
 Each flow is a self-contained Node project with its own `package.json`, `src/`, and `reports/`.
 
 ## Quick start (login flow)
 
 ```bash
-cd logjn
+cd login
 npm install
 npx agent-browser install
 cp .env.example .env   # add credentials

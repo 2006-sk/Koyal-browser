@@ -1,0 +1,13 @@
+# Exploration run artifacts (regenerable)
+screenshots/
+snapshots/
+console/
+network/
+*.log
+*.tsv
+full-push.log
+path-results*.log
+
+# Duplicate audio at happyflow root (canonical copies live in audio/assets/)
+/test-audio-*
+/test-narration-*

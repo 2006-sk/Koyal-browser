@@ -3,16 +3,16 @@
  * Audio QA — 2 tests by default:
  *   1. audio-complete-wav  — full path, all probes, real edits, nav, download (~6–8 min)
  *   2. audio-complete-mp3  — MP3 format parity with edits (~6 min)
+ *
+ * Output: a single clean reports/REPORT.md (previous reports deleted).
  */
 import { config, requireCredentials } from './config.js';
 import path from 'node:path';
+import fs from 'node:fs';
 import { AgentBrowser } from './lib/agent-browser.js';
-import { writeArtifactsIndex } from './lib/evidence.js';
 import {
-  appendReportNotes,
   createRunReport,
   finalizeRunReport,
-  scenarioEvidenceDir,
   writeRunReport,
 } from './lib/report.js';
 import { testAudioComplete } from './scenarios/audio-complete.js';
@@ -28,7 +28,7 @@ function hasOnlyFlag(prefix: string): boolean {
 
 async function runScenario(
   report: { scenarios: unknown[] },
-  runDir: string,
+  scratchDir: string,
   id: string,
   session: string,
   fn: (browser: AgentBrowser, evidence: string, options?: { record?: boolean }) => Promise<unknown>,
@@ -36,8 +36,9 @@ async function runScenario(
 ): Promise<void> {
   console.log(`\n▶ Scenario: ${id}`);
   const browser = new AgentBrowser({ session, headed: config.headed });
-  browser.recycle();
-  const evidence = scenarioEvidenceDir(runDir, id);
+  browser.recycle('startup');
+  const evidence = path.join(scratchDir, id);
+  fs.mkdirSync(evidence, { recursive: true });
   if (options.record) {
     browser.queueRecording(path.join(evidence, 'run-recording.webm'));
   }
@@ -46,7 +47,7 @@ async function runScenario(
   } finally {
     browser.recordStop();
     browser.close();
-    browser.recycle();
+    browser.recycle('teardown');
   }
 }
 
@@ -61,40 +62,72 @@ async function main(): Promise<void> {
   requireCredentials();
 
   const report = createRunReport(config.baseUrl);
-  const runDir = `${config.reportsDir}/${report.runId}`;
+  const scratchDir = path.join(config.reportsDir, `.scratch-${report.runId}`);
+  fs.mkdirSync(scratchDir, { recursive: true });
 
   const record = hasFlag('--record') || process.env.AGENT_RECORD === 'true';
 
   console.log(`\nRun ID: ${report.runId}`);
-  console.log(`Artifacts: ${runDir}/`);
+  console.log(`Report:  ${path.join(config.reportsDir, 'REPORT.md')} (single file)`);
   console.log(`Headed: ${config.headed} | Cursor: ${config.showCursor} | Record: ${record}`);
   console.log(`Tests: ${runWav ? 'WAV complete' : ''}${runWav && runMp3 ? ' + ' : ''}${runMp3 ? 'MP3 complete' : ''}\n`);
 
-  if (runWav) {
-    await runScenario(report, runDir, 'audio-complete-wav', config.sessionAudio, testAudioComplete, { record });
-  }
+  let exitCode = 0;
+  try {
+    if (runWav) {
+      await runScenario(report, scratchDir, 'audio-complete-wav', config.sessionAudio, testAudioComplete, {
+        record,
+      });
+    }
 
-  if (runMp3) {
-    await runScenario(report, runDir, 'audio-complete-mp3', `${config.sessionAudio}-mp3`, testAudioMp3, { record });
+    if (runMp3) {
+      await runScenario(
+        report,
+        scratchDir,
+        'audio-complete-mp3',
+        `${config.sessionAudio}-mp3`,
+        testAudioMp3,
+      );
+    }
+  } catch (error) {
+    console.error(error);
+    exitCode = 1;
   }
 
   const finalReport = finalizeRunReport(report as never);
-  const outputDir = writeRunReport(finalReport, config.reportsDir);
-  writeArtifactsIndex(outputDir, finalReport.scenarios);
-  appendReportNotes(outputDir);
+  const { reportPath, bugsPath } = writeRunReport(finalReport, config.reportsDir);
+
+  if (bugsPath) {
+    const { notifySlackBugs } = await import('./lib/slack-bugs.js');
+    await notifySlackBugs({
+      suite: 'audio',
+      runId: finalReport.runId,
+      markdown: fs.readFileSync(bugsPath, 'utf8'),
+    });
+  }
 
   const allSteps = finalReport.scenarios.flatMap((s) => s.steps);
   const pass = allSteps.filter((st) => st.result.verdict === 'pass').length;
   const fail = allSteps.filter((st) => st.result.verdict === 'fail').length;
   const review = allSteps.filter((st) => st.result.verdict === 'needs-review').length;
+  const koyalBugs = allSteps.filter((st) =>
+    st.result.reasons.some((r) => /KOYAL PRODUCT BUG/i.test(r)),
+  );
+  if (fail > 0) exitCode = 1;
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`Steps: ${pass} PASS | ${fail} FAIL | ${review} NEEDS REVIEW`);
-  console.log(`Report:     ${outputDir}/report.md`);
-  console.log(`Artifacts:  ${outputDir}/ARTIFACTS.md`);
+  if (koyalBugs.length) {
+    console.log(`Koyal product bugs: ${koyalBugs.length} (harness OK — flow rejected)`);
+    for (const bug of koyalBugs) {
+      console.log(`  • ${bug.workflow}`);
+    }
+    console.log(`Also wrote: ${path.join(config.reportsDir, 'KOYAL_BUGS.md')}`);
+  }
+  console.log(`Report: ${reportPath}`);
   console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 
-  process.exit(fail > 0 ? 1 : 0);
+  process.exit(exitCode);
 }
 
 main().catch((error) => {

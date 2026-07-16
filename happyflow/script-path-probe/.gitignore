@@ -1,0 +1,4 @@
+reports/
+*.png
+console.json
+network*.json

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.local
+reports/
+.autoqa-state/
+*.log
+.DS_Store
