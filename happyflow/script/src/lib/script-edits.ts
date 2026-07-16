@@ -1,4 +1,7 @@
-import { AgentBrowser, snapshotIncludes } from './agent-browser.js';
+import {
+  AgentBrowser,
+  snapshotIncludes,
+} from './agent-browser.js';
 
 export interface FillResult {
   ok: boolean;
@@ -41,45 +44,67 @@ function tag(): string {
   return pick(['alpha', 'beta', 'gamma', 'delta', 'omega']);
 }
 
+/** React-controlled inputs ignore el.value= — use the native setter. */
+const NATIVE_SET_VALUE = `
+  function setNativeValue(el, value) {
+    if (!el) return false;
+    el.focus();
+    el.click();
+    const proto =
+      (el.tagName === 'TEXTAREA' && window.HTMLTextAreaElement.prototype) ||
+      (el.tagName === 'INPUT' && window.HTMLInputElement.prototype) ||
+      null;
+    const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, value);
+    else if (el.isContentEditable) el.textContent = value;
+    else el.value = value;
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+`;
+
 export function fillFieldByHint(browser: AgentBrowser, hint: string, text: string): FillResult {
   const hintJson = JSON.stringify(hint);
   const textJson = JSON.stringify(text);
   browser.evalScript(`
     (function() {
+      ${NATIVE_SET_VALUE}
       const hint = ${hintJson}.toLowerCase();
       const value = ${textJson};
       const isMatch = (s) => s && String(s).toLowerCase().includes(hint);
 
-      function setValue(el) {
-        if (!el) return false;
-        el.focus();
-        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-          el.value = value;
-        } else {
-          el.textContent = value;
-        }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }
-
-      for (const label of document.querySelectorAll('label')) {
+      for (const label of document.querySelectorAll('label,h1,h2,h3,h4,h5,h6,[class*="label"]')) {
         if (!isMatch(label.textContent)) continue;
         const id = label.getAttribute('for');
         if (id) {
           const linked = document.getElementById(id);
-          if (setValue(linked)) return true;
+          if (setNativeValue(linked, value)) return 'LABEL_FOR';
         }
-        const nested = label.querySelector('textarea,input,[contenteditable="true"],[contenteditable=true]');
-        if (setValue(nested)) return true;
+        let root = label.parentElement;
+        for (let i = 0; i < 4 && root; i++) {
+          const nested = root.querySelector('textarea,input:not([type=hidden]),[contenteditable="true"],[contenteditable=true]');
+          if (nested && setNativeValue(nested, value)) return 'HEADING_NEAR';
+          root = root.parentElement;
+        }
+        let sib = label.nextElementSibling;
+        for (let i = 0; i < 6 && sib; i++) {
+          const nested = sib.matches?.('textarea,input,[contenteditable]')
+            ? sib
+            : sib.querySelector?.('textarea,input:not([type=hidden]),[contenteditable="true"],[contenteditable=true]');
+          if (nested && setNativeValue(nested, value)) return 'HEADING_SIB';
+          sib = sib.nextElementSibling;
+        }
       }
 
-      for (const el of document.querySelectorAll('textarea,input,[contenteditable="true"],[contenteditable=true]')) {
+      for (const el of document.querySelectorAll('textarea,input:not([type=hidden]),[contenteditable="true"],[contenteditable=true]')) {
         const ph = el.getAttribute('placeholder') || '';
         const aria = el.getAttribute('aria-label') || '';
-        if (isMatch(ph) || isMatch(aria)) return setValue(el);
+        if (isMatch(ph) || isMatch(aria)) {
+          if (setNativeValue(el, value)) return 'PLACEHOLDER';
+        }
       }
-      return false;
+      return 'NO_MATCH';
     })();
   `);
   browser.wait(600);
@@ -95,17 +120,12 @@ export function fillEditableByIndex(browser: AgentBrowser, index: number, text: 
   const textJson = JSON.stringify(text);
   browser.evalScript(`
     (function() {
-      const els = [...document.querySelectorAll('textarea,[contenteditable="true"],[contenteditable=true],input[type=text]')]
+      ${NATIVE_SET_VALUE}
+      const els = [...document.querySelectorAll('textarea,[contenteditable="true"],[contenteditable=true],input[type=text],input:not([type])')]
         .filter(el => el.offsetParent !== null || el.getClientRects().length);
       const el = els[${index}];
-      if (!el) return false;
-      el.focus();
-      const value = ${textJson};
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = value;
-      else el.textContent = value;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
+      if (!el) return 'NO_EL';
+      return setNativeValue(el, ${textJson}) ? 'OK' : 'FAIL';
     })();
   `);
   browser.wait(600);
@@ -117,10 +137,96 @@ export function fillEditableByIndex(browser: AgentBrowser, index: number, text: 
   return { ok: false, detail: `editable index ${index} — text not visible` };
 }
 
+/**
+ * Theme page: textboxes sit under h4 "Visual Style" / "Visual Narrative" with a Save button each.
+ * agent-browser fill + Save is required — plain DOM value= is ignored by React and unsaved edits revert.
+ */
+function fillThemeFieldByHeading(
+  browser: AgentBrowser,
+  heading: 'Visual Style' | 'Visual Narrative',
+  text: string,
+): FillResult {
+  const snap = browser.snapshotInteractive();
+  const lines = snap.split('\n');
+  const headingIdx = lines.findIndex((l) => new RegExp(`heading "${heading}"`, 'i').test(l));
+  if (headingIdx < 0) {
+    return { ok: false, detail: `heading "${heading}" not in snapshot` };
+  }
+
+  let textboxRef: string | null = null;
+  let saveRef: string | null = null;
+  for (let i = headingIdx + 1; i < Math.min(headingIdx + 12, lines.length); i++) {
+    const line = lines[i]!;
+    if (!textboxRef) {
+      const m = line.match(/textbox[^[]*\[ref=(e\d+)\]/i);
+      if (m) textboxRef = `@${m[1]}`;
+    }
+    if (textboxRef && !saveRef) {
+      const m = line.match(/button "Save"[^[]*\[ref=(e\d+)\]/i);
+      if (m) saveRef = `@${m[1]}`;
+    }
+    if (textboxRef && saveRef) break;
+    // Stop if we hit the other theme heading
+    if (i > headingIdx + 1 && /heading "Visual /i.test(line) && !line.includes(heading)) break;
+  }
+
+  if (textboxRef) {
+    try {
+      browser.fillVisible(textboxRef, text);
+      browser.wait(400);
+    } catch {
+      // fall through to DOM path
+    }
+  }
+
+  // Always also apply native setter via heading (covers fill miss / React)
+  const hintResult = fillFieldByHint(browser, heading, text);
+  if (!hintResult.ok) {
+    const idx = heading === 'Visual Style' ? 0 : 1;
+    fillEditableByIndex(browser, idx, text);
+  }
+
+  if (saveRef) {
+    try {
+      browser.clickVisible(saveRef);
+      browser.wait(800);
+    } catch {
+      browser.clickButtonByText('Save', true);
+      browser.wait(800);
+    }
+  } else {
+    // Click the Save nearest this heading in the DOM
+    const headingJson = JSON.stringify(heading);
+    browser.evalScript(`
+      (function() {
+        const h = [...document.querySelectorAll('h1,h2,h3,h4,h5')].find(el =>
+          (el.textContent || '').trim() === ${headingJson});
+        if (!h) return 'NO_H';
+        let root = h.parentElement;
+        for (let i = 0; i < 5 && root; i++) {
+          const btn = [...root.querySelectorAll('button')].find(b => /^\\s*Save\\s*$/i.test(b.textContent || ''));
+          if (btn) { btn.click(); return 'SAVED'; }
+          root = root.parentElement;
+        }
+        return 'NO_SAVE';
+      })();
+    `);
+    browser.wait(800);
+  }
+
+  const after = `${browser.snapshotInteractive()}\n${browser.snapshotFull()}`;
+  const snippet = text.slice(0, Math.min(24, text.length));
+  if (snapshotIncludes(after, snippet)) {
+    return { ok: true, detail: `theme "${heading}" filled + saved` };
+  }
+  return { ok: false, detail: `theme "${heading}" — text not visible after Save` };
+}
+
 export function editScriptDialogue(browser: AgentBrowser, text: string): FillResult {
   const textJson = JSON.stringify(text);
   browser.evalScript(`
     (function() {
+      ${NATIVE_SET_VALUE}
       const segment = [...document.querySelectorAll('paragraph,generic,div,p,[class*="dialogue"],[class*="segment"]')]
         .find(el => {
           const t = (el.textContent || '').trim();
@@ -129,14 +235,8 @@ export function editScriptDialogue(browser: AgentBrowser, text: string): FillRes
       if (segment) segment.click();
       const editable = document.querySelector('[contenteditable="true"],[contenteditable=true],textarea')
         || segment;
-      if (!editable) return false;
-      editable.focus();
-      const value = ${textJson};
-      if (editable.tagName === 'TEXTAREA' || editable.tagName === 'INPUT') editable.value = value;
-      else editable.textContent = value;
-      editable.dispatchEvent(new Event('input', { bubbles: true }));
-      editable.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
+      if (!editable) return 'NO_EL';
+      return setNativeValue(editable, ${textJson}) ? 'OK' : 'FAIL';
     })();
   `);
   browser.wait(800);
@@ -153,14 +253,8 @@ export function editThemeFields(
   visualStyle: string,
   narrative: string,
 ): { visual: FillResult; narrative: FillResult } {
-  let visual = fillFieldByHint(browser, 'Visual Style', visualStyle);
-  if (!visual.ok) visual = fillFieldByHint(browser, 'visual', visualStyle);
-  if (!visual.ok) visual = fillEditableByIndex(browser, 0, visualStyle);
-
-  let narr = fillFieldByHint(browser, 'Visual Narrative', narrative);
-  if (!narr.ok) narr = fillFieldByHint(browser, 'Narrative', narrative);
-  if (!narr.ok) narr = fillEditableByIndex(browser, 1, narrative);
-
+  const visual = fillThemeFieldByHeading(browser, 'Visual Style', visualStyle);
+  const narr = fillThemeFieldByHeading(browser, 'Visual Narrative', narrative);
   return { visual, narrative: narr };
 }
 

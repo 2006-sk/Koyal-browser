@@ -1,4 +1,6 @@
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { config, readCursorScript } from '../config.js';
 
@@ -43,46 +45,142 @@ export class AgentBrowser {
    * Force-kill the browser daemon + its Chrome tree when it has wedged (graceful
    * `close` hangs on a dead CDP connection, so kill hard). The next command
    * lazily respawns a fresh daemon. Session cookies are reloaded by the caller
-   * via ensureAuthenticated/stateLoad. Returns true if a kill was issued.
+   * via ensureAuthenticated/stateLoad. Returns true if a specific-PID kill was
+   * issued, false if recycling had to be skipped (see below) — callers should
+   * treat `false` as "still wedged," not silently assume it worked.
+   *
+   * History: this used to resolve the daemon's PID SOLELY via a live
+   * `session info --json` IPC call to the very daemon being recycled, and
+   * fell back to a BROAD `pkill -f agent-browser` (every session on the
+   * machine) whenever that call failed or timed out — exactly the scenario
+   * most likely when the daemon is badly wedged. That broad fallback has
+   * fired for real 4 confirmed times across this project's history, each
+   * time killing a DIFFERENT, unrelated concurrently-running session's
+   * browser as collateral damage (batch 2's the-internet→GreenKart, batch
+   * 3's webdriveruniversity→eviltester, and twice more since). Fixed by
+   * resolving the PID from disk first (see resolveDaemonPid) and removing
+   * the automatic broad-kill fallback entirely — a wedge in one session
+   * must never be able to reach into another's.
    */
   recycle(): boolean {
     console.log('[browser] recycling wedged daemon (force-kill + respawn)');
-    // Prefer a SESSION-SCOPED kill: `session info --json` exposes this session's
-    // own daemon PID, so we only tear down THIS session's Chrome tree — a blind
-    // `pkill -f agent-browser` kills every concurrent session on the machine,
-    // which breaks the (established) pattern of running several sites' explores
-    // at once. Fall back to the broad kill only if we can't resolve a specific PID.
-    let killedSpecific = false;
+    const pid = this.resolveDaemonPid();
+    if (!pid) {
+      const allowBroad = process.env.AUTOQA_ALLOW_BROAD_RECYCLE_KILL === 'true';
+      if (allowBroad) {
+        console.warn(
+          '[browser] could not resolve a session-specific PID for this wedged daemon — ' +
+            'AUTOQA_ALLOW_BROAD_RECYCLE_KILL=true is set, falling back to the OLD unsafe ' +
+            'broad kill (affects ALL agent-browser sessions on this machine)',
+        );
+        try {
+          spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
+          spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
+        } catch {
+          // best-effort
+        }
+        this.resetAfterKill();
+        return true;
+      }
+      console.warn(
+        `[browser] could not resolve a session-specific PID for session "${this.session}" — ` +
+          'refusing to broad-kill (would collaterally kill any OTHER concurrently-running ' +
+          'session). This session will keep failing until its daemon recovers or is killed ' +
+          'manually. Set AUTOQA_ALLOW_BROAD_RECYCLE_KILL=true to opt into the old unsafe behavior.',
+      );
+      return false;
+    }
+    // Re-check ownership immediately before killing — resolveDaemonPid()'s own
+    // check already ran a moment ago, but the wedged process could in principle
+    // die and have its PID reassigned by the OS in between (a classic TOCTOU
+    // race); re-confirming right here shrinks that window to near-zero instead
+    // of trusting a check that's already had time to go stale.
+    if (!this.pidOwnsThisSession(pid)) {
+      console.warn(
+        `[browser] PID ${pid} no longer belongs to session "${this.session}" (changed since resolution) — skipping kill to avoid hitting the wrong process`,
+      );
+      return false;
+    }
+    try {
+      spawnSync('pkill', ['-9', '-P', String(pid)], { timeout: 5_000 }); // Chrome children
+      spawnSync('kill', ['-9', String(pid)], { timeout: 5_000 }); // the daemon itself
+    } catch {
+      // best-effort — ownership was just verified above, so a spawnSync
+      // failure here is just noise
+    }
+    this.resetAfterKill();
+    return true;
+  }
+
+  /** Shared post-kill settle: give the OS a moment to reap/free ports before respawn. */
+  private resetAfterKill(): void {
+    spawnSync('sleep', ['3']);
+    this.cursorInjected = false;
+    this.consecutiveTimeouts = 0;
+  }
+
+  /**
+   * Resolve THIS session's own daemon PID without depending on the daemon
+   * itself being responsive. Primary source: the `.pid` file agent-browser
+   * writes to disk at daemon-spawn time (`~/.agent-browser/<session>.pid`,
+   * confirmed live) — a plain file read, so unlike an IPC round-trip it
+   * can't hang or time out on a wedged daemon, which is exactly the case
+   * this method has to handle. Falls back to the live `session info --json`
+   * call (bounded, 5s) only if the file is missing/unreadable — that call
+   * can still succeed when the daemon is slow-but-not-fully-wedged. Every
+   * resolved PID is cross-checked against the live process table AND against
+   * this specific session's own socket file before being trusted.
+   */
+  private resolveDaemonPid(): number | null {
+    try {
+      const pidFile = path.join(os.homedir(), '.agent-browser', `${this.session}.pid`);
+      const raw = readFileSync(pidFile, 'utf8').trim();
+      const pid = Number(raw);
+      if (pid && this.pidOwnsThisSession(pid)) return pid;
+    } catch {
+      // file missing/unreadable — fall through to the IPC-based lookup
+    }
     try {
       const infoResult = spawnSync(
         this.binary,
         ['--session', this.session, 'session', 'info', '--json'],
-        { encoding: 'utf8', timeout: 8_000 },
+        { encoding: 'utf8', timeout: 5_000 },
       );
       const parsed = this.tryParseJson((infoResult.stdout ?? '').trim());
       const pid = (parsed?.data as { pid?: number } | undefined)?.pid;
-      if (pid) {
-        spawnSync('pkill', ['-9', '-P', String(pid)], { timeout: 5_000 }); // Chrome children
-        spawnSync('kill', ['-9', String(pid)], { timeout: 5_000 }); // the daemon itself
-        killedSpecific = true;
-      }
+      if (pid && this.pidOwnsThisSession(pid)) return pid;
     } catch {
-      // best-effort — fall through to the broad kill below
+      // best-effort — caller decides how to handle a null result
     }
-    if (!killedSpecific) {
-      console.warn('[browser] could not resolve a session-specific PID — falling back to a broad kill (affects ALL sessions)');
-      try {
-        spawnSync('pkill', ['-9', '-f', 'agent-browser'], { timeout: 10_000 });
-        spawnSync('pkill', ['-9', '-f', 'Chrome for Testing'], { timeout: 10_000 });
-      } catch {
-        // best-effort
-      }
+    return null;
+  }
+
+  /**
+   * A PID matching "some agent-browser process" is NOT enough — a stale
+   * `.pid` file plus normal OS PID reuse (confirmed to happen fast under
+   * this project's own documented high-concurrency usage: many daemons
+   * spawned/killed/respawned in the same window) can point straight at a
+   * DIFFERENT, healthy, concurrently-running session's daemon, which is
+   * exactly the 4x-confirmed collateral-kill class this rewrite exists to
+   * close — checking the command name alone doesn't rule that out. Every
+   * agent-browser daemon holds its OWN `<session>.sock` file open for as
+   * long as it's alive (confirmed live via `lsof -p <pid>`); requiring that
+   * exact file to appear in the PID's open-file table is a direct,
+   * session-specific ownership check, not just a process-name guess.
+   */
+  private pidOwnsThisSession(pid: number): boolean {
+    try {
+      const result = spawnSync('ps', ['-p', String(pid), '-o', 'command='], {
+        encoding: 'utf8',
+        timeout: 3_000,
+      });
+      if (!/agent-browser/i.test((result.stdout ?? '').trim())) return false;
+      const sockPath = path.join(os.homedir(), '.agent-browser', `${this.session}.sock`);
+      const lsof = spawnSync('lsof', ['-p', String(pid)], { encoding: 'utf8', timeout: 3_000 });
+      return (lsof.stdout ?? '').includes(sockPath);
+    } catch {
+      return false;
     }
-    // give the OS a moment to reap and free ports/memory before respawn
-    spawnSync('sleep', ['3']);
-    this.cursorInjected = false;
-    this.consecutiveTimeouts = 0;
-    return true;
   }
 
   run(args: string[], options: { json?: boolean; timeoutMs?: number } = {}): {

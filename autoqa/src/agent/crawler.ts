@@ -398,7 +398,15 @@ export async function explore(
       const msg = error instanceof Error ? error.message : String(error);
       console.warn(`[crawl] error while processing ${item.url}: ${msg} — skipping to next page`);
       if (/timed out|consecutiveTimeouts/i.test(msg) || browser.consecutiveTimeouts >= 2) {
-        browser.recycle();
+        // recycle() can now legitimately no-op (return false) rather than always
+        // attempting some kill — a wedged daemon it couldn't recover is still
+        // wedged, so every remaining queued page would otherwise silently time
+        // out one by one with no signal beyond individually-logged skips.
+        // Abort the crawl outright instead of burning through the whole queue.
+        if (!browser.recycle()) {
+          console.warn('[crawl] daemon recycle failed — aborting crawl early rather than timing out on every remaining page');
+          break;
+        }
       }
     }
   }
@@ -527,10 +535,16 @@ export async function explore(
       console.log('[crawl] deep: all known entry points already walked (delete a walk via `review` to re-walk)');
     }
     const walkEvidenceDir = path.join(state.dir, 'walks');
+    // Shared across every entry walked this crawl — lets a later walk (or a later
+    // retry within one walk) know which mode/tab options an earlier one already
+    // selected on a given page, instead of each walk starting with zero memory and
+    // converging on the same 1-2 options every time. See deep-walker.ts's
+    // DeepWalkerDeps.triedChoicesByPage doc comment for the live repro this fixes.
+    const triedChoicesByPage = new Map<string, Set<string>>();
     for (const entry of toWalk) {
       try {
         const result = await deepWalk(
-          { browser, state, llm, explorer, interact, nav, ensureAuth: opts.ensureAuth },
+          { browser, state, llm, explorer, interact, nav, ensureAuth: opts.ensureAuth, triedChoicesByPage },
           entry,
           { evidenceDir: walkEvidenceDir },
         );

@@ -1,11 +1,4 @@
-import path from 'node:path';
 import { AgentBrowser } from './agent-browser.js';
-import {
-  attachEvidenceToStep,
-  captureNetworkAll,
-  capturePageErrors,
-  captureStepArtifacts,
-} from './evidence.js';
 import type { TestStep, VerificationExpectation, VerificationResult } from './types.js';
 import { VerificationLayer } from './verification.js';
 
@@ -16,10 +9,10 @@ export interface StepContext {
   stepsToReproduce: string[];
 }
 
-function slugify(workflow: string): string {
-  return workflow.replace(/[^a-z0-9-]/gi, '-').toLowerCase();
-}
-
+/**
+ * Verify a step and keep signals in memory for the single REPORT.md.
+ * Does not write per-step artifact folders.
+ */
 export async function recordVerifiedStep(
   ctx: StepContext,
   meta: {
@@ -32,32 +25,6 @@ export async function recordVerifiedStep(
 ): Promise<TestStep> {
   const result = await ctx.verification.verifyAfterAction(meta.expectation, meta.waitOptions);
 
-  const networkAllResp = ctx.browser.networkRequestsJson();
-  const networkAll = networkAllResp.data?.requests ?? [];
-
-  const slug = `${String(ctx.stepsToReproduce.length).padStart(2, '0')}-${slugify(meta.workflow)}`;
-  const stepDir = path.join(ctx.evidenceDir, slug);
-
-  const files = await captureStepArtifacts(
-    ctx.evidenceDir,
-    slug,
-    result.signals,
-    ctx.stepsToReproduce,
-    {
-      workflow: meta.workflow,
-      action: meta.action,
-      verdict: result.verdict,
-      reasons: result.reasons,
-    },
-    (filePath) => ctx.browser.screenshotAnnotated(path.resolve(filePath)),
-  );
-
-  captureNetworkAll(stepDir, networkAll);
-  files.push(path.join(stepDir, 'network-all.json'));
-
-  capturePageErrors(stepDir, result.signals.pageErrors);
-  files.push(path.join(stepDir, 'page-errors.json'));
-
   const step: TestStep = {
     workflow: meta.workflow,
     action: meta.action,
@@ -66,13 +33,9 @@ export async function recordVerifiedStep(
     stepsToReproduce: [...ctx.stepsToReproduce],
   };
 
-  const withEvidence = attachEvidenceToStep(step, ctx.evidenceDir, files);
+  console.log(`[${result.verdict.toUpperCase()}] ${meta.workflow}`);
 
-  console.log(
-    `[${result.verdict.toUpperCase()}] ${meta.workflow} → ${path.join(stepDir, 'step-summary.md')}`,
-  );
-
-  return withEvidence;
+  return step;
 }
 
 export function assertStepPassed(step: TestStep): void {

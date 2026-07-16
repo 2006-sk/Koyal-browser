@@ -12,6 +12,52 @@ import {
 export type AudioType = 'Podcast' | 'Narration' | 'Music';
 export type PlanType = 'Standard' | 'Pro';
 
+/** Stable id for the tus trim-upload regression on beta (Next after audio type). */
+export const KOYAL_BUG_TUS_TRIM_UPLOAD = 'koyal-tus-trim-upload-405';
+
+/**
+ * Thrown when the harness correctly drove the UI but Koyal's own Next handler
+ * failed (product/infra bug). Callers should record a FAIL step and end the
+ * scenario — do not treat this as a harness crash.
+ */
+export class KoyalProductBugError extends Error {
+  readonly bugId: string;
+  readonly owner = 'koyal' as const;
+
+  constructor(message: string, bugId: string = KOYAL_BUG_TUS_TRIM_UPLOAD) {
+    super(message);
+    this.name = 'KoyalProductBugError';
+    this.bugId = bugId;
+  }
+}
+
+export function isKoyalProductBug(error: unknown): error is KoyalProductBugError {
+  return error instanceof KoyalProductBugError;
+}
+
+/** Detect tus / performTrimAndUpload / handleNext console failures after Next. */
+export function readTusTrimUploadBug(browser: AgentBrowser): string | null {
+  try {
+    const messages = browser.consoleJson()?.data?.messages ?? [];
+    const hit = messages.find((m) =>
+      /tus upload failed|performTrimAndUpload|Error in handleNext|uploads\/tus|unexpected response while uploading chunk/i.test(
+        m.text,
+      ),
+    );
+    if (!hit) return null;
+    return (
+      `[Koyal product bug · ${KOYAL_BUG_TUS_TRIM_UPLOAD}] ` +
+      `Clicking Next on Choose Audio Type calls performTrimAndUpload; tus PATCH ` +
+      `/api/user/uploads/tus/* returns nginx HTTP 405 Not Allowed on beta.koyal.ai. ` +
+      `UI steps through audio type succeeded; the app cannot advance to Story Type. ` +
+      `Console: ${hit.text.slice(0, 220)}. ` +
+      `Owner: Koyal (not the QA harness). Last known good full WAV run: 2026-07-11.`
+    );
+  } catch {
+    return null;
+  }
+}
+
 export class AudioWizardPage {
   constructor(private readonly browser: AgentBrowser) {}
 
@@ -252,21 +298,23 @@ export class AudioWizardPage {
 
   clickNext(): void {
     this.dismissCreditModal();
+    this.waitForNextEnabled(config.verificationMaxWaitMs);
     let snap = this.browser.snapshotInteractive();
     let next = refForEnabledButton(snap, 'Next');
     if (!next) {
       snap = this.browser.snapshotFull();
       next = refForEnabledButton(snap, 'Next');
     }
-    if (!next) {
-      this.browser.clickButtonByText('Next', true);
-      this.browser.wait(config.actionDelayMs);
-      return;
-    }
-    try {
-      this.browser.clickVisible(next);
-    } catch {
-      this.browser.clickButtonByText('Next', true);
+    if (next) {
+      try {
+        this.browser.clickVisible(next);
+      } catch {
+        if (!this.browser.clickButtonByText('Next', true)) {
+          throw new Error(`Next click failed (enabled ref ${next}) at ${this.browser.getUrl()}`);
+        }
+      }
+    } else if (!this.browser.clickButtonByText('Next', true)) {
+      throw new Error(`Next is not clickable at ${this.browser.getUrl()}`);
     }
     this.browser.wait(config.actionDelayMs);
   }
@@ -274,8 +322,84 @@ export class AudioWizardPage {
   selectAudioType(type: AudioType, multilingual: boolean): void {
     this.browser.clickButtonByText(type, true);
     this.browser.wait(800);
-    this.browser.clickButtonByText(multilingual ? 'Yes' : 'No', true);
+    this.answerMultilingual(multilingual);
+  }
+
+  /**
+   * Multilingual Yes/No is required before Next enables on the audio-type screen.
+   * Snapshot after type select shows Next [disabled] until one of these is chosen.
+   */
+  answerMultilingual(multilingual: boolean): void {
+    const label = multilingual ? 'Yes' : 'No';
+    const snap = this.browser.snapshotInteractive();
+    if (!/is the content multilingual/i.test(snap) && !new RegExp(`button "${label}"`, 'i').test(snap)) {
+      // Already past this gate (or UI variant without the question).
+      return;
+    }
+    // Prefer exact button-"No"/"Yes" lines — loose text click can hit unrelated controls.
+    const ref = refForInteractiveSnapshot(snap, new RegExp(`button "${label}"`, 'i'));
+    if (ref) {
+      this.browser.clickVisible(ref);
+    } else if (!this.browser.clickButtonByText(label, true)) {
+      throw new Error(`Could not click multilingual "${label}" at ${this.browser.getUrl()}`);
+    }
     this.browser.wait(800);
+    this.waitForNextEnabled(config.verificationMaxWaitMs);
+  }
+
+  /**
+   * Leave Choose Audio Type → Story Type. Retries multilingual+Next if the SPA
+   * swallows the first click, and waits through Analyzing/Uploading.
+   *
+   * On Next, Koyal runs `performTrimAndUpload` (tus). If that API is broken,
+   * throws {@link KoyalProductBugError} so the scenario can record a FAIL
+   * (product bug found — not a harness crash).
+   */
+  advanceToStoryType(preferredType: AudioType = 'Narration'): void {
+    const maxMs = Math.max(config.verificationMaxWaitMs, config.transcriptWaitMs);
+    const deadline = Date.now() + maxMs;
+    let attempts = 0;
+
+    const onStoryType = (url: string, snap: string): boolean =>
+      audioSelectors.storyType.heading.test(snap) ||
+      /selectStoryType/i.test(url) ||
+      (audioSelectors.storyType.conceptDriven.test(snap) &&
+        audioSelectors.storyType.characterDriven.test(snap) &&
+        !audioSelectors.audioUpload.chooseAudioType.test(snap));
+
+    while (Date.now() < deadline) {
+      const url = this.browser.getUrl();
+      const snap = this.browser.snapshotInteractive();
+
+      if (onStoryType(url, snap)) return;
+
+      const tusErr = readTusTrimUploadBug(this.browser);
+      if (tusErr) throw new KoyalProductBugError(tusErr);
+
+      if (audioSelectors.audioUpload.chooseAudioType.test(snap)) {
+        attempts++;
+        if (attempts > 4) {
+          const tusLate = readTusTrimUploadBug(this.browser);
+          if (tusLate) throw new KoyalProductBugError(tusLate);
+          throw new Error(
+            `Still on Choose Audio Type after ${attempts} advance attempts at ${url}`,
+          );
+        }
+        this.browser.clearSignals();
+        this.selectAudioType(preferredType, false);
+        this.clickNext();
+        this.browser.wait(2500);
+        continue;
+      }
+
+      this.browser.wait(config.verificationPollMs);
+    }
+
+    const tusLate = readTusTrimUploadBug(this.browser);
+    if (tusLate) throw new KoyalProductBugError(tusLate);
+    throw new Error(
+      `Timed out waiting for story type (${maxMs}ms) url=${this.browser.getUrl()} snap=${this.browser.snapshotInteractive().slice(0, 400)}`,
+    );
   }
 
   selectConceptDriven(): void {
@@ -310,15 +434,14 @@ export class AudioWizardPage {
 
     const snap = this.browser.snapshotInteractive();
     if (audioSelectors.audioUpload.chooseAudioType.test(snap)) {
-      this.selectAudioType('Podcast', false);
-      this.clickNext();
+      this.advanceToStoryType('Podcast');
+    } else {
+      this.waitForSnapshotCondition(
+        (s, url) => audioSelectors.storyType.heading.test(s) || /selectStoryType/.test(url),
+        config.verificationMaxWaitMs,
+        'story type selection',
+      );
     }
-
-    this.waitForSnapshotCondition(
-      (snap, url) => audioSelectors.storyType.heading.test(snap) || /selectStoryType/.test(url),
-      config.verificationMaxWaitMs,
-      'story type selection',
-    );
     this.selectConceptDriven();
     this.clickNext();
   }

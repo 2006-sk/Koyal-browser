@@ -36,13 +36,20 @@ function waitForAuthenticated(browser: AgentBrowser, maxMs: number): boolean {
  * silently discarded by `sitemap.origin` alone, stranding the very first
  * navigation of the run on the site root instead of the requested entry point.
  */
-function authProbeUrl(state: SiteState): string {
+/**
+ * `isKnownGate` is true only when a PREVIOUSLY-CONFIRMED `requiresAuth` page's own
+ * URL was used — strong evidence, since reaching that specific page without a
+ * gate really does mean an active session. The fallback (bare startUrl/origin)
+ * carries no such guarantee: plenty of sites have a perfectly public homepage
+ * regardless of auth state, so landing there non-gated is NOT proof of anything.
+ */
+function authProbeUrl(state: SiteState): { url: string; isKnownGate: boolean } {
   const authedPage = Object.values(state.sitemap.pages).find(
     (p) => p.requiresAuth && p.urlPatterns.some((u) => !u.includes(':id')),
   );
   const pattern = authedPage?.urlPatterns.find((u) => !u.includes(':id'));
-  if (pattern) return `${state.sitemap.origin}${pattern}`;
-  return state.startUrl || state.sitemap.origin;
+  if (pattern) return { url: `${state.sitemap.origin}${pattern}`, isKnownGate: true };
+  return { url: state.startUrl || state.sitemap.origin, isKnownGate: false };
 }
 
 async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; password: string }> {
@@ -94,10 +101,25 @@ async function resolveCredentials(ctx: AuthContext): Promise<{ email: string; pa
  * NEXT flow ("Build a product comparison", entry = the unauthenticated home
  * page, no login involved at all) misread that leftover form as "this site
  * requires login," prompting for credentials no flow on this site needed.
+ *
+ * `forceAttempt` (default false) skips step 1 (silent-restore / not-gated
+ * probe) entirely and goes straight to a REAL, credentialed login attempt at
+ * whatever the browser's CURRENT position already is. It exists for exactly
+ * one caller: flow-runner.ts's login-shaped-milestone branch, after a first
+ * plain call already came back having found no gate and no login has ever
+ * succeeded this run. Before this option existed, that caller's only recourse
+ * was to hand the raw, credential-less milestone goal to the generic Explorer
+ * — which has no channel to real secrets and can only guess/hallucinate
+ * credentials, reintroducing the exact anti-pattern this module exists to
+ * prevent (bstackdemo.com, found via code review 2026-07-14). `forceAttempt`
+ * reuses this function's own already-correct credentialed-login machinery
+ * (steps 2-4 below) instead, and — critically — never navigates away first,
+ * so it operates on the milestone's own current position rather than an
+ * unrelated probe page.
  */
 export async function ensureAuthenticated(
   ctx: AuthContext,
-  opts: { trustCurrentGate?: boolean } = {},
+  opts: { trustCurrentGate?: boolean; forceAttempt?: boolean } = {},
 ): Promise<void> {
   const { browser, state } = ctx;
   const trustCurrentGate = opts.trustCurrentGate ?? true;
@@ -119,35 +141,59 @@ export async function ensureAuthenticated(
   const alreadyOnRealLoginGate = trustCurrentGate && isGated(browser);
 
   // 1. Silent path: restore saved storage state
-  const probeUrl = authProbeUrl(state);
-  if (fs.existsSync(state.authStatePath)) {
-    try {
-      browser.stateLoad(state.authStatePath);
-      browser.wait(500);
-    } catch {
-      // corrupted state — fall through to fresh login
-    }
-    // stateLoad() only applies cookies via CDP — it never reloads/re-renders the
-    // current page, so the visible DOM stays whatever it was BEFORE the cookies
-    // landed. Skipping navigation entirely here (as the earlier version did) left
-    // waitForAuthenticated polling a static, stale, pre-restore document that could
-    // never change, guaranteeing "expired — logging in fresh" every time even with a
-    // perfectly valid session. Reload the CURRENT url (not probeUrl) when already on
-    // a real login gate, so the cookies take visible effect without bouncing away to
-    // an ungated probe page.
-    browser.open(alreadyOnRealLoginGate ? browser.getUrl() : probeUrl);
-    if (waitForAuthenticated(browser, alreadyOnRealLoginGate ? 5000 : 15000)) {
-      console.log('[auth] session restored silently');
-      return;
-    }
-    console.log('[auth] saved session expired — logging in fresh');
-  } else if (alreadyOnRealLoginGate) {
-    console.log('[auth] already on a real login gate — skipping the generic probe, logging in directly');
-  } else {
-    browser.open(probeUrl);
-    if (waitForAuthenticated(browser, 8000)) {
-      console.log('[auth] site is not auth-gated (or already authenticated)');
-      return;
+  const probe = authProbeUrl(state);
+  if (!opts.forceAttempt) {
+    if (fs.existsSync(state.authStatePath)) {
+      try {
+        browser.stateLoad(state.authStatePath);
+        browser.wait(500);
+      } catch {
+        // corrupted state — fall through to fresh login
+      }
+      // stateLoad() only applies cookies via CDP — it never reloads/re-renders the
+      // current page, so the visible DOM stays whatever it was BEFORE the cookies
+      // landed. Skipping navigation entirely here (as the earlier version did) left
+      // waitForAuthenticated polling a static, stale, pre-restore document that could
+      // never change, guaranteeing "expired — logging in fresh" every time even with a
+      // perfectly valid session. Reload the CURRENT url (not probe.url) when already on
+      // a real login gate, so the cookies take visible effect without bouncing away to
+      // an ungated probe page.
+      browser.open(alreadyOnRealLoginGate ? browser.getUrl() : probe.url);
+      if (waitForAuthenticated(browser, alreadyOnRealLoginGate ? 5000 : 15000)) {
+        console.log('[auth] session restored silently');
+        // Only trust this as a CONFIRMED login when the signal backing it is
+        // strong: either we were already sitting on a genuine, detected login
+        // gate before the cookies applied (isGated flipped true→false is direct
+        // evidence), or the probe itself was a previously-confirmed requiresAuth
+        // page (reaching it non-gated is real evidence of an active session).
+        // The weak fallback (bare startUrl/origin, never confirmed as a gate)
+        // being non-gated proves nothing — plenty of sites have a public
+        // homepage regardless of auth state — so don't mark the whole run
+        // "authenticated" off that alone; a login-shaped milestone that later
+        // needs to know for sure will force a real attempt via `forceAttempt`.
+        if (alreadyOnRealLoginGate || probe.isKnownGate) {
+          state.authenticatedThisRun = true;
+        } else {
+          console.log('[auth] (restore looked fine, but only against an unconfirmed probe page — not marking a confirmed login yet)');
+        }
+        return;
+      }
+      console.log('[auth] saved session expired — logging in fresh');
+    } else if (alreadyOnRealLoginGate) {
+      console.log('[auth] already on a real login gate — skipping the generic probe, logging in directly');
+    } else {
+      browser.open(probe.url);
+      if (waitForAuthenticated(browser, 8000)) {
+        // NOT the same thing as "already authenticated" — this can also mean the
+        // generic probe simply found no login gate anywhere (e.g. a public-catalog
+        // site whose real login control sits behind an account icon, never on the
+        // probe page itself). Deliberately do NOT set authenticatedThisRun here —
+        // callers (flow-runner.ts's login-shaped-milestone branch) need to tell
+        // these two cases apart, since silently treating "no gate found" as "login
+        // successful" was a real, disclosed false-pass (bstackdemo.com, 2026-07-10).
+        console.log('[auth] site is not auth-gated (or already authenticated)');
+        return;
+      }
     }
   }
 
@@ -161,6 +207,7 @@ export async function ensureAuthenticated(
     });
     if (replay.ok && waitForAuthenticated(browser, 10000)) {
       browser.stateSave(state.authStatePath);
+      state.authenticatedThisRun = true;
       console.log('[auth] logged in via recipe replay');
       return;
     }
@@ -179,7 +226,7 @@ export async function ensureAuthenticated(
   // genuinely-wrong credentials, which will fail identically on the retry too.
   if (!result.success) {
     console.log(`[auth] first login attempt failed (${result.error ?? 'unknown'}) — retrying once fresh`);
-    browser.open(probeUrl);
+    browser.open(probe.url);
     browser.wait(1000);
     result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12 });
   }
@@ -207,6 +254,7 @@ export async function ensureAuthenticated(
   }
 
   browser.stateSave(state.authStatePath);
+  state.authenticatedThisRun = true;
   recordFromExplorer(state, 'auth:login', result, { secrets: creds });
   console.log('[auth] logged in via explorer; session + recipe saved');
 }

@@ -144,4 +144,8 @@ reports/<runId>/
 - `scenarios/audio-mp3.ts` — Test 2 wrapper
 - `lib/audio-edits.ts` — targeted field editing
 - `lib/audio-nav.ts` — resilient clicks
-- `lib/page-audio.ts` — wizard waits, upload tab restore
+- `lib/page-audio.ts` — wizard waits, upload tab restore; throws `KoyalProductBugError` for confirmed Koyal defects
+
+## Known Koyal bugs
+
+See [`KNOWN_KOYAL_BUGS.md`](./KNOWN_KOYAL_BUGS.md). As of 2026-07-15, **Next after Choose Audio Type** is blocked by tus `PATCH /api/user/uploads/tus/*` → nginx **405**. The suite records that as a **FAIL / Koyal product bug** and rejects the flow (harness OK).

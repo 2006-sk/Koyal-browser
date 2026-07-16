@@ -58,7 +58,10 @@ export function finalizeRunReport(report: RunReport): RunReport {
   };
 }
 
-export function writeRunReport(report: RunReport, reportsRoot: string): string {
+export function writeRunReport(
+  report: RunReport,
+  reportsRoot: string,
+): { reportPath: string; runDir: string; bugsPath: string | null } {
   const runDir = path.join(reportsRoot, report.runId);
   ensureDir(runDir);
 
@@ -68,7 +71,39 @@ export function writeRunReport(report: RunReport, reportsRoot: string): string {
   fs.writeFileSync(mdPath, renderMarkdownReport(report, runDir), 'utf8');
   fs.writeFileSync(jsonPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
 
-  return runDir;
+  const fails = report.scenarios.flatMap((s) =>
+    s.steps
+      .filter((step) => step.result.verdict === 'fail')
+      .map((step) => ({ scenario: s, step })),
+  );
+
+  let bugsPath: string | null = null;
+  if (fails.length) {
+    const bugLines: string[] = [
+      '# Koyal product bugs (from login QA)',
+      '',
+      `_Run \`${report.runId}\` · ${report.finishedAt || report.startedAt}_`,
+      '',
+    ];
+    for (const { scenario, step } of fails) {
+      bugLines.push(`## ${scenario.id ?? scenario.name} — ${step.workflow}`);
+      bugLines.push('');
+      bugLines.push(`- **Severity:** ${step.result.severity}`);
+      bugLines.push(`- **Action:** ${step.action}`);
+      bugLines.push(`- **Expected:** ${step.expected}`);
+      bugLines.push(`- **URL:** ${step.result.signals.url}`);
+      bugLines.push(`- **Actual:** ${step.result.actual}`);
+      bugLines.push('');
+      bugLines.push('### Reasons');
+      bugLines.push('');
+      for (const r of step.result.reasons) bugLines.push(`- ${r}`);
+      bugLines.push('');
+    }
+    bugsPath = path.join(runDir, 'KOYAL_BUGS.md');
+    fs.writeFileSync(bugsPath, `${bugLines.join('\n')}\n`, 'utf8');
+  }
+
+  return { reportPath: mdPath, runDir, bugsPath };
 }
 
 export function appendReportNotes(runDir: string): void {

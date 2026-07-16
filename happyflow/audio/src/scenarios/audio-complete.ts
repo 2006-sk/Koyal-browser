@@ -10,8 +10,8 @@ import {
   editTranscriptLine,
   snapshotHasText,
 } from '../lib/audio-edits.js';
-import { AudioNav, waitUntil, waitUntilNextEnabled } from '../lib/audio-nav.js';
-import { assertNoStepFailures, probeStep, STEP_BASE } from '../lib/audio-scenario-helpers.js';
+import { AudioNav, advanceFromThemePage, waitUntil, waitUntilNextEnabled } from '../lib/audio-nav.js';
+import { assertNoStepFailures, isKoyalProductBug, probeStep, recordKoyalProductBugStep, STEP_BASE } from '../lib/audio-scenario-helpers.js';
 import { AgentBrowser, isButtonDisabled, refForEnabledButton } from '../lib/agent-browser.js';
 import { AudioWizardPage } from '../lib/page-audio.js';
 import { SessionPage } from '../lib/page-session.js';
@@ -184,19 +184,46 @@ export async function runAudioCompleteFlow(
         }),
       );
     }
-    nav.click({ label: 'No', exact: true, optional: true });
-    wizard.clickNext();
+    try {
+      wizard.advanceToStoryType('Narration');
+    } catch (error) {
+      if (isKoyalProductBug(error)) {
+        steps.push(await recordKoyalProductBugStep(ctx(), repro, error));
+        return {
+          id: options.scenarioId,
+          name: options.scenarioName,
+          steps,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        };
+      }
+      throw error;
+    }
   } else if (detectWizardPhase(browser.getUrl(), browser.snapshotInteractive()) === 'audio-type') {
-    nav.click({ label: 'Podcast', exact: true });
-    nav.click({ label: 'No', exact: true, optional: true });
-    wizard.clickNext();
+    try {
+      wizard.advanceToStoryType('Podcast');
+    } catch (error) {
+      if (isKoyalProductBug(error)) {
+        steps.push(await recordKoyalProductBugStep(ctx(), repro, error));
+        return {
+          id: options.scenarioId,
+          name: options.scenarioName,
+          steps,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+        };
+      }
+      throw error;
+    }
+  } else {
+    // Already on story type (skipped audio-type UI) — nothing to do.
   }
 
   // ── STORY TYPE ────────────────────────────────────────────────
   waitUntil(
     browser,
     (u, s) => detectWizardPhase(u, s) === 'story-type',
-    config.verificationMaxWaitMs,
+    Math.max(config.verificationMaxWaitMs, 15_000),
     'story type',
   );
 
@@ -287,6 +314,7 @@ export async function runAudioCompleteFlow(
     );
   }
 
+  // Reach Theme — processing wait is OK here (transcript → theme). Cap UI wait separately below.
   waitUntilNextEnabled(browser, config.transcriptWaitMs);
   wizard.clickNext();
 
@@ -298,8 +326,11 @@ export async function runAudioCompleteFlow(
     'theme step',
   );
 
+  // Do NOT click "Describe New Theme" — that opens an overlay that covers fields/Save.
   nav.click({ label: 'Edit Text', optional: true });
-  nav.click({ label: 'Describe New Theme', optional: true });
+  wizard.dismissCreditModal();
+  nav.dismissOverlays();
+
   const themeEdits = editThemeFields(browser, THEME_VISUAL, THEME_NARRATIVE);
   steps.push(
     await probeStep(ctx(), repro, 'theme-edit', 'Edit Visual Style + Narrative', 'Both fields in snapshot', {
@@ -315,8 +346,16 @@ export async function runAudioCompleteFlow(
     );
   }
 
-  waitUntilNextEnabled(browser, config.transcriptWaitMs);
-  wizard.clickNext();
+  // Next on Theme must enable after Save — never burn 180–300s idle here.
+  advanceFromThemePage(
+    browser,
+    () => wizard.clickNext(),
+    () => {
+      wizard.dismissCreditModal();
+      nav.dismissOverlays();
+    },
+    30_000,
+  );
 
   // ── STYLE ─────────────────────────────────────────────────────
   waitUntil(

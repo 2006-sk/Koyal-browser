@@ -112,8 +112,11 @@ export class AgentBrowser {
     this.cursorInjected = false;
   }
 
-  recycle(): boolean {
-    console.log('[browser] recycling wedged daemon (force-kill + respawn)');
+  /**
+   * Force-kill this session's browser daemon (startup cleanup or after a wedge).
+   */
+  recycle(reason = 'cleanup'): boolean {
+    console.log(`[browser] recycling session daemon (${reason})`);
     let killedSpecific = false;
     try {
       const infoResult = spawnSync(

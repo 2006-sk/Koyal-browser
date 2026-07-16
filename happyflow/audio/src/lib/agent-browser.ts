@@ -138,10 +138,10 @@ export class AgentBrowser {
   }
 
   /**
-   * Force-kill this session's browser daemon when CDP has wedged (graceful close hangs).
+   * Force-kill this session's browser daemon (startup cleanup or after a wedge).
    */
-  recycle(): boolean {
-    console.log('[browser] recycling wedged daemon (force-kill + respawn)');
+  recycle(reason = 'cleanup'): boolean {
+    console.log(`[browser] recycling session daemon (${reason})`);
     let killedSpecific = false;
     try {
       const infoResult = spawnSync(

@@ -156,9 +156,19 @@ async function main(): Promise<void> {
   }
 
   const finalReport = finalizeRunReport(report);
-  const outputDir = writeRunReport(finalReport, config.reportsDir);
+  const { runDir: outputDir, bugsPath } = writeRunReport(finalReport, config.reportsDir);
   writeArtifactsIndex(outputDir, finalReport.scenarios);
   appendReportNotes(outputDir);
+
+  if (bugsPath) {
+    const { notifySlackBugs } = await import('./lib/slack-bugs.js');
+    const fs = await import('node:fs');
+    await notifySlackBugs({
+      suite: 'login',
+      runId: finalReport.runId,
+      markdown: fs.readFileSync(bugsPath, 'utf8'),
+    });
+  }
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`Report:     ${outputDir}/report.md`);

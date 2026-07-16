@@ -115,21 +115,67 @@ export function editTranscriptLine(browser: AgentBrowser, text: string): FillRes
   return fillEditableByIndex(browser, 0, text);
 }
 
-/** Story Theme — Visual Style + Visual Narrative (label-first, then index fallback). */
+/** Story Theme — fill Visual Style + Visual Narrative and click each Save. */
 export function editThemeFields(
   browser: AgentBrowser,
   visualStyle: string,
   narrative: string,
 ): { visual: FillResult; narrative: FillResult } {
-  let visual = fillFieldByHint(browser, 'Visual Style', visualStyle);
-  if (!visual.ok) visual = fillFieldByHint(browser, 'visual', visualStyle);
-  if (!visual.ok) visual = fillEditableByIndex(browser, 0, visualStyle);
-
-  let narr = fillFieldByHint(browser, 'Visual Narrative', narrative);
-  if (!narr.ok) narr = fillFieldByHint(browser, 'Narrative', narrative);
-  if (!narr.ok) narr = fillEditableByIndex(browser, 1, narrative);
-
+  const visual = fillThemeField(browser, 'Visual Style', visualStyle, 0);
+  const narr = fillThemeField(browser, 'Visual Narrative', narrative, 1);
   return { visual, narrative: narr };
+}
+
+function fillThemeField(
+  browser: AgentBrowser,
+  heading: string,
+  text: string,
+  index: number,
+): FillResult {
+  // Close "Create New Theme" / describe overlays that cover the fields
+  browser.evalScript(`
+    (function(){
+      for (const root of document.querySelectorAll('div.overlay,[role=dialog],div.fixed')) {
+        const t = root.textContent || '';
+        if (!/create new theme|describe new theme|describe the theme/i.test(t)) continue;
+        for (const b of root.querySelectorAll('button')) {
+          if (/^(×|✕|x|cancel|close)$/i.test((b.textContent||'').trim())) { b.click(); return; }
+        }
+      }
+    })();
+  `);
+  browser.wait(400);
+
+  let result = fillFieldByHint(browser, heading, text);
+  if (!result.ok) result = fillEditableByIndex(browser, index, text);
+
+  // Theme Next stays disabled until Save — click Save near this heading
+  const headingJson = JSON.stringify(heading);
+  browser.evalScript(`
+    (function(){
+      const h = [...document.querySelectorAll('h1,h2,h3,h4,h5')].find(el =>
+        (el.textContent||'').includes(${headingJson}));
+      let root = h ? h.parentElement : null;
+      for (let i = 0; i < 5 && root; i++) {
+        const btn = [...root.querySelectorAll('button')].find(b =>
+          /^\\s*Save\\s*$/i.test(b.textContent||'') && !b.disabled);
+        if (btn) { btn.click(); return 'SAVED'; }
+        root = root.parentElement;
+      }
+      const any = [...document.querySelectorAll('button')].find(b =>
+        /^\\s*Save\\s*$/i.test(b.textContent||'') && !b.disabled);
+      if (any) { any.click(); return 'SAVED_ANY'; }
+      return 'NO_SAVE';
+    })();
+  `);
+  browser.wait(800);
+
+  const snap = `${browser.snapshotInteractive()}\n${browser.snapshotFull()}`;
+  const snippet = text.slice(0, Math.min(24, text.length));
+  if (snapshotIncludes(snap, snippet)) {
+    return { ok: true, detail: `theme "${heading}" filled + saved` };
+  }
+  return { ok: false, detail: result.detail };
 }
 
 export function editSceneDescription(browser: AgentBrowser, text: string): FillResult {

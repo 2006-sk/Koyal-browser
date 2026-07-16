@@ -157,6 +157,8 @@ DEEP FUNCTIONAL COVERAGE (important): the goal is to prove the PLATFORM works, n
 - Walk multi-step creation wizards to their real terminal artifact, exercising the meaningful choice at each step.
 Include real content edits/creations wherever the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
 
+DISTINCT MODE/VARIANT COVERAGE (critical, easy to under-do): scan each page's Interactives list for a CLUSTER of several mutually-exclusive alternative options that represent different WORKFLOWS or generation modes, not settings — e.g. "Best(select), Top 3(select), Custom(select), Battle(select)" next to one Generate action, or "Video(tab), Image(tab), Video Edit(tab)". When you see this pattern, do NOT just pick one option and write a single flow around it — propose a SEPARATE flow (or at minimum clearly separate milestones) that each exercise a DIFFERENT one of those alternatives end-to-end, so every distinct mode gets tested at least once across the flows you propose. This is about covering every distinct FUNCTION, not enumerating combinations — do not multiply this by unrelated parameters (aspect ratio, duration, filters, sort order); use the default/first value for anything that is a parameter of the SAME workflow rather than an alternative workflow itself. If there are more alternative modes than you have flow slots for, still name each one across the milestones you do write (e.g. "Choose the Battle mode" in one flow, "Choose the Custom mode" in another) rather than repeating the same mode in more than one flow.
+
 Respond with JSON only:
 {
   "flows": [

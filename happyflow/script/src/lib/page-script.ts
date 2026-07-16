@@ -251,10 +251,18 @@ export class ScriptWizardPage {
     label: string,
   ): void {
     const deadline = Date.now() + maxMs;
+    let lastLog = 0;
     while (Date.now() < deadline) {
       const snap = this.browser.snapshotInteractive();
       const url = this.browser.getUrl();
       if (predicate(snap, url)) return;
+      const now = Date.now();
+      if (now - lastLog >= 10_000) {
+        console.log(
+          `[wait] ${label} — still waiting (${Math.round((deadline - now) / 1000)}s left) url=${url}`,
+        );
+        lastLog = now;
+      }
       this.browser.wait(config.verificationPollMs);
     }
     throw new Error(

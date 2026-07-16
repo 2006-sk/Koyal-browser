@@ -82,7 +82,8 @@ function networkStatusSummary(requests: NetworkRequest[]): string {
 function inferSeverity(reasons: string[], verdict: Verdict): Severity {
   if (verdict === 'needs-review') return 'medium';
   const joined = reasons.join(' ').toLowerCase();
-  if (joined.includes('exceeded') && joined.includes('15s')) return 'high';
+  if (joined.includes('product_bug')) return 'high';
+  if (joined.includes('exceeded') && joined.includes('wait')) return 'high';
   if (joined.includes('uncaught') || joined.includes('white screen') || joined.includes('500')) {
     return 'critical';
   }

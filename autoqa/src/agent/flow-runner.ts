@@ -3,7 +3,7 @@ import path from 'node:path';
 import { config } from '../config.js';
 import type { AgentBrowser } from '../core/agent-browser.js';
 import { randomEditMarker } from '../core/edits.js';
-import type { Explorer, ExplorerResult } from '../core/explorer.js';
+import type { Explorer, ExplorerAction, ExplorerResult } from '../core/explorer.js';
 import { patchStepSummaryVerdict, writeJson } from '../core/evidence.js';
 import { scenarioEvidenceDir } from '../core/report.js';
 import { recordVerifiedStep, type StepContext } from '../core/scenario-runner.js';
@@ -393,8 +393,25 @@ function isLoginShapedGoal(goal: string): boolean {
   // strip would otherwise mis-pair "user's" with a LATER real quoted label and
   // swallow genuine unquoted auth wording in between.
   const unquoted = goal.replace(/(?<=^|\s)(['"])[^'"]*\1(?=\s|[.,;:!?]|$)/g, '');
+  // Beyond a quoted clicked-label, "login"/"sign in" also shows up UNQUOTED as a
+  // bare UI-element descriptor in a purely navigational/confirmation milestone —
+  // live-reproduced on filmarena.ai: "Switch back to the 'Login' tab and confirm
+  // the login form is shown" matched the bare-word check on unquoted "login
+  // form" and got routed through the full credentialed ensureAuthenticated
+  // machinery (2 real login attempts, 24 wasted LLM steps) for a milestone that
+  // never asked to enter or submit anything — just navigate to/confirm a tab.
+  // "form/tab/page/screen" immediately after "log(in)/sign in" is the tell (a
+  // passive UI-element noun, unlike "button"/"link" which stay ambiguous with a
+  // real submit action and are deliberately NOT included here); only treat the
+  // bare match as a false alarm when the goal ALSO has no credential-entry
+  // wording anywhere else — a goal that both names the login form AND asks to
+  // enter/submit credentials still wants real auth.
+  const loginAsUiElement = /\b(log ?in|sign ?in)\b\s+(form|tab|page|screen)\b/i.test(unquoted);
+  const hasCredentialWording =
+    (/\b(enter|fill|type|submit)\b/i.test(unquoted) && /\b(credentials?|username|password)\b/i.test(unquoted)) ||
+    /\bcredentials?\b/i.test(unquoted);
   const wantsAuth =
-    /\b(log ?in|sign ?in)\b/i.test(unquoted) ||
+    (/\b(log ?in|sign ?in)\b/i.test(unquoted) && !(loginAsUiElement && !hasCredentialWording)) ||
     (/\b(enter|fill|type|submit)\b/i.test(unquoted) &&
       (/\bcredentials?\b/i.test(unquoted) || (/\busername\b/i.test(unquoted) && /\bpassword\b/i.test(unquoted))));
   const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);
@@ -469,6 +486,48 @@ function isLiteralValueShapedGoal(goal: string): boolean {
   return /\bvalue\s*['"]/i.test(goal) || /\b(exactly|precisely)\s+\d+[- ]?character/i.test(goal);
 }
 
+/** Letters-only, lowercased — strips exactly what the explorer's own literal-value-adaptation instruction strips (digits/hyphens/spaces/special chars) for comparison purposes. */
+function markerLettersOnly(s: string): string {
+  return s.toLowerCase().replace(/[^a-z]/g, '');
+}
+
+/**
+ * Was `value` really this run's edit marker, or a legitimate ADAPTATION of it?
+ * The explorer's own system prompt instructs it to strip disallowed characters
+ * from a literal value when the target field shows a visible format constraint
+ * (e.g. a letters-only name field) — a strict `===` against the raw marker
+ * (which contains digits/a hyphen/a space) would wrongly treat that adapted,
+ * genuinely-typed value as "marker never typed" (found via code review
+ * 2026-07-14). Falls back to a letters-only substring match, guarded by a
+ * minimum length so short/coincidental overlaps can't false-match.
+ */
+function valueLooksLikeMarker(value: string | undefined, marker: string): boolean {
+  if (value === undefined) return false;
+  if (value === marker) return true;
+  const markerLetters = markerLettersOnly(marker);
+  return markerLetters.length >= 6 && markerLettersOnly(value).includes(markerLetters);
+}
+
+/**
+ * Does the explorer's OWN stated reasoning show it recognized an already-done
+ * state, rather than just never having filled the marker for some other reason
+ * (including a premature/hallucinated "done")? Absence of a fill action alone
+ * doesn't distinguish a legitimate idempotent skip from an LLM that gave up or
+ * misjudged completion without ever attempting the edit — found via code
+ * review 2026-07-14: the original fix waived the marker requirement on
+ * absence-of-fill alone, which could silently pass a milestone whose edit
+ * never actually happened. Matches the exact phrasing walked-flow goals
+ * themselves use ("already done ... skip it and just advance" — see
+ * deep-walker.ts's flowFromTrail) plus its natural paraphrases.
+ */
+function looksLikeIdempotentSkipReason(actions: ExplorerAction[]): boolean {
+  return actions.some((a) =>
+    /already (done|exists|added|filled|there|complete)|no need to|not needed|nothing (left|more) to do|skip(ping)? (it|this)/i.test(
+      a.reason ?? '',
+    ),
+  );
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -516,6 +575,8 @@ async function runMilestone(
   const verification = ctx.verification;
   const before = await verification.captureSignals();
 
+  const recipeId = `flow:${flow.id}:${milestone.id}`;
+
   // fill in run-unique edit markers so edits are real and verifiable — only for
   // explicit edit milestones (a 'create' click may involve no text field at all)
   const loginShaped = isLoginShapedGoal(milestone.goal);
@@ -525,13 +586,33 @@ async function runMilestone(
   let goal = milestone.goal;
   let marker: string | undefined;
   if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped && !literalValueShaped) {
-    marker = randomEditMarker('autoqa');
+    // If a recipe already exists for this milestone (walked-flow recipes are
+    // recorded during the deep walk itself, BEFORE flow-testing ever runs —
+    // see deep-walker.ts's own independent `randomEditMarker('autoqa-walk')` —
+    // and a prior test run's recordFromExplorer can do the same), its 'fill'
+    // steps carry a FIXED literal value baked in at recording time. Replay
+    // (RecipePlayer.tryReplay) types that exact recorded value verbatim, no
+    // matter what we generate here — inventing a brand-new random marker in
+    // that case guarantees the post-replay snapshot check requires text that
+    // was never actually typed this run (two independent random strings can
+    // never coincidentally match). Live-reproduced on filmarena.ai's very
+    // first walked-flow test: recipe replayed "autoqa-walk QA-284z0fud6" while
+    // verification demanded "autoqa QA-2cqh35n08" — guaranteed mismatch, every
+    // run, forever. Reuse the recipe's own last recorded fill value as the
+    // marker instead: it matches what replay actually produces, AND — if
+    // replay fails and falls through to a fresh explore below — the goal's
+    // "use exactly" instruction stays consistent with what a retry should type.
+    const existingRecipe = state.recipes[recipeId];
+    const recordedFillValue = existingRecipe?.steps
+      .filter((s) => s.kind === 'fill' && !s.secretRef)
+      .map((s) => (s as { value: string }).value)
+      .pop();
+    marker = recordedFillValue || randomEditMarker('autoqa');
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
     goal = `${goal}\nUse a real, generic search term likely to match existing content (e.g. a common product/category word) — NOT a random or made-up string.`;
   }
 
-  const recipeId = `flow:${flow.id}:${milestone.id}`;
   let explored: ExplorerResult | null = null;
   let replayOk = false;
 
@@ -539,7 +620,29 @@ async function runMilestone(
     console.log('[flow] auth milestone — delegating to the auth module');
     try {
       await ensureAuthenticated(authCtx);
-      replayOk = true; // authenticated; verification below judges the milestone
+      if (state.authenticatedThisRun) {
+        replayOk = true; // a real login (this call or an earlier one this run) — verification below judges the milestone
+      } else {
+        // Real, previously-disclosed gap (bstackdemo.com, 2026-07-10): ensureAuthenticated()
+        // returning without throwing used to be treated as "authenticated" unconditionally,
+        // but it can ALSO mean the generic probe found no login gate anywhere on this site at
+        // all (e.g. a public-catalog site whose real login control sits behind an account icon,
+        // never on the generic probe page) — silently declaring the milestone done with zero
+        // login ever attempted is a false pass. Force a REAL, credentialed login attempt at the
+        // milestone's current position via ensureAuthenticated's own machinery (its `forceAttempt`
+        // option) instead of handing the raw, credential-less goal to the generic explorer — code
+        // review (2026-07-14) found that the generic-explorer version of this fix reintroduced the
+        // exact "LLM guesses/hallucinates credentials" anti-pattern isLoginShapedGoal exists to
+        // prevent, plus a positioning bug (the explorer ran from wherever ensureAuthenticated's own
+        // failed probe had navigated to, not the milestone's actual position).
+        console.log('[flow] auth probe found no gate and no login has succeeded yet this run — forcing a real credentialed login attempt at the current position instead of assuming success');
+        try {
+          await ensureAuthenticated(authCtx, { forceAttempt: true });
+          replayOk = state.authenticatedThisRun;
+        } catch (forceErr) {
+          console.log(`[flow] forced login attempt failed: ${forceErr instanceof Error ? forceErr.message : forceErr}`);
+        }
+      }
     } catch (err) {
       console.log(`[flow] auth milestone failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -589,7 +692,43 @@ async function runMilestone(
     delete base.snapshotIncludesAny;
   }
   if (marker) {
-    base.snapshotIncludesAny = [...(base.snapshotIncludesAny ?? []), marker];
+    // Walked-flow goals deliberately carry an idempotency clause ("if this action
+    // appears already done ... skip it and just advance" — see deep-walker.ts's
+    // flowFromTrail) so a re-run against state a PRIOR run already created (a
+    // character/asset that already exists) doesn't force a duplicate. When the
+    // explorer legitimately takes that path, it calls "done" without ever typing
+    // the marker — there was nothing to type. The marker text can then never
+    // legitimately appear in the final snapshot, yet this check required it
+    // unconditionally, false-failing an otherwise-correct skip. Live-reproduced
+    // twice on koyal (2026-07-14): walked-projects-list-create-your-next-video:m5,
+    // walked-characters-list-new-character:m2. Only require the marker when we
+    // have direct evidence (from the explorer's own recorded actions) that it was
+    // actually typed; recipe-replay/login-shaped paths (explored === null) are
+    // unchanged — this only touches the live-explorer path where the ambiguity
+    // exists.
+    // valueLooksLikeMarker (not strict equality): the explorer's own system prompt
+    // instructs it to ADAPT the literal marker for a format-constrained field (e.g.
+    // strip digits/hyphens/spaces for a letters-only name field) — strict `===`
+    // would misclassify that legitimate, adapted fill as "marker never typed" and
+    // wrongly waive verification on a real edit (found via code review 2026-07-14).
+    const markerTyped =
+      !explored || explored.actions.some((a) => a.action === 'fill' && valueLooksLikeMarker(a.value, marker));
+    // A missing marker is ONLY a legitimate idempotent skip when the explorer's OWN
+    // stated reasoning shows it actually recognized an already-done state — absence
+    // of a fill action ALONE doesn't distinguish that from an LLM that hallucinated
+    // "done" without ever attempting the edit (found via code review 2026-07-14:
+    // the original fix dropped the marker requirement on absence-of-fill alone,
+    // silently passing a milestone whose edit never happened at all).
+    const legitimateSkip = !markerTyped && Boolean(explored) && looksLikeIdempotentSkipReason(explored!.actions);
+    if (markerTyped || !legitimateSkip) {
+      base.snapshotIncludesAny = [...(base.snapshotIncludesAny ?? []), marker];
+    } else {
+      console.log(
+        '[flow] edit milestone completed without ever typing the verification marker ' +
+          '(explorer reasoning confirms it recognized an already-done state — the goal\'s own ' +
+          '"already done, just advance" idempotency clause) — not requiring the marker in the final snapshot',
+      );
+    }
   }
   const expectation = statements.augmentExpectation(base, pageId);
 
@@ -909,11 +1048,19 @@ export async function runFlows(
       // on timeouts. Recycle it and re-auth so the next flow starts on a fresh,
       // healthy daemon instead of cascading the whole test phase into failure.
       if (/timed out|consecutiveTimeouts/i.test(msg) || deps.browser.consecutiveTimeouts >= 2) {
-        deps.browser.recycle();
-        try {
-          await ensureAuthenticated(authCtx);
-        } catch (reauthErr) {
-          console.warn(`[flow] re-auth after recycle failed: ${reauthErr instanceof Error ? reauthErr.message : reauthErr}`);
+        // recycle() can now legitimately no-op (return false) instead of always
+        // attempting some kill — if it did, the daemon is exactly as wedged as
+        // before, so a re-auth attempt against it is certain to fail too; skip
+        // the pointless retry and say so plainly instead of silently proceeding
+        // as if recovery had happened.
+        if (deps.browser.recycle()) {
+          try {
+            await ensureAuthenticated(authCtx);
+          } catch (reauthErr) {
+            console.warn(`[flow] re-auth after recycle failed: ${reauthErr instanceof Error ? reauthErr.message : reauthErr}`);
+          }
+        } else {
+          console.warn('[flow] daemon recycle failed — still wedged; skipping re-auth, next flow will likely hit the same timeout');
         }
       }
     }

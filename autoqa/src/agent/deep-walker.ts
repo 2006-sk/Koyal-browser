@@ -30,6 +30,19 @@ export interface DeepWalkerDeps {
   nav: Nav;
   /** Re-login hook: sessions can expire mid-explore, stranding a walk on the login wall */
   ensureAuth?: () => Promise<void>;
+  /**
+   * Shared across every deepWalk() call in one explore session (crawler.ts owns
+   * the Map, passes the same instance to each entry it walks). Tracks which
+   * radio/tab option labels have already been selected on a given page, so a
+   * later attempt — whether a retry within this walk or a separate walk entry
+   * that lands on the same page — knows to prefer an untried alternative instead
+   * of blindly re-picking (or regressing back to) an option already covered.
+   * Confirmed live on filmarena.ai: 3 separate walk entries into the same
+   * "Best/Top 3/Custom/Battle" mode selector converged on just 2 of 4 options
+   * across 6 total attempts, because each attempt had no idea what a prior one
+   * (in this walk or an earlier walk) had already tried.
+   */
+  triedChoicesByPage?: Map<string, Set<string>>;
 }
 
 export interface DeepWalkEntry {
@@ -80,18 +93,24 @@ function isOffOrigin(url: string, origin: string): boolean {
   }
 }
 
-function advanceGoal(page: PageNode, marker: string): string {
+function advanceGoal(page: PageNode, marker: string, triedChoices: string[] = []): string {
   if (config.probes.exhaustive) {
     // DEEP mode: don't just click through — actually USE the step's features so we
     // test that they work (create a character, edit a scene, change settings), then
     // advance. This is what proves the platform functions, not just that it renders.
+    const alreadyTried =
+      triedChoices.length > 0
+        ? ` Already tried on this step (in this walk or an earlier one): ${triedChoices.join(', ')}. ` +
+          `If other radio/tab/mode options exist that you haven't tried yet, pick one of those instead — ` +
+          `don't repeat or regress back to an option already covered.`
+        : '';
     return (
       `You are one step inside a creation flow. Current step: "${page.title}" (${page.description}). ` +
       `Your job is to EXERCISE this step's real functionality, then advance one screen:\n` +
       `1. If this step lets you CREATE or ADD something (a character, a scene, an item), DO it — ` +
       `click the create/add control, fill any required fields with exactly "${marker}", and confirm the new thing appears.\n` +
       `2. If this step has EDITABLE content (script/scene/prompt text), edit it: insert exactly "${marker}" and verify it shows.\n` +
-      `3. If this step offers CHOICES (story type, style, settings), make a real selection (not necessarily the first — pick a meaningful one).\n` +
+      `3. If this step offers CHOICES (story type, style, settings), make a real selection (not necessarily the first — pick a meaningful one).${alreadyTried}\n` +
       `4. Complete any REQUIRED modal (plan/confirmation) — never close it with ✕ or Cancel; upload via action "upload" if a file picker is required.\n` +
       `Then click the enabled Next/Continue/primary button. Use "done" the moment the screen visibly changes to the next step. ` +
       `If the step has no creatable/editable/selectable content, just advance.`
@@ -446,9 +465,25 @@ export async function deepWalk(
         lastSignature = signature;
       }
 
-      const explored = await explorer.achieveGoal(advanceGoal(page, marker), { maxSteps: 6 });
+      const triedChoices = Array.from(deps.triedChoicesByPage?.get(page.id) ?? []);
+      const explored = await explorer.achieveGoal(advanceGoal(page, marker, triedChoices), { maxSteps: 6 });
       explorations.push(explored);
       browser.wait(1500);
+
+      // Remember which mode/tab options this attempt selected, so a retry within
+      // this walk — or a later, separate walk entry that lands on the same page —
+      // can be told to try something else instead of converging on the same 1-2
+      // options (or regressing back to the default) every time.
+      if (deps.triedChoicesByPage) {
+        const chosen = explored.actions
+          .filter((a) => a.action === 'click' && (a.resolvedRole === 'radio' || a.resolvedRole === 'tab') && a.resolvedLabel)
+          .map((a) => a.resolvedLabel!);
+        if (chosen.length > 0) {
+          const set = deps.triedChoicesByPage.get(page.id) ?? new Set<string>();
+          chosen.forEach((label) => set.add(label));
+          deps.triedChoicesByPage.set(page.id, set);
+        }
+      }
 
       steps.push({
         index: i,

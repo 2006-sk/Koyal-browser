@@ -52,6 +52,15 @@ export class SiteState {
   recipes: Record<string, Recipe>;
   allowlist: Allowlist;
   secrets: Secrets;
+  /**
+   * In-memory only (never persisted) — has a REAL login (silent session
+   * restore, recipe replay, or a full explorer-driven login) actually
+   * succeeded at least once during this process's run? Distinct from
+   * "ensureAuthenticated() returned without throwing," which can also mean
+   * "the generic auth probe found no login gate at all" — a real, disclosed
+   * gap (bstackdemo.com) where those two were conflated. Set by auth.ts.
+   */
+  authenticatedThisRun = false;
 
   constructor(baseUrl: string) {
     this.hostname = new URL(baseUrl).hostname;
