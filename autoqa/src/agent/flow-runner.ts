@@ -10,6 +10,7 @@ import { recordVerifiedStep, type StepContext } from '../core/scenario-runner.js
 import type {
   RunReport,
   ScenarioResult,
+  SignalBundle,
   TestStep,
   VerificationExpectation,
   Verdict,
@@ -378,6 +379,87 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
 function hasAnyPriorRecipe(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): boolean {
   for (let j = 0; j < milestoneIndex; j++) {
     if (deps.player.has(`flow:${flow.id}:${flow.milestones[j].id}`)) return true;
+  }
+  return false;
+}
+
+/** Minimal empty signal bundle for synthetic (skipped) steps — no browser I/O. */
+function emptySignals(url: string): SignalBundle {
+  return {
+    url,
+    title: '',
+    snapshot: { raw: '', interactive: '' },
+    pageErrors: [],
+    consoleMessages: [],
+    consoleErrors: [],
+    networkRequests: [],
+  };
+}
+
+/**
+ * A synthetic step recording that a milestone was NOT tested because an upstream
+ * milestone failed and its position could not be recovered to test this one
+ * independently. Verdict is `needs-review` (honest: neither a pass nor a real
+ * failure of THIS milestone — it simply never ran), with empty signals so the
+ * Slack product-bug filter (fail + real error evidence) never treats it as a bug.
+ * This replaces the old behavior of silently dropping every milestone after a
+ * `break` — a skipped-with-reason record is strictly more honest than a milestone
+ * that vanishes from the report entirely.
+ */
+function skippedStep(
+  flow: Flow,
+  milestone: FlowMilestone,
+  brokenAtId: string,
+  priorGoals: string[],
+): TestStep {
+  const actual = `skipped — not tested because upstream milestone "${brokenAtId}" failed and position could not be recovered to test this one independently`;
+  return {
+    workflow: milestone.id,
+    action: milestone.goal,
+    expected: milestone.goal,
+    result: {
+      verdict: 'needs-review',
+      severity: 'low',
+      expected: milestone.goal,
+      actual,
+      signals: emptySignals('unknown'),
+      reasons: [`skipped: upstream break at ${brokenAtId}`],
+      retried: false,
+    },
+    stepsToReproduce: [...priorGoals, milestone.goal],
+  };
+}
+
+/**
+ * After a milestone FAILS, decide whether the browser can be brought to the NEXT
+ * milestone's expected start so independent later milestones still get tested.
+ * Returns true only when we can CONFIRM a good position (the next milestone's own
+ * guardPhases matches, possibly after replaying prior recipes) — never guesses.
+ * When it can't confirm, the caller records the remaining milestones as skipped
+ * rather than running them from a corrupted post-failure position (which would
+ * mint an untrustworthy verdict — the exact thing this whole area is about).
+ */
+async function tryRecoverAfterBreak(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  nextIndex: number,
+): Promise<boolean> {
+  const next = flow.milestones[nextIndex];
+  const guards = next?.guardPhases;
+  // No guardPhases on the next milestone → we have no reliable way to confirm the
+  // post-failure position is the one it expects, so we can't safely continue.
+  if (!guards?.length) return false;
+  if (guards.includes(currentPageId(deps))) return true;
+  // Rebuild position by replaying prior milestones' recipes — only meaningful when
+  // at least one exists (else replayUpTo strands us at the flow entry, per
+  // hasAnyPriorRecipe's doc comment).
+  if (hasAnyPriorRecipe(deps, flow, nextIndex)) {
+    try {
+      await replayUpTo(deps, flow, nextIndex);
+    } catch {
+      return false;
+    }
+    if (guards.includes(currentPageId(deps))) return true;
   }
   return false;
 }
@@ -793,6 +875,30 @@ async function runMilestone(
     );
   }
 
+  // The SAME false-PASS gap, but for the login-shaped branch (the "m4" class,
+  // task #17). A login-shaped milestone routes through ensureAuthenticated()
+  // (explored === null), so the explorer-failure downgrade above can never fire
+  // for it. When that auth did NOT succeed this run (replayOk stayed false —
+  // neither a silent session-restore nor the forced credentialed attempt
+  // confirmed a login via state.authenticatedThisRun), the deterministic layer
+  // can still record PASS purely from absence of a negative signal: a
+  // silently-failed login usually leaves the page unchanged with no console
+  // error, so nothing objective trips. That is a false pass sitting on top of a
+  // login that never happened. Downgrade the bare 'pass' to needs-review (never
+  // upgrade) — mirroring the explorer-failure case, and honest for the
+  // isLoginShapedGoal false-positive case too (a mis-classified nav milestone on
+  // a public site just gets surfaced for review rather than hard-failed).
+  // Live-reproduced repeatedly and deliberately deferred until now: lambdatest
+  // account-login-gate:m2, expandtesting user-auth-api:m3, webdriveruniversity
+  // login-portal-auth:m1/m2, koyal google-signup-flow (2026-07-16).
+  const loginFailureDowngrade = loginShaped && !replayOk && step.result.verdict === 'pass';
+  if (loginFailureDowngrade) {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(
+      'Login-shaped milestone did not confirm authentication this run (no successful login) — not a verified pass',
+    );
+  }
+
   // Everything below is POST-verdict bookkeeping (KB triage, human escalation,
   // recipe caching) — none of it should be able to lose the verdict `step`
   // already computed above. A browser hiccup here (the daemon wedging between
@@ -940,6 +1046,11 @@ export async function runFlows(
       stepsToReproduce: [],
     };
 
+    // Highest milestone index we started running — lets the outer catch record
+    // any milestones AFTER an uncaught mid-flow exception as skipped instead of
+    // silently dropping them (the-internet.herokuapp.com report-loss variant).
+    let lastAttemptedIndex = -1;
+
     try {
       // Nothing has navigated anywhere for THIS flow yet at this point — the
       // browser is wherever the PREVIOUS flow left it, which is unrelated to
@@ -991,10 +1102,36 @@ export async function runFlows(
         }
 
         ctx.stepsToReproduce.push(milestone.goal);
+        lastAttemptedIndex = mi;
         const { step, marker } = await runMilestone(deps, flow, milestone, mi, ctx, authCtx);
         scenario.steps.push(step);
         if (step.result.verdict === 'fail') {
-          console.log(`[flow] ✗ ${flow.id} broken at ${milestone.id} — moving to next flow`);
+          const remaining = flow.milestones.length - (mi + 1);
+          if (remaining <= 0) {
+            console.log(`[flow] ✗ ${flow.id} broken at ${milestone.id} (final milestone) — flow done`);
+            break;
+          }
+          // Don't abandon the rest of the flow on one failed milestone. Try to
+          // recover position to the next milestone's expected start so
+          // independent later milestones still get tested; only continue if we
+          // can CONFIRM a good position. If we can't, record the remainder as
+          // explicitly skipped (untested due to the upstream break) rather than
+          // silently dropping them (old `break` behavior) or running them from a
+          // corrupted position and minting an untrustworthy verdict.
+          const recovered = await tryRecoverAfterBreak(deps, flow, mi + 1);
+          if (recovered) {
+            console.log(
+              `[flow] milestone ${milestone.id} failed — recovered position; continuing to test remaining ${remaining} milestone(s)`,
+            );
+            continue;
+          }
+          console.log(
+            `[flow] ✗ ${flow.id} broken at ${milestone.id} — could not recover position; recording remaining ${remaining} milestone(s) as skipped`,
+          );
+          const priorGoals = flow.milestones.slice(0, mi + 1).map((m) => m.goal);
+          for (let k = mi + 1; k < flow.milestones.length; k++) {
+            scenario.steps.push(skippedStep(flow, flow.milestones[k], milestone.id, priorGoals));
+          }
           break;
         }
 
@@ -1060,6 +1197,40 @@ export async function runFlows(
           },
           stepsToReproduce: [...ctx.stepsToReproduce],
         });
+      } else if (lastAttemptedIndex >= 0) {
+        // Some milestones ran, then an uncaught exception threw mid-flow (e.g. a
+        // malformed-JSON parse in the explorer's decide step) — previously the
+        // milestone that crashed AND every milestone after it just vanished from
+        // the report (the-internet.herokuapp.com report-loss variant). Record the
+        // crashing milestone as a FAIL carrying the error, and the rest as
+        // skipped, so nothing disappears silently.
+        const recorded = new Set(scenario.steps.map((s) => s.workflow));
+        for (let k = lastAttemptedIndex; k < flow.milestones.length; k++) {
+          const m = flow.milestones[k];
+          if (recorded.has(m.id)) continue;
+          if (k === lastAttemptedIndex) {
+            scenario.steps.push({
+              workflow: m.id,
+              action: m.goal,
+              expected: m.goal,
+              result: {
+                verdict: 'fail',
+                severity: 'high',
+                expected: m.goal,
+                actual: `milestone crashed with an uncaught error: ${msg}`,
+                signals: emptySignals('unknown'),
+                reasons: [msg],
+                retried: false,
+              },
+              stepsToReproduce: [...ctx.stepsToReproduce],
+            });
+          } else {
+            const priorGoals = flow.milestones.slice(0, k).map((mm) => mm.goal);
+            scenario.steps.push(
+              skippedStep(flow, m, flow.milestones[lastAttemptedIndex].id, priorGoals),
+            );
+          }
+        }
       }
       // A wedged browser daemon (heavy-page CDP stall) makes EVERY later flow abort
       // on timeouts. Recycle it and re-auth so the next flow starts on a fresh,
