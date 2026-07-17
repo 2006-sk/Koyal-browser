@@ -10,14 +10,6 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 ## Open — priority order
 
-### #15 — HIGH — `parseJsonFromLlm` crashes the whole flow on a messy LLM reply
-Found 2026-07-17 on a 10-flow koyal deep-run (4 of 10 flows crashed). Root cause: the fallback parser grabs "first `{` to last `}`"; two JSON objects back-to-back (or JSON + trailing prose) glue into invalid JSON, `JSON.parse` throws uncaught, kills the entire flow. Not a Koyal bug — a rare per-call dice roll a big run was bound to hit.
-**Fix (proposed, not built):**
-1. Brace-balanced extraction (count braces, stop at matching close) instead of first/last-`{}`; wrap fallback in try/catch.
-2. In `decideNextAction`, retry the LLM call once on an unparseable reply (usually clean 2nd time); if still bad, record one failed/needs-review step — never crash the flow.
-Part 2 alone would have contained all 4 of this run's aborts to at-most-one-retried-step each.
-Location: `core/llm/client.ts` (`parseJsonFromLlm`) + `core/explorer.ts` (`decideNextAction`).
-
 ### #16-live — validate task #17 on a real login-gated site
 `loginFailureDowngrade` (task #17, shipped 2026-07-16, commit `c13c7e4`) is only validated by code-review + saucedemo no-regression — a clean-auth koyal run never proposes a login-shaped milestone, so the actual downgrade-on-silent-failure branch has never fired live. Run against lambdatest / expandtesting / webdriveruniversity (all have real login-gated flows in history) and confirm a genuinely-failed login gets `needs-review`, not a false `pass`.
 *(Old prose called this "task #16" on 2026-07-17 — collides with the already-shipped Slack-integration #16 from 2026-07-16. Disambiguated here as #16-live.)*
@@ -63,6 +55,7 @@ Found 2026-07-13 on webdriveruniversity. `resolveBlockingDialog` resolves the bl
 
 ## Recently completed / shipped (context, not action items)
 
+- **#15 — `parseJsonFromLlm` crash-the-whole-flow bug.** Fixed 2026-07-17 in worktree branch `worktree-fix-json-parse-crash`, commit `07d33f0`, draft PR [#2](https://github.com/2006-sk/Koyal-browser/pull/2) (not yet merged to `autoqa`). `client.ts`: extracts every brace-balanced candidate, prefers the LAST one that parses (recovers self-correction replies, skips a stray earlier brace). `explorer.ts`: `decideNextAction` retries once on parse/call failure, degrades to one contained `fail` step instead of an uncaught throw; `LlmBudgetExceededError` still propagates. xhigh code review (`wf_48ed55b0-0d5`) found 6 real defects in the first version (credential-redaction bypass, the retry's own unguarded 2nd LLM call, stale-object extraction, wrong-brace anchoring, an idempotent-skip regex collision, silent budget double-consumption) — all fixed in the same commit. 2 lower-severity findings (unify with `proposeFlows`' own retry pattern; retry-stacking with the LLM client's internal retries) left as follow-ups, not fixed. Validated: unit tests for every extraction scenario + mocked-LLM redaction/budget tests, plus a live saucedemo run where a genuine transient "fetch failed" hit both the attempt and the retry and degraded cleanly to one contained FAIL instead of crashing the flow.
 - **#11 — flow-runner no longer silently drops milestones after a mid-flow FAIL.** Shipped + live-validated both branches 2026-07-16/17. Commit `c13c7e4`.
 - **#17 — login-shaped-milestone false-PASS downgrade.** Shipped 2026-07-16, commit `c13c7e4`. Code-reviewed + no-regression only — see #16-live above for the still-needed live trigger.
 - **Two-step logout (opener > logout) + auto-discovery.** Shipped 2026-07-16, commit `8d99b06`. Not yet re-confirmed on OrangeHRM's collapsed-dropdown case specifically.
