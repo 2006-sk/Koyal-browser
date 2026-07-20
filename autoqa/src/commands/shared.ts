@@ -80,7 +80,7 @@ export function bootstrap(): Session {
   const llm = new LlmClient();
   const guard = new Guard(state, interact);
   const player = new RecipePlayer(browser, state, guard);
-  const statements = new Statements(state, interact);
+  const statements = new Statements(state, interact, llm);
 
   const pageIdNow = (): string => {
     try {

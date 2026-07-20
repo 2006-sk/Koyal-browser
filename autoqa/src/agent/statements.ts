@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { parseJsonFromLlm, type LlmClient } from '../core/llm/client.js';
 import type { SignalBundle, VerificationExpectation } from '../core/types.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
@@ -19,7 +20,7 @@ export interface StatementEntry {
   scope: string;
   /** 'snapshot' for visible page text, 'console' for console errors */
   kind: 'snapshot' | 'console';
-  decidedBy: 'human';
+  decidedBy: 'human' | 'llm';
   decidedAt: string;
   seenCount: number;
 }
@@ -133,6 +134,7 @@ export class Statements {
   constructor(
     private readonly state: SiteState,
     private readonly interact: Interact,
+    private readonly llm?: LlmClient,
   ) {}
 
   find(normalized: string): StatementEntry | undefined {
@@ -149,8 +151,13 @@ export class Statements {
   }
 
   /**
-   * Ask-once triage: every unknown candidate gets one inline human classification,
-   * persisted forever. Known candidates just bump seenCount.
+   * Triage unknown candidates. Known ones just bump seenCount. Unknown SNAPSHOT
+   * candidates first go through one batched LLM pass that auto-classifies obvious
+   * NOISE (UI chrome, headings, nav, data/list items) so the human is never asked
+   * about them; everything the model calls an OUTCOME (or is unsure about, or that
+   * the LLM can't decide) falls through to the human, as do ALL console errors.
+   * Success/failure are only ever assigned by the human — the model can only
+   * downgrade snapshot text to noise.
    */
   async triage(
     candidates: StatementCandidate[],
@@ -159,6 +166,7 @@ export class Statements {
     const seen: string[] = [];
     const newlyClassified: string[] = [];
 
+    const unknown: StatementCandidate[] = [];
     for (const candidate of candidates) {
       const known = this.match(candidate.text);
       if (known) {
@@ -166,7 +174,33 @@ export class Statements {
         seen.push(known.normalized);
         continue;
       }
+      unknown.push(candidate);
+    }
 
+    // LLM auto-noise pass — SNAPSHOT candidates ONLY. A snapshot 'noise' entry is
+    // verdict-harmless: it feeds NEITHER augmentExpectation NOR hasSuccessStatement,
+    // it only stops us re-asking — so auto-suppressing it is safe even when the
+    // model is wrong, and snapshot labels are the entire human-prompt flood ("Your
+    // Projects", "Create Asset", character/asset names, …). CONSOLE errors are
+    // deliberately EXCLUDED here: a 'noise'+console entry feeds
+    // allowedConsoleErrorPatterns and would SUPPRESS that console error from ever
+    // failing verification — exactly how the marquee product bug surfaces (Koyal's
+    // S3 scene-gen "Failed to fetch JSON from S3"), so one mislabel there would hide
+    // the very class of bug this tool exists to catch. Console errors always go to
+    // the human below.
+    const snapshotUnknown = unknown.filter((c) => c.kind === 'snapshot');
+    const autoNoise = await this.classifyNoiseWithLlm(snapshotUnknown.map((c) => c.text));
+
+    const needsHuman: StatementCandidate[] = [];
+    snapshotUnknown.forEach((candidate, i) => {
+      if (autoNoise[i]) this.persist(candidate, 'noise', pageId, 'llm', newlyClassified);
+      else needsHuman.push(candidate);
+    });
+    for (const candidate of unknown) {
+      if (candidate.kind === 'console') needsHuman.push(candidate);
+    }
+
+    for (const candidate of needsHuman) {
       const kindLabel = candidate.kind === 'console' ? 'console error' : 'message';
       let answer: StatementClass;
       try {
@@ -180,31 +214,94 @@ export class Statements {
         console.log(`[statements] unanswered, will re-ask next run: "${candidate.text}"`);
         continue;
       }
-
-      const normalized = normalizeStatement(candidate.text);
-      // success/failure classifications FLIP verdicts, so scope them to the page
-      // they were seen on — a global "success" phrase would wrongly pass every
-      // page containing it. 'noise' only SUPPRESSES a benign message, so keeping
-      // it global is low-risk and avoids re-asking about framework warnings.
-      const scope = answer === 'noise' ? 'global' : pageId || 'global';
-      const entry: StatementEntry = {
-        key: statementKey(normalized),
-        normalized,
-        pattern: statementPattern(normalized),
-        raw: candidate.text,
-        classification: answer,
-        scope,
-        kind: candidate.kind,
-        decidedBy: 'human',
-        decidedAt: new Date().toISOString(),
-        seenCount: 1,
-      };
-      this.state.statements.push(entry);
-      newlyClassified.push(`${normalized} → ${answer}`);
+      this.persist(candidate, answer, pageId, 'human', newlyClassified);
     }
 
     if (newlyClassified.length) this.state.saveStatements();
     return { seen, newlyClassified };
+  }
+
+  /** Persist one classified candidate (idempotent on its normalized key). */
+  private persist(
+    candidate: StatementCandidate,
+    answer: StatementClass,
+    pageId: string,
+    decidedBy: 'human' | 'llm',
+    newlyClassified: string[],
+  ): void {
+    const normalized = normalizeStatement(candidate.text);
+    if (this.find(normalized)) return; // already added (e.g. earlier in this batch)
+    // success/failure classifications FLIP verdicts, so scope them to the page
+    // they were seen on — a global "success" phrase would wrongly pass every
+    // page containing it. 'noise' only SUPPRESSES a benign message, so keeping
+    // it global is low-risk and avoids re-asking about framework warnings.
+    const scope = answer === 'noise' ? 'global' : pageId || 'global';
+    this.state.statements.push({
+      key: statementKey(normalized),
+      normalized,
+      pattern: statementPattern(normalized),
+      raw: candidate.text,
+      classification: answer,
+      scope,
+      kind: candidate.kind,
+      decidedBy,
+      decidedAt: new Date().toISOString(),
+      seenCount: 1,
+    });
+    newlyClassified.push(`${normalized} → ${answer}${decidedBy === 'llm' ? ' (llm)' : ''}`);
+  }
+
+  /**
+   * One batched LLM call labelling each snapshot snippet 'noise' (UI chrome,
+   * labels, headings, nav, data/list items) or 'outcome' (reports an action's
+   * result). Returns per-input `true` ONLY where the model is confident it is
+   * noise; anything marked 'outcome', omitted, or unparseable defaults to `false`
+   * (escalate to the human). Any failure — no client, parse error, or over
+   * budget — yields all-`false`, i.e. degrades to today's ask-the-human behavior.
+   * Never called for console candidates (see triage).
+   */
+  private async classifyNoiseWithLlm(texts: string[]): Promise<boolean[]> {
+    const result: boolean[] = new Array(texts.length).fill(false);
+    if (!this.llm || texts.length === 0) return result;
+
+    const numbered = texts.map((t, i) => `${i + 1}. ${JSON.stringify(t)}`).join('\n');
+    const prompt =
+      `You are triaging short text snippets captured from a web page during automated QA.\n` +
+      `For EACH snippet choose exactly one label:\n` +
+      `- "noise": NOT a report of an action's result — UI labels, headings/section titles, ` +
+      `navigation items, button/link/tab text, field labels, placeholder or empty-state text ` +
+      `("No X yet"), and data/list items (names, filenames, IDs, counts, prices).\n` +
+      `- "outcome": DOES report the result of an action — a success confirmation ("Saved", ` +
+      `"X created", "started successfully") or an error/validation/failure message ` +
+      `("required", "invalid", "not found", "failed", "went wrong", "unauthorized").\n` +
+      `When unsure, choose "outcome" — it is safer to escalate than to suppress a real result.\n\n` +
+      `Snippets:\n${numbered}\n\n` +
+      `Return ONLY JSON: {"labels":[{"i":<1-based index>,"label":"noise"|"outcome"}, ...]} ` +
+      `with exactly one entry per snippet.`;
+
+    try {
+      // NB: no `temperature` — some models (e.g. claude-opus-4-8) reject the param
+      // with a 400, which would throw and silently degrade every candidate to the
+      // human. Mirror the explorer's call, which omits it.
+      const raw = await this.llm.complete({
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const parsed = parseJsonFromLlm<{ labels?: { i?: number; label?: string }[] }>(raw);
+      for (const item of parsed.labels ?? []) {
+        if (
+          typeof item.i === 'number' &&
+          item.i >= 1 &&
+          item.i <= texts.length &&
+          item.label === 'noise'
+        ) {
+          result[item.i - 1] = true;
+        }
+      }
+    } catch {
+      // no client / parse failure / over budget → degrade to all-human
+      return new Array(texts.length).fill(false);
+    }
+    return result;
   }
 
   /** Merge the KB into a deterministic expectation. */

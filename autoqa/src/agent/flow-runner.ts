@@ -238,8 +238,9 @@ async function ensureLoggedOutForEntry(
 /**
  * Some create/upload entry points resume prior state (e.g. Koyal's "Create Your
  * Next Video" always resumes the last draft) instead of landing where entry
- * navigation should. Ask once for the label of a "start fresh" control, persist
- * it on the flow (or persist "none" to stop asking), and apply it going forward.
+ * navigation should. Ask once for a site-wide "start fresh" action (a URL or a
+ * control label), persist it on the sitemap (or "none" to stop asking), and
+ * apply it going forward — reused by every flow, mirroring learnedLogoutControl.
  * Only called at true flow start — never during replayUpTo repositioning, where
  * clicking "start fresh" again would blow away the progress being rebuilt.
  *
@@ -324,28 +325,104 @@ async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<vo
     if (await ensureLoggedOutForEntry(deps, flow, [expectedEntryPageId])) return;
   }
 
-  if (flow.entry.freshEntryHint) {
-    if (flow.entry.freshEntryHint !== 'none') {
-      new Nav(deps.browser).click({ label: flow.entry.freshEntryHint, optional: true });
-      deps.browser.wait(1500);
-    }
-    return;
+  const sitemap = deps.state.sitemap;
+
+  // Site-level fresh-start action, learned ONCE and reused by every flow (like
+  // learnedLogoutControl) — replaces the old per-flow flow.entry.freshEntryHint
+  // (which was asked/persisted per flow and, when answered 'none', poisoned that
+  // one flow forever). Accepts a URL (http…/ /…) → navigate, or a control label →
+  // click. 'none' = no fresh-start needed/available on this site (stop asking).
+  if (sitemap.learnedFreshStart === undefined) {
+    const hereId = currentPageId(deps);
+    if (hereId === expectedEntryPageId || hereId === 'unknown') return; // not a resumed draft — don't ask yet
+    const answer = await deps.interact.ask(
+      `A flow's entry landed on "${hereId}", not the expected first step "${expectedEntryPageId}" — ` +
+        `looks like it resumed stale state (e.g. a draft). To start fresh, paste EITHER a URL ` +
+        `(e.g. https://…/new) OR the exact label of a "start fresh/new" control, or "none" if this is expected.`,
+      { default: 'none' },
+    );
+    const raw = answer.trim();
+    sitemap.learnedFreshStart = raw && raw.toLowerCase() !== 'none' ? raw : 'none';
+    deps.state.saveSitemap();
   }
 
-  const hereId = currentPageId(deps);
-  if (hereId === expectedEntryPageId || hereId === 'unknown') return;
+  const fresh = sitemap.learnedFreshStart;
+  if (!fresh || fresh === 'none') return;
 
-  const answer = await deps.interact.ask(
-    `Flow "${flow.title}" entry landed on "${hereId}", not the expected first step "${expectedEntryPageId}" — ` +
-      `looks like it resumed stale state (e.g. a draft). Paste the exact label of a "start fresh/new" control to click here, or "none" if this is expected.`,
-    { default: 'none' },
-  );
-  const label = answer.trim();
-  flow.entry.freshEntryHint = label && label.toLowerCase() !== 'none' ? label : 'none';
-  deps.state.saveSitemap();
-  if (flow.entry.freshEntryHint !== 'none') {
-    new Nav(deps.browser).click({ label: flow.entry.freshEntryHint, optional: true });
+  // Apply it, then SELF-VERIFY it actually reached the expected entry (retry once).
+  // If it still didn't, warn honestly and proceed from the current state rather
+  // than silently pretending the draft was cleared (mirrors the logout self-check).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    applyFreshStartAction(deps, fresh);
     deps.browser.wait(1500);
+    const now = currentPageId(deps);
+    if (now === expectedEntryPageId || now === 'unknown') return;
+    if (attempt === 1) {
+      console.warn(
+        `[flow] fresh-start "${fresh}" did not reach "${expectedEntryPageId}" (still on "${now}") — proceeding from current state`,
+      );
+    }
+  }
+}
+
+/**
+ * Apply a learned fresh-start action agnostically. Supports a MULTI-STEP value
+ * separated by " > " (mirroring the logout `opener > control` pattern), so a
+ * site whose "start fresh" control lives on a different page than the flow entry
+ * can be reached — e.g. "/dashboard > New project" navigates to the dashboard
+ * then clicks the "New project" button. Each step is either a URL (absolute
+ * http(s) or a root-relative path resolved against the origin) → navigate, or a
+ * control label → click. A malformed URL step falls back to a click so a
+ * mis-typed hint still does something rather than throwing.
+ */
+function applyFreshStartAction(deps: FlowRunnerDeps, action: string): void {
+  const steps = action
+    .split('>')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const step of steps) {
+    const looksLikeUrl = /^https?:\/\//i.test(step) || step.startsWith('/');
+    if (looksLikeUrl) {
+      try {
+        const url = step.startsWith('/')
+          ? new URL(step, deps.state.sitemap.origin).toString()
+          : step;
+        deps.browser.open(url);
+        deps.browser.wait(1500);
+        continue;
+      } catch {
+        // fall through to click
+      }
+    }
+    new Nav(deps.browser).click({ label: step, optional: true });
+    deps.browser.wait(1500);
+  }
+}
+
+/**
+ * First-run prompt for a real value to type on a content (edit) milestone — a
+ * name/title/description for an item being created — so created content gets a
+ * meaningful, valid value instead of an invented random marker the site may
+ * reject (a documented failure mode: letters-only name fields, etc.). Returns the
+ * trimmed value, or null if left blank or no answer arrives (detached run), in
+ * which case the caller falls back to the auto marker.
+ */
+async function askCreationValue(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  milestone: FlowMilestone,
+): Promise<string | null> {
+  try {
+    const answer = await deps.interact.ask(
+      `Flow "${flow.title}" — this step enters/creates content:\n  "${milestone.goal}"\n` +
+        `Enter a real value to type (e.g. a name/title/description for the new item); ` +
+        `it is reused on every future run. Leave blank to let the tool auto-generate a test value.`,
+      { default: '' },
+    );
+    const v = answer.trim();
+    return v || null;
+  } catch {
+    return null;
   }
 }
 
@@ -706,7 +783,31 @@ async function runMilestone(
       .filter((s) => s.kind === 'fill' && !s.secretRef)
       .map((s) => (s as { value: string }).value)
       .pop();
-    marker = recordedFillValue || randomEditMarker('autoqa');
+    if (recordedFillValue) {
+      // A recipe already carries the value that will actually be typed on replay —
+      // reuse it so verification and replay never diverge (see the long note above).
+      marker = recordedFillValue;
+    } else if (milestone.seedValue) {
+      // Human already provided a real value for this milestone on an earlier run.
+      marker = milestone.seedValue;
+    } else {
+      // FIRST time this content milestone runs and nothing is recorded yet: ask the
+      // human for the real value to type (a name/title/description for the item being
+      // created) instead of inventing a random marker that the site may reject. Asked
+      // once, persisted on the milestone, reused forever. A blank answer or a detached
+      // run with no answer falls back to the auto marker (today's behavior) and is NOT
+      // persisted, so it re-asks next interactive run. The value still flows through the
+      // same "use exactly: X" injection + marker-presence verification + format
+      // adaptation (valueLooksLikeMarker) as the auto marker.
+      const provided = await askCreationValue(deps, flow, milestone);
+      if (provided) {
+        milestone.seedValue = provided;
+        state.saveSitemap();
+        marker = provided;
+      } else {
+        marker = randomEditMarker('autoqa');
+      }
+    }
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
   } else if (searchShaped) {
     goal = `${goal}\nUse a real, generic search term likely to match existing content (e.g. a common product/category word) — NOT a random or made-up string.`;

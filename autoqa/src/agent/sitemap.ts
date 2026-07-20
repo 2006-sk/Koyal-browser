@@ -114,6 +114,14 @@ export interface FlowMilestone {
   successHint?: string;
   /** Verification wait override (e.g. observed processing time × 1.5) */
   maxWaitMs?: number;
+  /**
+   * Human-provided value to type on this edit milestone (a real name/title/
+   * description for content being created), asked ONCE the first time the
+   * milestone runs and reused forever — replaces the auto-generated random
+   * marker so created items get meaningful, valid names instead of invented
+   * junk that the site may reject. Empty/absent = fall back to the auto marker.
+   */
+  seedValue?: string;
 }
 
 export interface Flow {
@@ -151,6 +159,17 @@ export interface SiteMap {
    * Left unset for sites where Logout is directly clickable with no menu.
    */
   learnedLogoutMenuOpener?: string;
+  /**
+   * Learned once, site-wide: how to START A FRESH creation (bypassing a
+   * resumed/stale draft that some create-entry points reopen — e.g. Koyal's
+   * "Create Your Next Video" reopens the last draft). Either a URL (starts with
+   * http:// or /) → navigate there, or the exact label of a "start fresh/new"
+   * control → click it. 'none' = no fresh-start action needed/available on this
+   * site (stop asking). Agnostic — the site-specific value is runtime data,
+   * learned via the human once and reused by every flow (mirrors
+   * learnedLogoutControl). Replaces the old per-flow Flow.entry.freshEntryHint.
+   */
+  learnedFreshStart?: string;
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;

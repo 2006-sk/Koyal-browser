@@ -224,9 +224,23 @@ export class Explorer {
         processingWaitedMs += Date.now() - t0;
         snapshot = this.browser.snapshotInteractive();
         url = this.browser.getUrl();
-        stepsTaken.push(
-          `waited ${Math.round((Date.now() - t0) / 1000)}s for in-page processing to finish (deterministic, no steps consumed)`,
-        );
+        const waitedS = Math.round((Date.now() - t0) / 1000);
+        if (hasInlineProcessing(snapshot)) {
+          // Loop exited on the budget, NOT because processing cleared — server-side
+          // work (script/scene generation, final render) can take several minutes,
+          // longer than one wait budget. Tell the LLM plainly it just needs MORE
+          // time and must NOT navigate away: the observed failure mode was the
+          // explorer giving up here and clicking a sidebar/step link, which
+          // abandoned the in-progress wizard entirely (koyal script-gen, 2026-07-20).
+          // Raise AUTOQA_PROCESSING_WAIT_MS so the whole generation fits in-budget.
+          stepsTaken.push(
+            `waited ${waitedS}s but in-page processing is STILL ongoing — this server-side work just needs MORE time. Respond with another "wait"; do NOT click other controls, sidebar/step links, or navigate away, or you will abandon the in-progress work.`,
+          );
+        } else {
+          stepsTaken.push(
+            `waited ${waitedS}s for in-page processing to finish (deterministic, no steps consumed)`,
+          );
+        }
       }
 
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
