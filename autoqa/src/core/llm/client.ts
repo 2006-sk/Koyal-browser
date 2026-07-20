@@ -31,6 +31,9 @@ export class LlmClient {
   static callCount = 0;
   /** Hard cap; 0 = unlimited */
   static budget = 0;
+  /** Cumulative billed input/output tokens across all clients this process (from API usage). */
+  static inputTokens = 0;
+  static outputTokens = 0;
 
   constructor(options?: {
     provider?: LlmProvider;
@@ -96,9 +99,12 @@ export class LlmClient {
 
         const data = (await response.json()) as {
           choices?: Array<{ message?: { content?: string } }>;
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
         };
         const content = data.choices?.[0]?.message?.content;
         if (!content) throw new Error('LLM returned empty response');
+        LlmClient.inputTokens += data.usage?.prompt_tokens ?? 0;
+        LlmClient.outputTokens += data.usage?.completion_tokens ?? 0;
         return content;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -149,11 +155,22 @@ export class LlmClient {
 
         const data = (await response.json()) as {
           content?: Array<{ type: string; text?: string }>;
+          usage?: {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_creation_input_tokens?: number;
+            cache_read_input_tokens?: number;
+          };
         };
         const text = data.content?.find((c) => c.type === 'text')?.text;
         if (!text) {
           throw new Error('Anthropic returned empty response');
         }
+        LlmClient.inputTokens +=
+          (data.usage?.input_tokens ?? 0) +
+          (data.usage?.cache_creation_input_tokens ?? 0) +
+          (data.usage?.cache_read_input_tokens ?? 0);
+        LlmClient.outputTokens += data.usage?.output_tokens ?? 0;
         return text;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));

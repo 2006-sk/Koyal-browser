@@ -95,6 +95,22 @@ function formatBug(step: TestStep, scenarioName: string, credentialsType: string
   ].join('\n');
 }
 
+/**
+ * The genuine product bugs in a run — failed milestones carrying real
+ * site-emitted error evidence — each formatted as the Bug/Inputs/Reproduction/
+ * Error-log block used for both Slack and the per-site summary. Shared so the two
+ * surfaces never disagree about what counts as a product bug.
+ */
+export function collectProductBugs(report: RunReport, credentialsType: string): string[] {
+  const bugs: string[] = [];
+  for (const scenario of report.scenarios) {
+    for (const step of scenario.steps) {
+      if (isProductBug(step)) bugs.push(formatBug(step, scenario.name, credentialsType));
+    }
+  }
+  return bugs;
+}
+
 export interface SlackBugReport {
   posted: boolean;
   bugCount: number;
@@ -111,12 +127,7 @@ export async function notifyKoyalBugsToSlack(opts: {
 }): Promise<SlackBugReport> {
   const url = process.env.SLACK_BUGS_WEBHOOK_URL?.trim();
 
-  const bugs: string[] = [];
-  for (const scenario of opts.report.scenarios) {
-    for (const step of scenario.steps) {
-      if (isProductBug(step)) bugs.push(formatBug(step, scenario.name, opts.credentialsType));
-    }
-  }
+  const bugs = collectProductBugs(opts.report, opts.credentialsType);
 
   if (bugs.length === 0) {
     // No product bugs → post nothing (no all-clear/fluff, per spec).
