@@ -164,15 +164,80 @@ export class LlmClient {
   }
 }
 
+/**
+ * Extract every complete, brace-balanced `{...}` substring in `text`, in
+ * order, tracking quoted-string state so braces inside string values (e.g.
+ * `"reason": "the {selector} syntax"`) don't miscount and so a stray `{`
+ * appearing in prose before the real object doesn't get anchored on alone —
+ * scanning continues past it to any later balanced object too. A span that
+ * never returns to depth 0 (truncated/incomplete JSON) ends the scan.
+ */
+function extractJsonObjects(text: string): string[] {
+  const objects: string[] = [];
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const start = text.indexOf('{', searchFrom);
+    if (start === -1) break;
+    let depth = 0;
+    let inString = false;
+    let escapeNext = false;
+    let end = -1;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+      if (inString) {
+        if (ch === '\\') escapeNext = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end === -1) break; // unbalanced from here to the end — nothing more to find
+    objects.push(text.slice(start, end + 1));
+    searchFrom = end + 1;
+  }
+  return objects;
+}
+
+/**
+ * The LLM is expected to reply with exactly one small JSON object, but
+ * occasionally returns two objects back-to-back, an abandoned self-correction
+ * followed by the real answer, or JSON plus prose containing a stray `{`. The
+ * old fallback (greedy first-`{`-to-last-`}`) glued any of these into invalid
+ * JSON and threw uncaught, which killed the entire calling flow rather than
+ * just this one step (2026-07-17, 4 of 10 koyal flows crashed this way).
+ * Extracting every balanced candidate and preferring the LAST one that
+ * actually parses — rather than blindly the first — recovers the model's
+ * final/corrected answer in a self-correction reply, and skips past an
+ * earlier stray `{` (e.g. in "ref {e12} looks right. {\"action\":...}") that
+ * would otherwise be mistaken for the whole object. A still-bad parse is
+ * always wrapped in a typed error so a caller can catch and contain it
+ * instead of an uncaught JSON.parse throw.
+ */
 export function parseJsonFromLlm<T>(raw: string): T {
   const trimmed = raw.trim();
   try {
     return JSON.parse(trimmed) as T;
   } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (!match) {
-      throw new Error(`LLM did not return JSON: ${raw}`);
+    const candidates = extractJsonObjects(trimmed);
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      try {
+        return JSON.parse(candidates[i]) as T;
+      } catch {
+        // try the next-earliest candidate
+      }
     }
-    return JSON.parse(match[0]) as T;
+    throw new Error(`LLM did not return parseable JSON: ${raw}`);
   }
 }

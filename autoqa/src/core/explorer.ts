@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { parseJsonArrayFromEvalStdout, resolveBlockingDialog, type AgentBrowser } from './agent-browser.js';
-import { LlmClient, parseJsonFromLlm } from './llm/client.js';
+import { LlmBudgetExceededError, LlmClient, parseJsonFromLlm, type LlmMessage } from './llm/client.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
@@ -371,18 +371,67 @@ export class Explorer {
       truncateSnapshot(snapshot, config.llm.snapshotMaxChars),
     ].join('\n\n');
 
-    const raw = await this.llm.complete({
-      messages: [
-        { role: 'system', content: buildSystemPrompt(this.siteDescription, this.siteHints) },
-        { role: 'user', content: userPrompt },
-      ],
-    });
+    const messages: LlmMessage[] = [
+      { role: 'system', content: buildSystemPrompt(this.siteDescription, this.siteHints) },
+      { role: 'user', content: userPrompt },
+    ];
 
-    const parsed = parseJsonFromLlm<ExplorerAction>(raw);
-    if (!parsed.action) {
-      throw new Error(`Invalid explorer response: ${raw}`);
+    // A malformed reply (two JSON objects back-to-back, JSON + trailing prose)
+    // usually parses cleanly on a second attempt — retry once before giving up.
+    // Containing the failure to a single 'fail' step (instead of letting the
+    // error propagate) means one bad LLM reply degrades to one contained step
+    // failure, not an uncaught exception that kills the whole flow (2026-07-17:
+    // this exact gap crashed 4 of 10 koyal flows in one run). The whole attempt
+    // — the LLM call AND the parse — is inside the try: an LLM-call-level
+    // failure on the retry (network, budget) needs the same containment as a
+    // parse failure, or this loop just doubles the pre-existing single-call
+    // exposure to that same class of crash. LlmBudgetExceededError is the one
+    // exception that must still propagate — it's a deliberate hard stop for
+    // the whole run, not a per-step condition to retry past.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const raw = await this.llm.complete({
+          messages:
+            attempt === 0
+              ? messages
+              : [
+                  ...messages,
+                  {
+                    role: 'user',
+                    content:
+                      'Your previous reply could not be parsed as JSON. Respond with ONLY a single JSON object matching the schema above — no second object, no explanation, no markdown.',
+                  },
+                ],
+        });
+        const parsed = parseJsonFromLlm<ExplorerAction>(raw);
+        if (!parsed.action) throw new Error(`Invalid explorer response: ${raw}`);
+        return parsed;
+      } catch (error) {
+        if (error instanceof LlmBudgetExceededError) throw error;
+        // Redacted for the same reason stepsTaken.push(this.redact(...)) below
+        // redacts: a malformed reply can echo prose from the prompt, which for
+        // a login goal embeds the real credentials (auth.ts's setRedactions).
+        const message = this.redact(error instanceof Error ? error.message : String(error));
+        if (attempt === 0) {
+          console.log(
+            `  [explorer] LLM call/parse failed — retrying once, consuming an extra LLM-call budget unit (${message})`,
+          );
+          continue;
+        }
+        console.log(`  [explorer] LLM call/parse failed again after retry — failing this step (${message})`);
+        // Deliberately generic, NOT echoing the raw reply: agent/flow-runner.ts's
+        // looksLikeIdempotentSkipReason() regex-scans this exact field for
+        // phrases like "already done"/"no need to", and a malformed reply can
+        // easily contain that kind of self-referential text by coincidence,
+        // misreading a parse crash as a legitimate idempotent skip.
+        return {
+          action: 'fail',
+          reason: 'LLM reply could not be parsed as a valid action after one retry (see logs for detail).',
+        };
+      }
     }
-    return parsed;
+    // unreachable — the loop above always returns or throws by its second iteration
+    throw new Error('decideNextAction: exhausted retries');
   }
 
   private async executeAction(decision: ExplorerAction, stepsTaken: string[]): Promise<void> {
