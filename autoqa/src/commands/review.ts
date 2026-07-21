@@ -12,7 +12,9 @@ export async function reviewCommand(): Promise<void> {
     for (;;) {
       console.log(`\n=== autoqa review — ${state.hostname} ===`);
       console.log(`  statements: ${state.statements.length}`);
-      console.log(`  flows: ${state.sitemap.flows.length} (${state.sitemap.flows.filter((f) => f.status === 'approved').length} approved)`);
+      const exploratory = state.sitemap.flows.filter((f) => f.status === 'exploratory').length;
+      const deterministic = state.sitemap.flows.filter((f) => f.status === 'deterministic').length;
+      console.log(`  flows: ${state.sitemap.flows.length} (${exploratory} exploratory, ${deterministic} deterministic)`);
       console.log(`  walks: ${Object.keys(state.sitemap.walks ?? {}).length}`);
       console.log(`  recipes: ${Object.keys(state.recipes).length}`);
       console.log(`  allowlist: ${Object.keys(state.allowlist).length}`);
@@ -95,11 +97,17 @@ export async function reviewCommand(): Promise<void> {
           const last = f.lastResult ? ` last: ${f.lastResult.verdict}` : '';
           console.log(`  ${i + 1}. [${f.status}] ${f.title} (${f.milestones.length} milestones)${last}`);
         });
-        const pick = await interact.ask('Number to toggle approve/skip (or blank)', { default: '' });
+        const pick = await interact.ask('Number to toggle exploratory/skip (or blank)', { default: '' });
         const idx = Number(pick) - 1;
         if (Number.isInteger(idx) && state.sitemap.flows[idx]) {
           const flow = state.sitemap.flows[idx];
-          flow.status = flow.status === 'approved' ? 'skipped' : 'approved';
+          if (flow.status === 'exploratory' || flow.status === 'deterministic' || flow.status === 'approved') {
+            flow.status = 'skipped';
+            flow.qualification = undefined;
+          } else {
+            flow.status = 'exploratory';
+            flow.qualification = { phase: 'learning' };
+          }
           state.saveSitemap();
           console.log(`  ${flow.id} → ${flow.status}`);
         }

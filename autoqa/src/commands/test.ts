@@ -17,7 +17,7 @@ export async function testCommand(
   opts: { session?: Session; keepOpen?: boolean; only?: string[] } = {},
 ): Promise<{ session: Session; failed: number }> {
   const session = opts.session ?? bootstrap();
-  const { browser, state, interact, explorer, player, statements, authCtx } = session;
+  const { browser, state, interact, llm, explorer, player, statements, authCtx } = session;
 
   const reportsRoot = path.join(config.reportsDir, state.hostname);
   // Snapshot LLM counters at test-phase entry. For the combined `run` command,
@@ -37,7 +37,7 @@ export async function testCommand(
   let failed = 0;
   try {
     await runFlows(
-      { browser, state, interact, explorer, player, statements },
+      { browser, state, interact, llm, explorer, player, statements },
       authCtx,
       report,
       runDir,
@@ -86,7 +86,9 @@ export async function testCommand(
         model: config.llm.model,
         credentialsType,
         flowsTotal: state.sitemap.flows.length,
-        flowsApproved: state.sitemap.flows.filter((f) => f.status === 'approved').length,
+        flowsApproved: state.sitemap.flows.filter(
+          (f) => f.status === 'exploratory' || f.status === 'deterministic' || f.status === 'approved',
+        ).length,
         verdicts: { pass, fail: failed, review },
         total: {
           calls: LlmClient.callCount,

@@ -25,6 +25,17 @@ import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
 import { looksLikeAuthGate, looksLikeSoft404 } from './page-classifier.js';
+import type { LlmClient } from '../core/llm/client.js';
+import { resolveHumanFieldValue } from './field-values.js';
+import {
+  flowRunMode,
+  hasEveryMilestoneRecipe,
+  hasVerifiedTerminalArtifact,
+  isRunnableFlow,
+  qualifyFlowAfterRun,
+  type FlowRunMode,
+  type MilestoneExecution,
+} from './flow-lifecycle.js';
 
 const STEP_BASE: Partial<VerificationExpectation> = {
   allowPageErrors: true,
@@ -47,6 +58,7 @@ export interface FlowRunnerDeps {
   explorer: Explorer;
   player: RecipePlayer;
   statements: Statements;
+  llm: LlmClient;
 }
 
 /**
@@ -399,31 +411,43 @@ function applyFreshStartAction(deps: FlowRunnerDeps, action: string): void {
   }
 }
 
-/**
- * First-run prompt for a real value to type on a content (edit) milestone — a
- * name/title/description for an item being created — so created content gets a
- * meaningful, valid value instead of an invented random marker the site may
- * reject (a documented failure mode: letters-only name fields, etc.). Returns the
- * trimmed value, or null if left blank or no answer arrives (detached run), in
- * which case the caller falls back to the auto marker.
- */
-async function askCreationValue(
-  deps: FlowRunnerDeps,
-  flow: Flow,
-  milestone: FlowMilestone,
-): Promise<string | null> {
-  try {
-    const answer = await deps.interact.ask(
-      `Flow "${flow.title}" — this step enters/creates content:\n  "${milestone.goal}"\n` +
-        `Enter a real value to type (e.g. a name/title/description for the new item); ` +
-        `it is reused on every future run. Leave blank to let the tool auto-generate a test value.`,
-      { default: '' },
-    );
-    const v = answer.trim();
-    return v || null;
-  } catch {
-    return null;
+/** Safe suggestion passed to the centralized human field-value resolver. */
+export function defaultCreationValue(goal: string): string {
+  if (/description|appearance|bio|about the character|character prompt/i.test(goal)) {
+    return 'A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression.';
   }
+  if (/character|person|name/i.test(goal)) return 'Jason';
+  return 'AutoQA Test Item';
+}
+
+export function fillFieldHintFromGoal(goal: string): string | undefined {
+  return goal.match(/\bfill\s+"([^"]+)"/i)?.[1];
+}
+
+function requiresPersistedCreation(flow: Flow, milestone: FlowMilestone): boolean {
+  const context = `${flow.id} ${flow.title} ${flow.description} ${milestone.goal}`;
+  if (milestone.kind === 'edit') {
+    // Do not inherit broad words from the FLOW title (e.g. every transcript
+    // edit lives inside "Create video"). Only this milestone's own wording can
+    // make an edit responsible for persisted creation.
+    return /character|asset|outfit|avatar|generate|regenerate|finalize/i.test(milestone.goal);
+  }
+  return (
+    milestone.kind === 'create' &&
+    /complete (?:adding|creation)|submit|generate|regenerate|try outfit|finalize|save|create video|render/i.test(milestone.goal)
+  );
+}
+
+function hasCompletionAction(explored: ExplorerResult | null, recipe: typeof SiteState.prototype.recipes[string] | undefined): boolean {
+  const explorerLabels = explored?.actions
+    .filter((a) => a.action === 'click')
+    .map((a) => a.resolvedLabel ?? '') ?? [];
+  const recipeLabels = recipe?.steps
+    .filter((s) => s.kind === 'click')
+    .map((s) => (s as { label: string }).label) ?? [];
+  return [...explorerLabels, ...recipeLabels].some((label) =>
+    /create|generate|try outfit|finalize|save|add asset|create video|render/i.test(label),
+  );
 }
 
 /** Rebuild flow position by replaying prior milestones' recipes from the entry. */
@@ -547,7 +571,7 @@ async function tryRecoverAfterBreak(
  * sadface"). Positive-path auth milestones must route through the auth module.
  * Negative-path goals (invalid/empty credentials) stay with the explorer.
  */
-function isLoginShapedGoal(goal: string): boolean {
+export function isLoginShapedGoal(goal: string): boolean {
   // A milestone that just fills ONE password-labeled field (e.g. a widget-demo
   // page's "Input: Password" text box, unrelated to real auth) must not route
   // through ensureAuthenticated — require BOTH username+password together, or
@@ -592,6 +616,28 @@ function isLoginShapedGoal(goal: string): boolean {
       (/\bcredentials?\b/i.test(unquoted) || (/\busername\b/i.test(unquoted) && /\bpassword\b/i.test(unquoted))));
   const negativePath = /\b(invalid|wrong|incorrect|bad|empty|blank|missing|error|fail)/i.test(goal);
   return wantsAuth && !negativePath;
+}
+
+/** A credential-fill step prepares the form but must not submit it through auth.ts yet. */
+export function isCredentialPreparationGoal(goal: string): boolean {
+  const hasCredentials =
+    /\bcredentials?\b/i.test(goal) ||
+    ((/\b(email|username)\b/i.test(goal)) && /\bpassword\b/i.test(goal));
+  const fills = /\b(fill|enter|type|input)\b/i.test(goal);
+  const submits = /\b(click|submit|authenticate|log ?in|sign ?in|start creating)\b/i.test(goal);
+  return hasCredentials && fills && !submits;
+}
+
+/** Stable execution order: proven deterministic recipes, replay candidates, then learning flows. */
+export function orderRunnableFlows(flows: Flow[]): Flow[] {
+  const rank = (flow: Flow): number => {
+    const mode = flowRunMode(flow);
+    return mode === 'deterministic' ? 0 : mode === 'replay-validation' ? 1 : 2;
+  };
+  return flows
+    .map((flow, index) => ({ flow, index }))
+    .sort((a, b) => rank(a.flow) - rank(b.flow) || a.index - b.index)
+    .map(({ flow }) => flow);
 }
 
 /**
@@ -704,6 +750,24 @@ function looksLikeIdempotentSkipReason(actions: ExplorerAction[]): boolean {
   );
 }
 
+function hasConcreteProductFailureEvidence(step: TestStep): boolean {
+  const signals = step.result.signals;
+  if (signals.pageErrors.length > 0 || signals.consoleErrors.length > 0) return true;
+  if (signals.networkRequests.some((request) => Number(request.status ?? 0) >= 500)) return true;
+  if (
+    /\b(something went wrong|internal server error|failed to (?:generate|save|create|upload|render)|unexpected error|try again later)\b/i.test(
+      `${signals.snapshot.raw}\n${signals.snapshot.interactive}`,
+    )
+  ) {
+    return true;
+  }
+  return step.result.reasons.some(
+    (reason) =>
+      /page error|console error|unexpected.*5\d\d|blank (?:page|screen)|should not include|persist|visible error/i.test(reason) &&
+      !reason.startsWith('Expected snapshot to include'),
+  );
+}
+
 async function runMilestone(
   deps: FlowRunnerDeps,
   flow: Flow,
@@ -711,7 +775,8 @@ async function runMilestone(
   milestoneIndex: number,
   ctx: StepContext,
   authCtx: AuthContext,
-): Promise<{ step: TestStep; marker?: string }> {
+  runMode: FlowRunMode,
+): Promise<{ step: TestStep; marker?: string; execution: MilestoneExecution['execution'] }> {
   const { browser, state, player, statements, interact } = deps;
   const decisionsBefore = interact.decisions.length;
   let pageId = currentPageId(deps);
@@ -747,6 +812,24 @@ async function runMilestone(
     }
   }
 
+  // A session can expire during probe recovery/repositioning, before the next
+  // Explorer call begins. Do not hand a non-auth milestone to the generic LLM
+  // while visibly on /login (it will guess credentials and ask for fake email
+  // field values). Re-authenticate with the dedicated auth module, then rebuild
+  // the exact milestone position before taking any test action.
+  const authRelated = isLoginShapedGoal(milestone.goal);
+  const credentialPreparation = isCredentialPreparationGoal(milestone.goal);
+  if (
+    !authRelated &&
+    looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput())
+  ) {
+    console.log(`[flow] auth wall detected before milestone "${milestone.id}" — re-authenticating and rebuilding position`);
+    await ensureAuthenticated(authCtx);
+    await navigateToEntry(deps, flow);
+    if (milestoneIndex > 0) await replayUpTo(deps, flow, milestoneIndex);
+    pageId = currentPageId(deps);
+  }
+
   browser.clearSignals();
   const verification = ctx.verification;
   const before = await verification.captureSignals();
@@ -755,13 +838,14 @@ async function runMilestone(
 
   // fill in run-unique edit markers so edits are real and verifiable — only for
   // explicit edit milestones (a 'create' click may involve no text field at all)
-  const loginShaped = isLoginShapedGoal(milestone.goal);
+  const loginShaped = authRelated && !credentialPreparation;
   const searchShaped = isSearchShapedGoal(milestone.goal);
   const selectionShaped = isSelectionShapedGoal(milestone.goal);
   const literalValueShaped = isLiteralValueShapedGoal(milestone.goal);
+  const creationMustPersist = requiresPersistedCreation(flow, milestone);
   let goal = milestone.goal;
   let marker: string | undefined;
-  if (milestone.kind === 'edit' && !loginShaped && !searchShaped && !selectionShaped && !literalValueShaped) {
+  if (milestone.kind === 'edit' && !authRelated && !searchShaped && !selectionShaped && !literalValueShaped) {
     // If a recipe already exists for this milestone (walked-flow recipes are
     // recorded during the deep walk itself, BEFORE flow-testing ever runs —
     // see deep-walker.ts's own independent `randomEditMarker('autoqa-walk')` —
@@ -783,38 +867,39 @@ async function runMilestone(
       .filter((s) => s.kind === 'fill' && !s.secretRef)
       .map((s) => (s as { value: string }).value)
       .pop();
-    if (recordedFillValue) {
+    const fieldHint = fillFieldHintFromGoal(milestone.goal);
+    if (fieldHint) {
+      marker = await resolveHumanFieldValue(
+        state,
+        deps.interact,
+        pageId,
+        fieldHint,
+        milestone.seedValue ?? recordedFillValue ?? defaultCreationValue(milestone.goal),
+      );
+    } else if (recordedFillValue) {
       // A recipe already carries the value that will actually be typed on replay —
       // reuse it so verification and replay never diverge (see the long note above).
       marker = recordedFillValue;
     } else if (milestone.seedValue) {
       // Human already provided a real value for this milestone on an earlier run.
       marker = milestone.seedValue;
-    } else {
-      // FIRST time this content milestone runs and nothing is recorded yet: ask the
-      // human for the real value to type (a name/title/description for the item being
-      // created) instead of inventing a random marker that the site may reject. Asked
-      // once, persisted on the milestone, reused forever. A blank answer or a detached
-      // run with no answer falls back to the auto marker (today's behavior) and is NOT
-      // persisted, so it re-asks next interactive run. The value still flows through the
-      // same "use exactly: X" injection + marker-presence verification + format
-      // adaptation (valueLooksLikeMarker) as the auto marker.
-      const provided = await askCreationValue(deps, flow, milestone);
-      if (provided) {
-        milestone.seedValue = provided;
-        state.saveSitemap();
-        marker = provided;
-      } else {
-        marker = randomEditMarker('autoqa');
-      }
-    }
+    } else marker = defaultCreationValue(milestone.goal);
     goal = `${goal}\nWhen entering test text, use exactly: "${marker}"`;
+    if (creationMustPersist) {
+      goal +=
+        '\nThis is a real content-creation step. Filling the field is NOT completion. ' +
+        'Click the appropriate Create/Generate/Try control, wait until generation genuinely finishes, complete every subsequently required field, ' +
+        'then click Finalize/Save. Use done only after the new item is visibly present in the persistent list/library. ' +
+        'A spinner, generated preview, name field, or Finalize button means the goal is still in progress.';
+    }
   } else if (searchShaped) {
     goal = `${goal}\nUse a real, generic search term likely to match existing content (e.g. a common product/category word) — NOT a random or made-up string.`;
   }
 
   let explored: ExplorerResult | null = null;
   let replayOk = false;
+  let execution: MilestoneExecution['execution'] = 'none';
+  const forceExplore = runMode === 'learning';
 
   if (loginShaped) {
     console.log('[flow] auth milestone — delegating to the auth module');
@@ -846,15 +931,22 @@ async function runMilestone(
     } catch (err) {
       console.log(`[flow] auth milestone failed: ${err instanceof Error ? err.message : err}`);
     }
-  } else if (player.has(recipeId)) {
+    if (replayOk) execution = 'auth';
+  } else if (!forceExplore && player.has(recipeId) && (!creationMustPersist || hasCompletionAction(null, state.recipes[recipeId]))) {
     const replay = await player.tryReplay(recipeId, {
       pageId,
       secrets: { email: state.secrets.email, password: state.secrets.password },
     });
     replayOk = replay.ok;
+    if (replayOk) execution = 'replay';
+  } else if (!forceExplore && player.has(recipeId) && creationMustPersist) {
+    console.log('[flow] ignoring stale creation recipe: it never recorded Create/Generate/Finalize/Save');
+  } else if (forceExplore && player.has(recipeId)) {
+    console.log('[flow] exploratory learning mode — bypassing the saved recipe and using LLM exploration');
   }
 
   if (!replayOk && !loginShaped) {
+    execution = 'explore';
     explored = await deps.explorer.achieveGoal(goal);
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
@@ -880,6 +972,19 @@ async function runMilestone(
       await navigateToEntry(deps, flow);
       explored = await deps.explorer.achieveGoal(goal);
     }
+  }
+
+  // The ask-once resolver may replace a stale recipe/LLM proposal with the
+  // human's saved value. Verify what was actually typed, not the suggestion
+  // that existed before the resolver ran.
+  if (marker && milestone.kind === 'edit') {
+    const actualFill =
+      explored?.actions.filter((a) => a.action === 'fill' && a.value !== undefined).at(-1)?.value ??
+      state.recipes[recipeId]?.steps
+        .filter((s) => s.kind === 'fill' && !s.secretRef)
+        .map((s) => (s as { value: string }).value)
+        .at(-1);
+    if (actualFill) marker = actualFill;
   }
 
   // verify with the KB-augmented expectation
@@ -942,6 +1047,7 @@ async function runMilestone(
       pollMs: milestone.maxWaitMs && milestone.maxWaitMs > 60000 ? 5000 : 2000,
     },
     explorerSteps: explored?.stepsTaken,
+    visualVerification: true,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 
@@ -969,10 +1075,35 @@ async function runMilestone(
   // explicit "I could not do this" hides a real gap in coverage as if the
   // milestone were proven.
   const explorerFailureDowngrade = Boolean(explored && !explored.success && step.result.verdict === 'pass');
+  const automationBlockedWithoutProductEvidence = Boolean(
+    explored && !explored.success && !hasConcreteProductFailureEvidence(step),
+  );
+  const visualConcernDowngrade = step.result.visualAssessment?.status === 'concern';
+  const creationCompletionMissing = creationMustPersist && !hasCompletionAction(explored, state.recipes[recipeId]);
+  const creationVisuallyUnproven =
+    creationMustPersist && step.result.visualAssessment?.status !== 'clear';
+  if (creationCompletionMissing && step.result.verdict === 'pass') {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(
+      'Creation milestone filled content but did not prove a Create/Generate/Finalize/Save action and persisted item',
+    );
+  }
+  if (creationVisuallyUnproven && step.result.verdict === 'pass') {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(
+      'Creation was not visually proven persisted in the final list/library/artifact state',
+    );
+  }
   if (explorerFailureDowngrade && explored) {
     step.result.verdict = 'needs-review';
     step.result.reasons.push(
       `Explorer did not confirm goal completion: ${explored.error ?? 'unknown reason'}`,
+    );
+  }
+  if (automationBlockedWithoutProductEvidence && step.result.verdict === 'fail') {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(
+      `Automation could not complete the interaction (${explored?.error ?? 'control not reached'}), but captured no concrete product error; flow remains exploratory and will retry`,
     );
   }
 
@@ -1054,9 +1185,16 @@ async function runMilestone(
       // success statement actually observed on the page — resolve it back to pass;
       // a bare re-check with no new evidence must not.
       let flipped: Verdict | null = null;
-      if ((reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen)) || (reVerdict !== 'fail' && successSeen)) {
+      if (
+        (reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen) && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade) ||
+        (reVerdict !== 'fail' && successSeen && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade)
+      ) {
         flipped = 'pass';
-      } else if (reVerdict === 'fail' && step.result.verdict !== 'fail') {
+      } else if (
+        reVerdict === 'fail' &&
+        step.result.verdict !== 'fail' &&
+        (!automationBlockedWithoutProductEvidence || hasConcreteProductFailureEvidence(step))
+      ) {
         flipped = 'fail';
       }
       if (flipped && flipped !== step.result.verdict) {
@@ -1068,7 +1206,7 @@ async function runMilestone(
     }
 
     // still ambiguous → the human is the escalation path
-    if (step.result.verdict === 'needs-review') {
+    if (step.result.verdict === 'needs-review' && !automationBlockedWithoutProductEvidence) {
       const answer = await interact.askChoice(
         `Step "${milestone.goal.slice(0, 80)}" is ambiguous (${step.result.reasons.join('; ').slice(0, 120)}). Verdict?`,
         ['pass', 'fail', 'skip'],
@@ -1107,7 +1245,7 @@ async function runMilestone(
     patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
   }
 
-  return { step, marker };
+  return { step, marker, execution };
 }
 
 export async function runFlows(
@@ -1118,19 +1256,25 @@ export async function runFlows(
   opts: { only?: string[]; quick?: boolean } = {},
 ): Promise<void> {
   const { state } = deps;
-  const flows = state.sitemap.flows.filter(
-    (f) => f.status === 'approved' && (!opts.only?.length || opts.only.includes(f.id)),
-  );
+  const flows = orderRunnableFlows(state.sitemap.flows.filter(
+    (f) => isRunnableFlow(f) && (!opts.only?.length || opts.only.includes(f.id)),
+  ));
 
   if (flows.length === 0) {
-    console.log('[flow] no approved flows to run — run `autoqa explore` first or approve flows via `autoqa review`');
+    console.log('[flow] no exploratory/deterministic flows to run — run `autoqa explore` first or select flows via `autoqa review`');
     return;
   }
 
   const verification = new VerificationLayer(deps.browser);
 
   for (const flow of flows) {
-    console.log(`\n[flow] ▶ ${flow.title} (${flow.milestones.length} milestones)`);
+    const runMode = flowRunMode(flow);
+    console.log(`\n[flow] ▶ ${flow.title} (${flow.milestones.length} milestones, ${runMode})`);
+    if (runMode === 'learning') {
+      console.log('[flow] exploratory flow — every milestone will use LLM exploration until one complete terminal run is learned');
+    } else if (runMode === 'replay-validation') {
+      console.log('[flow] complete exploratory flow — validating every saved milestone recipe before deterministic promotion');
+    }
     const scenario: ScenarioResult = {
       id: flow.id,
       name: flow.title,
@@ -1145,12 +1289,14 @@ export async function runFlows(
       verification,
       evidenceDir,
       stepsToReproduce: [],
+      llm: deps.llm,
     };
 
     // Highest milestone index we started running — lets the outer catch record
     // any milestones AFTER an uncaught mid-flow exception as skipped instead of
     // silently dropping them (the-internet.herokuapp.com report-loss variant).
     let lastAttemptedIndex = -1;
+    const milestoneExecutions: MilestoneExecution[] = [];
 
     try {
       // Nothing has navigated anywhere for THIS flow yet at this point — the
@@ -1158,8 +1304,26 @@ export async function runFlows(
       // whether this flow's own entry requires login. Don't trust an incidental
       // login-shaped page left over from that prior flow (see trustCurrentGate's
       // doc comment in auth.ts for the confirmed live false-positive this fixes).
-      await ensureAuthenticated(authCtx, { trustCurrentGate: false });
+      const needsAnonymousEntry = looksLikeAuthEntryPageId(flow.entry.pageId);
+      if (!needsAnonymousEntry) {
+        await ensureAuthenticated(authCtx, { trustCurrentGate: false });
+      }
       await navigateToEntry(deps, flow);
+      if (needsAnonymousEntry) {
+        let url = '';
+        let snapshot = '';
+        try {
+          url = deps.browser.getUrl();
+          snapshot = deps.browser.snapshotInteractive();
+        } catch {
+          // The ordinary entry handling below will report an unavailable browser.
+        }
+        const onLoginGate = looksLikeAuthGate(url, snapshot, deps.browser.hasVisiblePasswordInput());
+        if (!onLoginGate) {
+          await ensureLoggedOutForEntry(deps, flow, [flow.entry.pageId]);
+          await navigateToEntry(deps, flow);
+        }
+      }
       await applyFreshEntryHint(deps, flow);
 
       const probeCtx: ProbeContext = {
@@ -1168,6 +1332,7 @@ export async function runFlows(
         nav: new Nav(deps.browser),
         statements: deps.statements,
         stepCtx: ctx,
+        interact: deps.interact,
       };
 
       for (let mi = 0; mi < flow.milestones.length; mi++) {
@@ -1191,7 +1356,7 @@ export async function runFlows(
         // milestone's position (not just the unstarted flow start) — unconditionally
         // disabling fast-forward for every iteration would block that legitimate case.
         const isEntryPage = mi === 0 && hereId !== 'unknown' && hereId === flow.entry.pageId;
-        const aheadIdx = isEntryPage
+        const aheadIdx = runMode !== 'deterministic' || isEntryPage
           ? -1
           : flow.milestones.findIndex((m, j) => j > mi && m.guardPhases?.includes(hereId));
         if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
@@ -1204,8 +1369,9 @@ export async function runFlows(
 
         ctx.stepsToReproduce.push(milestone.goal);
         lastAttemptedIndex = mi;
-        const { step, marker } = await runMilestone(deps, flow, milestone, mi, ctx, authCtx);
+        const { step, marker, execution } = await runMilestone(deps, flow, milestone, mi, ctx, authCtx, runMode);
         scenario.steps.push(step);
+        milestoneExecutions.push({ milestoneId: milestone.id, verdict: step.result.verdict, execution });
         if (step.result.verdict === 'fail') {
           const remaining = flow.milestones.length - (mi + 1);
           if (remaining <= 0) {
@@ -1356,6 +1522,22 @@ export async function runFlows(
 
     scenario.finishedAt = new Date().toISOString();
     report.scenarios.push(scenario);
+
+    const milestoneSteps = scenario.steps.filter((step) => flow.milestones.some((m) => m.id === step.workflow));
+    let finalPageKind: string | undefined;
+    try {
+      finalPageKind = matchPage(state.sitemap, deps.browser.getUrl(), deps.browser.snapshotInteractive())?.kind;
+    } catch {
+      // The captured final milestone signals below can still prove the artifact.
+    }
+    const terminalArtifactVerified = hasVerifiedTerminalArtifact(flow, milestoneSteps, finalPageKind);
+    const lifecycleMessage = qualifyFlowAfterRun(flow, {
+      mode: runMode,
+      executions: milestoneExecutions,
+      terminalArtifactVerified,
+      allRecipesPresent: hasEveryMilestoneRecipe(state, flow),
+    });
+    console.log(`[flow] lifecycle: ${flow.status} — ${lifecycleMessage}`);
 
     // Navigation/state-loss breakage (back/forward, abandon/resume) is a REAL,
     // first-class product bug — the user explicitly wants it reported, not buried

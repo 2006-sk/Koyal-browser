@@ -240,8 +240,10 @@ export async function ensureAuthenticated(
   // 4. OTP / verification code challenge
   if (looksLikeOtpGate(browser.snapshotInteractive())) {
     const code = await ctx.interact.ask(
-      `The site is asking for a verification code (check ${creds.email})`,
+      'The site is asking for a verification code; check the configured login inbox',
+      { secret: true },
     );
+    ctx.explorer.setRedactions([creds.password, creds.email, code]);
     await ctx.explorer.achieveGoal(
       `Enter the verification code "${code}" into the code field and submit. Use "done" once accepted.`,
       { maxSteps: 6 },

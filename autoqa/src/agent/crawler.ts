@@ -488,7 +488,7 @@ export async function explore(
     for (const p of removedOrChanged) console.log(`  - ${p}`);
     const staleFlows = state.sitemap.flows.filter(
       (f) =>
-        f.status === 'approved' &&
+        (f.status === 'exploratory' || f.status === 'deterministic' || f.status === 'approved') &&
         (removedOrChanged.some((r) => r.startsWith(`${f.entry.pageId} `)) ||
           f.milestones.some((m) => m.guardPhases?.some((g) => removedOrChanged.some((r) => r.startsWith(`${g} `))))),
     );
@@ -499,7 +499,16 @@ export async function explore(
 
   // ---- Deep-walk phase: actually enter create/upload flows ----
   const walkFlowIds: string[] = [];
-  const deepCap = opts.deepFlows ?? config.deep.walksPerExplore;
+  // Exhaustive means every discovered creation entry, unless the caller gave an
+  // explicit --deep-flows budget. The old default cap of 3 silently left Koyal's
+  // character/assets/outfit/audio entries untouched while claiming the crawl
+  // was complete.
+  const deepCap =
+    opts.deepFlows !== undefined
+      ? opts.deepFlows
+      : config.probes.exhaustive
+        ? Number.POSITIVE_INFINITY
+        : config.deep.walksPerExplore;
   if (config.deep.enabled && deepCap > 0) {
     const entries: DeepWalkEntry[] = [];
     for (const page of Object.values(state.sitemap.pages)) {
@@ -548,7 +557,16 @@ export async function explore(
           // words like "reserve"/"schedule"/"enroll" matched as substrings inside
           // unrelated words (e.g. "Preserve My Settings" contains "reserve").
           /\b(check ?out|place order|start|begin|reserve|book(ing)?|schedule|enroll)\b/i.test(el.label);
-        if (el.category !== 'create' && el.category !== 'upload' && !checkoutish) continue;
+        // Classification is advisory; a mislabeled but explicit creation CTA
+        // must not disappear from deep coverage. This catches concrete surfaces
+        // such as NEW CHARACTER, ADD ASSET, CREATE OUTFIT, Start with Audio,
+        // Generate/Regenerate and Create Video even if the page classifier called
+        // them navigation/unknown.
+        const explicitCreationLabel =
+          /\b(new (?:project|character|asset|outfit|item)|create(?: video| character| asset| outfit| project)?|add (?:asset|character|outfit|item)|start with (?:script|audio)|generate|regenerate|render|upload)\b/i.test(
+            el.label,
+          ) && !/\bdelete|remove|cancel\b/i.test(el.label);
+        if (el.category !== 'create' && el.category !== 'upload' && !checkoutish && !explicitCreationLabel) continue;
         // wizard states resumed by direct URL need the fresh entry chain that
         // originally discovered them (e.g. projects → "Create …" → fork)
         let via: DeepWalkEntry['via'];
@@ -578,9 +596,12 @@ export async function explore(
       return aScore - bScore;
     });
 
-    // aborted trails (entry unreachable, login wall) are retried, not skipped
+    // Only terminal walks are complete. no-progress/step-cap/error/budget walks
+    // stay queued and are retried on every explore; previously only `aborted`
+    // retried, so one weak button-discovery attempt permanently suppressed that
+    // creation surface from all future crawls.
     const toWalk = entries
-      .filter((e) => !walks[trailIdFor(e)] || walks[trailIdFor(e)].outcome === 'aborted')
+      .filter((e) => !walks[trailIdFor(e)] || walks[trailIdFor(e)].outcome !== 'terminal')
       .slice(0, deepCap);
     if (toWalk.length === 0) {
       console.log('[crawl] deep: all known entry points already walked (delete a walk via `review` to re-walk)');
@@ -694,9 +715,23 @@ export async function explore(
   }
 
   fresh.forEach((f, i) => {
-    f.flow.status = keep.has(i) ? 'approved' : 'skipped';
+    if (keep.has(i)) {
+      const allRecipes =
+        f.flow.milestones.length > 0 &&
+        f.flow.milestones.every((milestone) => Boolean(state.recipes[`flow:${f.flow.id}:${milestone.id}`]));
+      f.flow.status = 'exploratory';
+      f.flow.qualification = {
+        // A terminal deep walk has already learned the entire action trail, but
+        // its recipes still need one real replay-validation run. LLM-proposed or
+        // incomplete flows start in learning and deliberately bypass recipes.
+        phase: f.walked && allRecipes ? 'replay-validation' : 'learning',
+      };
+    } else {
+      f.flow.status = 'skipped';
+      f.flow.qualification = undefined;
+    }
     if (!f.inSitemap) state.sitemap.flows.push(f.flow);
   });
   state.saveSitemap();
-  console.log(`[crawl] ${keep.size}/${fresh.length} flows approved`);
+  console.log(`[crawl] ${keep.size}/${fresh.length} flows selected as exploratory (promotion requires complete replay proof)`);
 }

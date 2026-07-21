@@ -9,6 +9,7 @@
     "qa": "tsx src/cli.ts",
     "explore": "tsx src/cli.ts explore",
     "test:flows": "tsx src/cli.ts test",
+    "test:unit": "node --import tsx --test 'src/**/*.test.ts'",
     "review": "tsx src/cli.ts review"
   },
   "dependencies": {

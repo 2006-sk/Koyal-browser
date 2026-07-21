@@ -11,9 +11,9 @@ const HELP = `autoqa — autonomous site-agnostic QA agent
 Usage: npm run qa -- <command> --url <URL> [flags]
 
 Commands:
-  run       explore-if-needed, then test all approved flows   (default)
+  run       explore-if-needed, then test selected exploratory/deterministic flows   (default)
   explore   crawl the site, build/refresh the sitemap, propose flows
-  test      run approved flows (--flow id[,id] to filter)
+  test      run selected flows (--flow id[,id] to filter)
   review    browse/reclassify the knowledge base (statements, flows, recipes, allowlist)
   reset     clear saved state (--sitemap --statements --recipes --auth or --all)
 
@@ -21,6 +21,7 @@ Flags:
   --url <URL>        target site (or AUTOQA_URL in .env)
   --flow id[,id]     only these flow ids (test/run)
   --fresh            re-explore even if a sitemap exists (run)
+  --wipeout          delete all saved state for this site, then explore + test from zero (run)
   --max-pages N      crawl page cap (default 25)
   --max-steps N      LLM steps per goal (default 12)
   --budget N         hard cap on total LLM calls (default unlimited)
@@ -62,6 +63,15 @@ async function main(): Promise<number> {
 
   switch (command) {
     case 'run':
+      if (argv.includes('--wipeout')) {
+        const state = new SiteState(requireBaseUrl());
+        const removed = state.reset({ all: true });
+        console.log(
+          removed.length
+            ? `[autoqa] --wipeout removed:\n${removed.map((item) => `  ${item}`).join('\n')}`
+            : '[autoqa] --wipeout: no prior site state existed',
+        );
+      }
       return runCommand({ fresh: argv.includes('--fresh'), only });
     case 'explore':
       await exploreCommand();

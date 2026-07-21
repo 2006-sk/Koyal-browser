@@ -96,6 +96,25 @@ export interface WalkTrail {
   outcome: 'terminal' | 'error' | 'no-progress' | 'step-cap' | 'budget' | 'aborted';
   steps: WalkStep[];
   generatedFlowId?: string;
+  terminalEvidence?: {
+    source: 'page-kind' | 'vision';
+    pageId: string;
+    screenshot?: string;
+    summary?: string;
+  };
+  /**
+   * Runtime problems observed while walking that did not themselves prevent
+   * progress. They remain reportable evidence; the walk only becomes `error`
+   * when the UI is actually blocked, visibly enters an error state, or cannot
+   * complete after bounded recovery/waiting.
+   */
+  runtimeSignals?: Array<{
+    at: string;
+    context: string;
+    kind: 'page-error' | 'console-error' | 'network-5xx';
+    detail: string;
+    screenshot?: string;
+  }>;
 }
 
 export interface Edge {
@@ -128,7 +147,22 @@ export interface Flow {
   id: string;
   title: string;
   description: string;
-  status: 'proposed' | 'approved' | 'skipped';
+  /**
+   * proposed: waiting for human selection
+   * exploratory: selected, but not yet proven replayable end-to-end
+   * deterministic: every milestone recipe replayed successfully and any
+   *   creation flow reached a verified terminal/persistent artifact
+   * skipped: intentionally disabled
+   * approved: legacy on-disk value, migrated to exploratory by SiteState
+   */
+  status: 'proposed' | 'exploratory' | 'deterministic' | 'skipped' | 'approved';
+  qualification?: {
+    /** learning uses the LLM for every milestone; replay-validation tests the compiled recipes. */
+    phase: 'learning' | 'replay-validation';
+    learnedAt?: string;
+    terminalArtifactVerifiedAt?: string;
+    replayValidatedAt?: string;
+  };
   entry: {
     pageId: string;
     url?: string;
@@ -256,6 +290,13 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
   const normalized = normalizePath(url);
   const lowerUrl = url.toLowerCase();
   const lowerSnap = snapshot.toLowerCase();
+  const routeAgrees = (page: PageNode): boolean =>
+    page.urlPatterns.length > 0
+      ? page.urlPatterns.includes(normalized)
+      : Boolean(
+          page.detection.urlIncludes &&
+          lowerUrl.includes(page.detection.urlIncludes.toLowerCase()),
+        );
 
   // PASS 0: landmark-first match for wizard/modal/processing/terminal/error states
   if (lowerSnap) {
@@ -265,11 +306,15 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
       if (isPlainPage(page)) continue;
       const hits = page.detection.snapshotAnyOf.filter((t) => lowerSnap.includes(t.toLowerCase())).length;
       if (hits === 0) continue;
-      const urlBonus =
-        (page.detection.urlIncludes && lowerUrl.includes(page.detection.urlIncludes.toLowerCase())) ||
-        page.urlPatterns.includes(normalized)
-          ? 0.5
-          : 0;
+      const urlAgrees = routeAgrees(page);
+      // Stateful landmarks are often persistent wizard sidebars ("Upload",
+      // "Theme", "Final video") visible on every step. Never let those labels
+      // identify the state on a completely different URL: this was collapsing
+      // Koyal's /scriptEdit, /selectTheme, /editscene and /finalvideo back into
+      // the old /upload node, so the deep crawler literally could not map the
+      // rendering/download states even after reaching them.
+      if (!urlAgrees) continue;
+      const urlBonus = 0.5;
       const score = hits + urlBonus;
       if (score > bestScore) {
         best = page;
@@ -284,16 +329,33 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
     if (isPlainPage(page) && page.urlPatterns.includes(normalized)) return page;
   }
 
+  // A stateful route with exactly one learned owner is unambiguous even when
+  // its distinctive action disappeared after completion (e.g. CREATE COMMANDER
+  // is gone once the character exists). Without this, a broad LLM fragment such
+  // as `/characters` on another theme can steal `/space/characters` at runtime.
+  const exactStateful = Object.values(sitemap.pages).filter(
+    (page) => !isPlainPage(page) && page.urlPatterns.includes(normalized),
+  );
+  if (exactStateful.length === 1) return exactStateful[0];
+
   // PASS 2: detection recipes (URL fragment and/or snapshot landmarks).
   // Plain pages are URL-addressable by definition — they may only match when the
   // URL agrees. Snapshot-only matching is reserved for stateful kinds; otherwise
   // one shared chrome landmark (site header) absorbs every page on the site.
   for (const page of Object.values(sitemap.pages)) {
     const det = page.detection;
-    const urlOk = det.urlIncludes ? lowerUrl.includes(det.urlIncludes.toLowerCase()) : false;
+    const urlOk = routeAgrees(page);
     const snapOk = det.snapshotAnyOf.some((text) => lowerSnap.includes(text.toLowerCase()));
     if (det.urlIncludes && urlOk && (det.snapshotAnyOf.length === 0 || snapOk)) return page;
-    if (!isPlainPage(page) && !det.urlIncludes && det.snapshotAnyOf.length > 0 && snapOk) return page;
+    if (
+      !isPlainPage(page) &&
+      !det.urlIncludes &&
+      det.snapshotAnyOf.length > 0 &&
+      snapOk &&
+      (page.urlPatterns.length === 0 || page.urlPatterns.includes(normalized))
+    ) {
+      return page;
+    }
   }
 
   return null;
@@ -306,12 +368,17 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
  */
 export function mergePage(sitemap: SiteMap, incoming: PageNode): PageNode {
   const landmarksLower = incoming.detection.snapshotAnyOf.map((t) => t.toLowerCase());
+  const sameRoute = (page: PageNode): boolean =>
+    page.urlPatterns.length === 0 ||
+    incoming.urlPatterns.length === 0 ||
+    page.urlPatterns.some((u) => incoming.urlPatterns.includes(u));
+  const idMatch = sitemap.pages[incoming.id];
   // Plain pages are identified by URL only: a single shared chrome landmark (a
   // header/nav item) must NOT collapse two distinct plain pages into one. Landmark-
   // overlap merging is reserved for stateful kinds (wizard/modal/…) that legitimately
   // share a URL across sibling states.
   const existing =
-    sitemap.pages[incoming.id] ??
+    (idMatch && sameRoute(idMatch) ? idMatch : undefined) ??
     (isPlainPage(incoming)
       ? Object.values(sitemap.pages).find(
           (p) => isPlainPage(p) && p.urlPatterns.some((u) => incoming.urlPatterns.includes(u)),
@@ -320,10 +387,35 @@ export function mergePage(sitemap: SiteMap, incoming: PageNode): PageNode {
           (p) =>
             (p.kind ?? 'page') === (incoming.kind ?? 'page') &&
             !isPlainPage(p) &&
+            // Landmark overlap only means "same state" when the route also
+            // agrees. Separate themed wizards commonly share generic chrome
+            // (Characters, Continue, Next character); merging /space/characters
+            // with /titanic/characters pooled their theme-specific controls and
+            // caused impossible cross-theme flows to be proposed.
+            p.urlPatterns.some((u) => incoming.urlPatterns.includes(u)) &&
             p.detection.snapshotAnyOf.some((t) => landmarksLower.includes(t.toLowerCase())),
         ));
 
   if (!existing) {
+    // LLM page ids are descriptive guesses, not identities. Different routes
+    // frequently receive the same generic id ("wizard-characters",
+    // "checkout", "details"). Never overwrite/merge solely because that text
+    // key collided; derive a stable route-qualified key for the later page.
+    if (sitemap.pages[incoming.id]) {
+      const routeSlug = (incoming.urlPatterns[0] ?? 'state')
+        .replace(/:id/g, 'item')
+        .replace(/[^a-z0-9]+/gi, '-')
+        .replace(/^-|-$/g, '')
+        .toLowerCase();
+      const base = `${incoming.id}-${routeSlug || 'state'}`;
+      let candidate = base;
+      let suffix = 2;
+      while (sitemap.pages[candidate]) candidate = `${base}-${suffix++}`;
+      console.warn(
+        `[sitemap] page id "${incoming.id}" was reused for a different route; storing it as "${candidate}"`,
+      );
+      incoming.id = candidate;
+    }
     sitemap.pages[incoming.id] = incoming;
     return incoming;
   }

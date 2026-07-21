@@ -80,6 +80,12 @@ export interface VerificationResult {
   signals: SignalBundle;
   reasons: string[];
   retried: boolean;
+  /** Conservative screenshot review; never allowed to upgrade a deterministic verdict. */
+  visualAssessment?: {
+    status: 'clear' | 'concern' | 'uncertain';
+    summary: string;
+    concerns: string[];
+  };
   /** Set when knowledge-base triage touched this verdict */
   kbTriage?: {
     statementsSeen: string[];

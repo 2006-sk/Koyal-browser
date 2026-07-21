@@ -5,6 +5,8 @@ import { randomEditMarker } from '../core/edits.js';
 import { hasInlineProcessing, type Explorer, type ExplorerResult } from '../core/explorer.js';
 import { LlmBudgetExceededError, type LlmClient } from '../core/llm/client.js';
 import type { Nav } from '../core/nav.js';
+import { assessScreenshot } from '../core/visual-verification.js';
+import { captureRuntimeFailure } from '../core/runtime-failure.js';
 import { classifyPage, looksLikeAuthGate } from './page-classifier.js';
 import { recordWalkRecipe, type RecipeStep } from './recipes.js';
 import type { Interact } from './interact.js';
@@ -108,8 +110,11 @@ function advanceGoal(page: PageNode, marker: string, triedChoices: string[] = []
       `You are one step inside a creation flow. Current step: "${page.title}" (${page.description}). ` +
       `Your job is to EXERCISE this step's real functionality, then advance one screen:\n` +
       `1. If this step lets you CREATE or ADD something (a character, a scene, an item), DO it — ` +
-      `click the create/add control, fill any required fields with exactly "${marker}", and confirm the new thing appears.\n` +
+      `click the create/add control and confirm the new thing appears. For a person/character name use a normal human name such as "Jason"; ` +
+      `for a character description use "A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression."; ` +
+      `for other free-text fields use exactly "${marker}". Obey every visible format rule and never use fictional titles, digits in letters-only names, joke names, or random nonsense.\n` +
       `2. If this step has EDITABLE content (script/scene/prompt text), edit it: insert exactly "${marker}" and verify it shows.\n` +
+      `If the edit requires Apply/Regenerate/Save, click it, wait for processing, and verify the edited value survives the resulting refresh/state change; merely typing text is never sufficient.\n` +
       `3. If this step offers CHOICES (story type, style, settings), make a real selection (not necessarily the first — pick a meaningful one).${alreadyTried}\n` +
       `4. Complete any REQUIRED modal (plan/confirmation) — never close it with ✕ or Cancel; upload via action "upload" if a file picker is required.\n` +
       `Then click the enabled Next/Continue/primary button. Use "done" the moment the screen visibly changes to the next step. ` +
@@ -119,7 +124,9 @@ function advanceGoal(page: PageNode, marker: string, triedChoices: string[] = []
   return (
     `You are one step inside a creation flow. Current step: "${page.title}" (${page.description}). ` +
     `Complete ONLY this step and advance exactly one screen: make the minimal required choice ` +
-    `(prefer the first/standard/default option), fill any required text field with exactly "${marker}", ` +
+    `(prefer the first/standard/default option). For person/character names use "Jason" and for character descriptions use ` +
+    `"A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression."; ` +
+    `otherwise fill required text with exactly "${marker}". Obey visible validation rules. ` +
     `use action "upload" if a file picker is required, then click the enabled Next/Continue/primary button. ` +
     `If a REQUIRED modal blocks you (plan selection, confirmation), complete it — never close it with ✕ or Cancel. ` +
     `Use "done" the moment the screen visibly changes to the next step.`
@@ -130,6 +137,67 @@ function advanceGoal(page: PageNode, marker: string, triedChoices: string[] = []
 function verifiedLandmark(page: PageNode, snapshot: string): string | undefined {
   const lower = snapshot.toLowerCase();
   return page.detection.snapshotAnyOf.find((t) => lower.includes(t.toLowerCase()));
+}
+
+function stableStateSignature(page: PageNode, snapshot: string): string {
+  const stableSnapshot = snapshot
+    .toLowerCase()
+    .replace(/\[ref=e\d+\]/g, '')
+    .replace(/\b\d+(?:\.\d+)?(?:%|s|sec|seconds?|min|minutes?)?\b/g, '#')
+    .replace(/\s+/g, ' ')
+    .slice(0, 3500);
+  return `${page.id}|${stableSnapshot}`;
+}
+
+function hasPossibleCompletionAction(result: ExplorerResult): boolean {
+  return result.actions.some(
+    (action) =>
+      action.action === 'click' &&
+      /\b(create(?: video| character| asset| outfit)?|generate|regenerate|finalize|save|submit|finish|complete|download|place order|reserve|book)\b/i.test(
+        action.resolvedLabel ?? '',
+      ),
+  );
+}
+
+/**
+ * A mapped `kind:terminal` is preferred, but vision can prove a persistent
+ * artifact when an SPA's sidebar landmarks make deterministic classification
+ * ambiguous. The visual reviewer is deliberately asked to reject previews,
+ * open forms, spinners, and still-visible finalize controls.
+ */
+async function visuallyProveTerminal(
+  deps: DeepWalkerDeps,
+  trail: WalkTrail,
+  page: PageNode,
+  opts: { evidenceDir: string },
+  observations: string,
+): Promise<boolean> {
+  const screenshot = path.join(opts.evidenceDir, `${slug(trail.id)}-terminal-candidate-${Date.now()}.png`);
+  try {
+    deps.browser.screenshotAnnotated(screenshot);
+    const assessment = await assessScreenshot(deps.llm, screenshot, {
+      action: `Complete the creation flow entered through "${trail.entry.actionLabel}"`,
+      expected:
+        'A genuinely completed, persistent artifact is visible: for video, a playable/downloadable final video; for character/asset/outfit/item, the newly created item in its saved list/library. A generated preview, open form, spinner, Regenerate/Create/Finalize/Save button, or intermediate wizard step is NOT completion.',
+      url: deps.browser.getUrl(),
+      observations,
+    });
+    if (assessment.status !== 'clear') {
+      console.log(`[walk] vision did not prove terminal persistence (${assessment.status}: ${assessment.summary})`);
+      return false;
+    }
+    trail.terminalEvidence = {
+      source: 'vision',
+      pageId: page.id,
+      screenshot,
+      summary: assessment.summary,
+    };
+    console.log(`[walk] ✓ vision verified terminal/persistent artifact: ${assessment.summary}`);
+    return true;
+  } catch (error) {
+    console.warn(`[walk] terminal vision check unavailable: ${error instanceof Error ? error.message : error}`);
+    return false;
+  }
 }
 
 /** Full ordered sequence of meaningful actions from one explorer goal. */
@@ -187,6 +255,26 @@ export async function deepWalk(
     finishedAt: '',
     outcome: 'aborted',
     steps,
+  };
+
+  const noteRuntimeSignal = (
+    failure: NonNullable<ReturnType<typeof captureRuntimeFailure>>,
+    context: string,
+    screenshot?: string,
+  ): void => {
+    (trail.runtimeSignals ??= []).push({
+      at: new Date().toISOString(),
+      context,
+      kind: failure.kind,
+      detail: failure.detail,
+      screenshot,
+    });
+    console.warn(
+      `[walk] ! recorded product ${failure.kind} ${context}: ${failure.detail} — continuing while the UI remains usable`,
+    );
+    // Prevent one already-recorded exception from being mistaken for a new
+    // blocker on every subsequent state/poll.
+    browser.clearSignals();
   };
 
   console.log(`\n[walk] ▶ ${trailId} — entering via "${entry.interactive.label}"`);
@@ -268,6 +356,7 @@ export async function deepWalk(
   try {
     // enter the flow — deterministic first (we know the exact label), LLM only as fallback
     openEntry();
+    browser.clearSignals();
 
     // sessions expire mid-explore: a login wall here means we'd deep-walk the auth
     // pages instead of the target flow (observed: an "audio upload" walk that
@@ -325,9 +414,39 @@ export async function deepWalk(
     });
 
     for (let i = 1; i <= maxSteps; i++) {
+      // Public landing pages can make the initial auth probe look healthy, while
+      // a protected creation action redirects to login later. Re-authenticate at
+      // the redirect before identify() maps the login page as a wizard state.
+      if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput())) {
+        if (!deps.ensureAuth) {
+          trail.outcome = 'aborted';
+          console.warn(`[walk] ${trailId}: hit an authentication wall mid-walk with no auth handler`);
+          break;
+        }
+        console.log('[walk] authentication wall appeared mid-flow — signing in and resuming the redirected state');
+        await deps.ensureAuth();
+        browser.wait(1500);
+        if (looksLikeAuthGate(browser.getUrl(), browser.snapshotInteractive(), browser.hasVisiblePasswordInput())) {
+          trail.outcome = 'aborted';
+          console.warn(`[walk] ${trailId}: authentication wall remained after login attempt`);
+          break;
+        }
+      }
       const { page, snapshot } = await identify(prev.snapshot);
       const kind = page.kind ?? 'page';
       const landmark = verifiedLandmark(page, snapshot);
+
+      const runtimeFailure = captureRuntimeFailure(browser);
+      if (runtimeFailure) {
+        let screenshot: string | undefined;
+        try {
+          screenshot = path.join(opts.evidenceDir, `${slug(trailId)}-product-error-${i}.png`);
+          browser.screenshotAnnotated(screenshot);
+        } catch {
+          screenshot = undefined;
+        }
+        noteRuntimeSignal(runtimeFailure, `on state "${page.id}"`, screenshot);
+      }
 
       // record edge
       if (page.id !== prev.page.id) {
@@ -338,8 +457,16 @@ export async function deepWalk(
       }
 
       if (kind === 'terminal') {
-        steps.push({ index: i, pageId: page.id, kind, landmark });
+        let screenshot: string | undefined;
+        try {
+          screenshot = path.join(opts.evidenceDir, `${slug(trailId)}-terminal.png`);
+          browser.screenshotAnnotated(screenshot);
+        } catch {
+          screenshot = undefined;
+        }
+        steps.push({ index: i, pageId: page.id, kind, landmark, screenshot });
         trail.outcome = 'terminal';
+        trail.terminalEvidence = { source: 'page-kind', pageId: page.id, screenshot };
         console.log(`[walk] ✓ reached terminal state "${page.id}"`);
         break;
       }
@@ -388,6 +515,10 @@ export async function deepWalk(
           }
           browser.wait(5000);
           polls++;
+          const failure = captureRuntimeFailure(browser);
+          if (failure) {
+            noteRuntimeSignal(failure, `while processing "${page.id}"`);
+          }
           if (polls % 4 === 1) {
             try {
               browser.screenshotAnnotated(path.join(opts.evidenceDir, `${slug(trailId)}-poll-${polls}.png`));
@@ -428,6 +559,10 @@ export async function deepWalk(
         while (Date.now() - t0 < config.deep.processingWaitMs) {
           browser.wait(5000);
           polls++;
+          const failure = captureRuntimeFailure(browser);
+          if (failure) {
+            noteRuntimeSignal(failure, `during inline processing on "${page.id}"`);
+          }
           if (polls % 4 === 1) {
             try {
               browser.screenshotAnnotated(path.join(opts.evidenceDir, `${slug(trailId)}-inline-${i}-${polls}.png`));
@@ -452,13 +587,49 @@ export async function deepWalk(
       }
 
       // wizard-step / modal / page: try to advance one screen
-      const signature = `${page.id}|${landmark ?? ''}`;
+      const signature = stableStateSignature(page, snapshot);
       if (signature === lastSignature) {
         noProgress++;
-        if (noProgress >= 3) {
-          trail.outcome = 'no-progress';
-          console.log(`[walk] no progress after 3 attempts on "${page.id}" — stopping`);
-          break;
+        const noProgressLimit = config.probes.exhaustive ? 6 : 3;
+        if (noProgress >= noProgressLimit) {
+          const terminal = await visuallyProveTerminal(
+            deps,
+            trail,
+            page,
+            opts,
+            `The browser state remained unchanged after ${noProgressLimit} attempts. Determine whether that is because the artifact is already completely created and persisted, or because automation is stuck on an intermediate control.`,
+          );
+          if (terminal) {
+            trail.outcome = 'terminal';
+            console.log(`[walk] unchanged state was a vision-verified terminal artifact on "${page.id}"`);
+            break;
+          }
+
+          console.log(`[walk] no progress on "${page.id}" — invoking screenshot-first control recovery`);
+          const recovery = await explorer.achieveGoal(
+            `The automation is stuck while completing the creation flow started by "${entry.interactive.label}". ` +
+              `Use the screenshot and full page state to locate the actual enabled control, modal, validation message, or required field that advances toward a saved terminal artifact. ` +
+              `Do not declare a product failure merely because an element is hard to locate. If processing is visible, wait. ` +
+              `If a real error is visible, use fail and quote it. Otherwise perform the corrective action and use done only after the state advances.`,
+            { maxSteps: Math.max(12, config.llm.maxStepsPerGoal), visionFirst: true },
+          );
+          explorations.push(recovery);
+          steps.push({
+            index: i,
+            pageId: page.id,
+            kind,
+            landmark,
+            action: summarizeActions(recovery),
+            actions: collectActions(recovery),
+          });
+          const afterRecoveryFailure = captureRuntimeFailure(browser);
+          if (afterRecoveryFailure) {
+            noteRuntimeSignal(afterRecoveryFailure, `during screenshot recovery on "${page.id}"`);
+          }
+          noProgress = 0;
+          lastSignature = '';
+          prev = await identify(snapshot);
+          continue;
         }
       } else {
         noProgress = 0;
@@ -466,7 +637,9 @@ export async function deepWalk(
       }
 
       const triedChoices = Array.from(deps.triedChoicesByPage?.get(page.id) ?? []);
-      const explored = await explorer.achieveGoal(advanceGoal(page, marker, triedChoices), { maxSteps: 6 });
+      const explored = await explorer.achieveGoal(advanceGoal(page, marker, triedChoices), {
+        maxSteps: config.probes.exhaustive ? Math.max(12, config.llm.maxStepsPerGoal) : 6,
+      });
       explorations.push(explored);
       browser.wait(1500);
 
@@ -493,10 +666,36 @@ export async function deepWalk(
         action: summarizeActions(explored),
         actions: collectActions(explored),
       });
+      if (!explored.success && /^Human input unavailable for required field/i.test(explored.error ?? '')) {
+        trail.outcome = 'aborted';
+        console.warn(`[walk] current walk stopped: ${explored.error}`);
+        break;
+      }
+      if (explored.success && hasPossibleCompletionAction(explored)) {
+        const after = await identify(snapshot);
+        const terminal = await visuallyProveTerminal(
+          deps,
+          trail,
+          after.page,
+          opts,
+          explored.stepsTaken.join('\n'),
+        );
+        if (terminal) {
+          steps.push({
+            index: i + 1,
+            pageId: after.page.id,
+            kind: after.page.kind ?? 'page',
+            landmark: verifiedLandmark(after.page, after.snapshot),
+            screenshot: trail.terminalEvidence?.screenshot,
+          });
+          trail.outcome = 'terminal';
+          break;
+        }
+      }
       prev = { page, snapshot };
     }
 
-    if (trail.outcome === 'aborted') trail.outcome = 'step-cap';
+    if (trail.outcome === 'aborted' && steps.length >= maxSteps) trail.outcome = 'step-cap';
   } catch (error) {
     if (error instanceof LlmBudgetExceededError) {
       trail.outcome = 'budget';
@@ -514,7 +713,10 @@ export async function deepWalk(
   // derive a testable flow + replayable recipes from the observed trail
   let flow: Flow | null = null;
   let recipeIds: string[] = [];
-  if (trail.steps.length >= 2 && (trail.outcome === 'terminal' || trail.outcome === 'step-cap' || trail.outcome === 'no-progress')) {
+  // Only a terminal trail proves an end-to-end flow. no-progress/step-cap trails
+  // are diagnostic evidence, not replayable success recipes; turning them into
+  // approved flows created repeated fill-only Koyal tests that never finalized.
+  if (trail.steps.length >= 2 && isProvenTrailOutcomeForFlow(trail.outcome)) {
     flow = flowFromTrail(trail, state);
     if (flow) {
       trail.generatedFlowId = flow.id;
@@ -529,22 +731,40 @@ export async function deepWalk(
   return { trail, newPageIds, flow, recipeIds };
 }
 
+export function isProvenTrailOutcomeForFlow(outcome: WalkTrail['outcome']): boolean {
+  return outcome === 'terminal';
+}
+
 /**
  * The single source of truth for which trail steps become milestones. BOTH
  * flowFromTrail and recordWalkRecipes must use this exact list — if they derive
  * it independently they drift (e.g. a collapsed wait-processing step) and recipes
  * bind to the wrong milestone.
  */
-function actionableSteps(trail: WalkTrail): WalkStep[] {
+export function actionableSteps(trail: WalkTrail): WalkStep[] {
   const candidates = trail.steps.filter(
     (s) => s.kind === 'wizard-step' || s.kind === 'modal' || s.kind === 'page',
   );
-  // collapse repeats: keep a step only if it did something, or it landed on a new state
-  const actionable: WalkStep[] = [];
-  for (const step of candidates) {
+  if (candidates.length === 0) return [];
+
+  // Step zero is the entry action and must remain independently replayable even
+  // when clicking it lands on the same page id as the first in-page action.
+  // After that, a no-progress walker may make several full Explorer attempts on
+  // one unchanged page. Each contains clicks, but turning all of them into
+  // milestones produced five identical Premiere→Next-step milestones and huge,
+  // broken recipes. Keep only the final meaningful attempt in each consecutive
+  // page-state run: that is the attempt closest to (and normally responsible
+  // for) the observed transition to the next mapped state.
+  const actionable: WalkStep[] = [candidates[0]];
+  for (let i = 1; i < candidates.length; ) {
+    let end = i;
+    while (end + 1 < candidates.length && candidates[end + 1].pageId === candidates[i].pageId) end++;
+    const group = candidates.slice(i, end + 1);
+    const meaningful = group.filter((step) => step.action && step.action.type !== 'wait-processing');
+    const chosen = meaningful[meaningful.length - 1] ?? group[group.length - 1];
     const last = actionable[actionable.length - 1];
-    const meaningful = Boolean(step.action && step.action.type !== 'wait-processing');
-    if (meaningful || !last || last.pageId !== step.pageId) actionable.push(step);
+    if (meaningful.length > 0 || last.pageId !== chosen.pageId) actionable.push(chosen);
+    i = end + 1;
   }
   return actionable;
 }
@@ -625,8 +845,9 @@ export function flowFromTrail(trail: WalkTrail, state: SiteState): Flow | null {
 
   const existingIdx = state.sitemap.flows.findIndex((f) => f.id === flowId);
   if (existingIdx >= 0) {
-    // keep approval status across re-walks
+    // keep lifecycle state across re-walks
     flow.status = state.sitemap.flows[existingIdx].status;
+    flow.qualification = state.sitemap.flows[existingIdx].qualification;
     flow.lastResult = state.sitemap.flows[existingIdx].lastResult;
     state.sitemap.flows[existingIdx] = flow;
   } else {

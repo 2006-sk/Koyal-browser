@@ -336,6 +336,17 @@ export class AgentBrowser {
       // (navigation replaces the probe) — never double-click those.
       if (landed !== '0') return;
       if (urlBefore && this.getUrl() !== urlBefore) return;
+      // A successful navigation click can schedule the route/document change a
+      // fraction AFTER the driver returns. Without this bounded recheck, the
+      // fallback may reuse the old ref on the newly-arrived page and activate a
+      // completely unrelated control there (live XP case: clicking EXPORT on
+      // Premiere arrived at Export, then stale @e11 opened a download/share
+      // target and stranded the walker on Instagram/S3). Only fall back when
+      // the same document+URL still reports an unlanded click after settling.
+      this.wait(500);
+      const settledLanded = this.evalScript('window.__abClickLanded', { skipEnsure: true }).trim();
+      if (settledLanded !== '0') return;
+      if (urlBefore && this.getUrl() !== urlBefore) return;
       console.log(`[browser] trusted click on ${ref} never reached the page — DOM activation fallback`);
       this.domActivate(ref);
     } catch {
@@ -580,10 +591,10 @@ export class AgentBrowser {
     return stdout;
   }
 
-  errorsJson(): AgentBrowserJsonResponse<{ errors: Array<{ message?: string; stack?: string }> }> {
+  errorsJson(): AgentBrowserJsonResponse<{ errors: unknown[] }> {
     const result = this.run(['errors'], { json: true });
     return (result.parsed ?? { success: false, error: result.stderr || result.stdout }) as AgentBrowserJsonResponse<{
-      errors: Array<{ message?: string; stack?: string }>;
+      errors: unknown[];
     }>;
   }
 

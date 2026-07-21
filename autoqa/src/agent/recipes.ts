@@ -26,6 +26,22 @@ export interface Recipe {
   stats: { successes: number; failures: number; lastSuccessAt?: string };
 }
 
+function secretRefForLabel(label: string): 'email' | 'password' | undefined {
+  if (/\b(password|passcode|pin)\b/i.test(label)) return 'password';
+  if (/\b(email|e-mail|user\s*name|username)\b/i.test(label)) return 'email';
+  return undefined;
+}
+
+function redactRecipeGoal(
+  goal: string,
+  secrets?: { email?: string; password?: string },
+): string {
+  let safe = goal;
+  if (secrets?.email) safe = safe.split(secrets.email).join('«email»');
+  if (secrets?.password) safe = safe.split(secrets.password).join('«password»');
+  return safe;
+}
+
 /**
  * Convert a successful LLM exploration into a label-based recipe that replays
  * without any LLM calls. Refs (@eN) are never stored — labels survive refactors.
@@ -43,7 +59,11 @@ export function recordFromExplorer(
       steps.push({ kind: 'click', label: action.resolvedLabel, role: action.resolvedRole });
     } else if (action.action === 'fill' && action.resolvedLabel && action.value !== undefined) {
       const step: RecipeStep = { kind: 'fill', hint: action.resolvedLabel, value: action.value };
-      if (options?.secrets?.email && action.value === options.secrets.email) {
+      const labelSecretRef = secretRefForLabel(action.resolvedLabel);
+      if (labelSecretRef) {
+        step.value = '';
+        step.secretRef = labelSecretRef;
+      } else if (options?.secrets?.email && action.value === options.secrets.email) {
         step.value = '';
         step.secretRef = 'email';
       } else if (options?.secrets?.password && action.value === options.secrets.password) {
@@ -78,7 +98,7 @@ export function recordFromExplorer(
   const existing = state.recipes[id];
   const recipe: Recipe = {
     id,
-    goal: result.goal,
+    goal: redactRecipeGoal(result.goal, options?.secrets),
     steps,
     successCheck,
     stats: {
@@ -131,6 +151,8 @@ export class RecipePlayer {
     private readonly browser: AgentBrowser,
     private readonly state: SiteState,
     private readonly guard: Guard | null,
+    private readonly resolveFillValue?: (label: string, proposedValue: string) => Promise<string>,
+    private readonly resolveUploadPath?: (suggestedPath: string) => Promise<string>,
   ) {
     this.nav = new Nav(browser);
   }
@@ -169,8 +191,16 @@ export class RecipePlayer {
           const clicked = this.nav.click({ label: step.label, role, optional: true });
           if (!clicked) throw new Error(`could not click "${step.label}"`);
         } else if (step.kind === 'fill') {
-          const value = step.secretRef ? (context.secrets?.[step.secretRef] ?? '') : step.value;
+          const value = step.secretRef
+            ? (context.secrets?.[step.secretRef] ?? '')
+            : this.resolveFillValue
+              ? await this.resolveFillValue(step.hint, step.value)
+              : step.value;
           if (!value) throw new Error(`no value for fill "${step.hint}"`);
+          if (!step.secretRef && value !== step.value) {
+            step.value = value;
+            this.state.saveRecipes();
+          }
           const filled = fillFieldByHint(this.browser, step.hint, value);
           if (!filled.ok) {
             // fall back to ref-based fill via snapshot label match
@@ -193,7 +223,10 @@ export class RecipePlayer {
         } else if (step.kind === 'press') {
           this.browser.press(step.key);
         } else if (step.kind === 'upload') {
-          const assetPath = config.uploadFileOverride || step.assetPath;
+          const suggestedPath = config.uploadFileOverride || step.assetPath;
+          const assetPath = this.resolveUploadPath
+            ? await this.resolveUploadPath(suggestedPath)
+            : suggestedPath;
           if (!fs.existsSync(assetPath)) {
             throw new Error(`upload asset missing: ${assetPath}`);
           }

@@ -8,6 +8,8 @@ import type { TestStep, VerificationExpectation } from '../core/types.js';
 import type { Statements } from './statements.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone, type OptionGroup, type PageNode } from './sitemap.js';
+import type { Interact } from './interact.js';
+import { resolveHumanFieldValue } from './field-values.js';
 
 export interface ProbeContext {
   browser: AgentBrowser;
@@ -15,6 +17,7 @@ export interface ProbeContext {
   nav: Nav;
   statements: Statements;
   stepCtx: StepContext;
+  interact: Interact;
 }
 
 export interface ProbeOutcome {
@@ -231,7 +234,13 @@ export async function editSweepProbe(
   const results: string[] = [];
   const markers: string[] = [];
   for (let i = 0; i < count; i++) {
-    const marker = randomEditMarker(`sweep${i}`);
+    const marker = await resolveHumanFieldValue(
+      ctx.state,
+      ctx.interact,
+      pageIdNow(ctx),
+      `editable field ${i + 1}`,
+      randomEditMarker(`sweep${i}`),
+    );
     const filled = fillEditableByIndex(browser, i, marker);
     results.push(`field ${i}: ${filled.ok ? 'edit stuck' : `NOT verified (${filled.detail})`}`);
     if (filled.ok) markers.push(marker.slice(0, 20));

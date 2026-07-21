@@ -4,6 +4,7 @@ import { config } from '../config.js';
 import type { SiteMap } from './sitemap.js';
 import type { StatementEntry } from './statements.js';
 import type { Recipe } from './recipes.js';
+import type { SavedFieldValue } from './field-values.js';
 
 export interface Secrets {
   email?: string;
@@ -52,6 +53,8 @@ export class SiteState {
   recipes: Record<string, Recipe>;
   allowlist: Allowlist;
   secrets: Secrets;
+  /** Explicit human-provided non-secret field values, reused across runs. */
+  fieldValues: Record<string, SavedFieldValue>;
   /**
    * In-memory only (never persisted) — has a REAL login (silent session
    * restore, recipe replay, or a full explorer-driven login) actually
@@ -68,6 +71,7 @@ export class SiteState {
     this.dir = path.join(config.stateRoot, this.hostname);
     fs.mkdirSync(this.screensDir, { recursive: true });
     fs.mkdirSync(this.inboxDir, { recursive: true });
+    fs.mkdirSync(this.walksDir, { recursive: true });
 
     this.sitemap = readJson<SiteMap>(this.sitemapPath, {
       origin: new URL(baseUrl).origin,
@@ -79,10 +83,52 @@ export class SiteState {
       siteHints: [],
     });
     this.sitemap.walks = this.sitemap.walks ?? {};
+    // A bounded walk that explicitly ended in no-progress/step-cap is useful
+    // diagnostic evidence, but it never proved an end-to-end flow. Older
+    // versions generated and users approved these anyway, producing fill-only
+    // recipes that could never create/finalize content. Quarantine them while
+    // preserving both the map and the walk evidence.
+    let quarantined = false;
+    for (const flow of this.sitemap.flows) {
+      if (/Auto-generated from deep walk .*\(outcome: (?:no-progress|step-cap),/i.test(flow.description)) {
+        if (flow.status !== 'skipped') {
+          flow.status = 'skipped';
+          quarantined = true;
+        }
+      }
+    }
+    if (quarantined) this.saveSitemap();
     this.statements = readJson<StatementEntry[]>(this.statementsPath, []);
     this.recipes = readJson<Record<string, Recipe>>(this.recipesPath, {});
+    // `approved` used to mean only "the human selected this proposal", even if
+    // most milestones had never run and had no recipe. That made partial LLM
+    // plans look deterministic. Migrate every legacy selected flow into the
+    // explicit lifecycle. Only a terminal deep walk with a recipe for every
+    // milestone is ready to TRY replay validation; everything else must learn
+    // each milestone through LLM exploration first.
+    let lifecycleMigrated = false;
+    for (const flow of this.sitemap.flows) {
+      const allRecipes =
+        flow.milestones.length > 0 &&
+        flow.milestones.every((milestone) => Boolean(this.recipes[`flow:${flow.id}:${milestone.id}`]));
+      if (flow.status === 'approved') {
+        const terminalWalk = /Auto-generated from deep walk .*\(outcome: terminal,/i.test(flow.description);
+        flow.status = 'exploratory';
+        flow.qualification = { phase: terminalWalk && allRecipes ? 'replay-validation' : 'learning' };
+        lifecycleMigrated = true;
+      } else if (flow.status === 'deterministic' && !allRecipes) {
+        flow.status = 'exploratory';
+        flow.qualification = { phase: 'learning' };
+        lifecycleMigrated = true;
+      } else if (flow.status === 'exploratory' && flow.qualification?.phase === 'replay-validation' && !allRecipes) {
+        flow.qualification = { phase: 'learning' };
+        lifecycleMigrated = true;
+      }
+    }
+    if (lifecycleMigrated) this.saveSitemap();
     this.allowlist = readJson<Allowlist>(this.allowlistPath, {});
     this.secrets = readJson<Secrets>(this.secretsPath, {});
+    this.fieldValues = readJson<Record<string, SavedFieldValue>>(this.fieldValuesPath, {});
   }
 
   get sitemapPath(): string {
@@ -100,6 +146,9 @@ export class SiteState {
   get secretsPath(): string {
     return path.join(this.dir, 'secrets.json');
   }
+  get fieldValuesPath(): string {
+    return path.join(this.dir, 'field-values.json');
+  }
   get authStatePath(): string {
     return path.join(this.dir, 'auth-state.json');
   }
@@ -108,6 +157,9 @@ export class SiteState {
   }
   get inboxDir(): string {
     return path.join(this.dir, 'inbox');
+  }
+  get walksDir(): string {
+    return path.join(this.dir, 'walks');
   }
 
   saveSitemap(): void {
@@ -130,6 +182,9 @@ export class SiteState {
     } catch {
       // best-effort
     }
+  }
+  saveFieldValues(): void {
+    writeJsonAtomic(this.fieldValuesPath, this.fieldValues);
   }
 
   reset(parts: { sitemap?: boolean; statements?: boolean; recipes?: boolean; auth?: boolean; all?: boolean }): string[] {

@@ -45,9 +45,9 @@ export const config = {
   deep: {
     enabled: process.env.AUTOQA_DEEP !== 'false',
     walksPerExplore: Number(process.env.AUTOQA_DEEP_FLOWS ?? '3'),
-    walkMaxSteps: Number(process.env.AUTOQA_DEEP_WALK_MAX_STEPS ?? '25'),
-    processingWaitMs: Number(process.env.AUTOQA_PROCESSING_WAIT_MS ?? '300000'),
-    terminalWaitMs: Number(process.env.AUTOQA_TERMINAL_WAIT_MS ?? '600000'),
+    walkMaxSteps: Number(process.env.AUTOQA_DEEP_WALK_MAX_STEPS ?? '60'),
+    processingWaitMs: Number(process.env.AUTOQA_PROCESSING_WAIT_MS ?? '1200000'),
+    terminalWaitMs: Number(process.env.AUTOQA_TERMINAL_WAIT_MS ?? '1200000'),
   },
 
   /** QA probes during flow testing (back/forward, matrices, edit sweeps, …) */

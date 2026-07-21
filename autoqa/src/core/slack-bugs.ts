@@ -55,6 +55,28 @@ function isProductBug(step: TestStep): boolean {
   return step.result.verdict === 'fail' && errorLines(step).length > 0;
 }
 
+function normalizeErrorSignature(line: string): string {
+  return line
+    .toLowerCase()
+    .replace(/https?:\/\/[^\s)]+/g, (url) => {
+      try {
+        const parsed = new URL(url);
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return url;
+      }
+    })
+    .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, '<uuid>')
+    .replace(/\b[0-9a-f]{16,}\b/gi, '<id>')
+    .replace(/:\d+:\d+\b/g, ':<line>:<column>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function bugSignature(step: TestStep): string {
+  return errorLines(step).map(normalizeErrorSignature).sort().join('\n');
+}
+
 function shortTitle(step: TestStep): string {
   // Prefer the first real site error as the "what's broken" summary; fall back to
   // the deterministic reason, then the workflow id alone.
@@ -77,7 +99,13 @@ function detectPlan(step: TestStep): string {
   return m ? m[1].replace(/^\w/, (c) => c.toUpperCase()) : '—';
 }
 
-function formatBug(step: TestStep, scenarioName: string, credentialsType: string): string {
+function formatBug(
+  step: TestStep,
+  scenarioName: string,
+  credentialsType: string,
+  occurrences = 1,
+  flowCount = 1,
+): string {
   const url = step.result.signals?.url || '—';
   const repro = (step.stepsToReproduce ?? [])
     .slice(0, MAX_REPRO_STEPS)
@@ -88,7 +116,7 @@ function formatBug(step: TestStep, scenarioName: string, credentialsType: string
     .join('\n');
 
   return [
-    `Bug — ${shortTitle(step)}`,
+    `Bug — ${shortTitle(step)}${occurrences > 1 ? ` (${occurrences} occurrences across ${flowCount} flow${flowCount === 1 ? '' : 's'})` : ''}`,
     `Inputs — file: ${detectFileType(step)} · plan: ${detectPlan(step)} · credentials: ${credentialsType} · url: ${url}`,
     `Reproduction —\n${repro || '  (no steps recorded)'}`,
     `Error log —\n${errors}`,
@@ -102,13 +130,37 @@ function formatBug(step: TestStep, scenarioName: string, credentialsType: string
  * surfaces never disagree about what counts as a product bug.
  */
 export function collectProductBugs(report: RunReport, credentialsType: string): string[] {
-  const bugs: string[] = [];
+  const grouped = new Map<string, {
+    step: TestStep;
+    scenarioName: string;
+    occurrences: number;
+    flows: Set<string>;
+  }>();
   for (const scenario of report.scenarios) {
     for (const step of scenario.steps) {
-      if (isProductBug(step)) bugs.push(formatBug(step, scenario.name, credentialsType));
+      if (!isProductBug(step)) continue;
+      const signature = bugSignature(step);
+      const existing = grouped.get(signature);
+      if (existing) {
+        existing.occurrences++;
+        existing.flows.add(scenario.id);
+      } else {
+        grouped.set(signature, {
+          step,
+          scenarioName: scenario.name,
+          occurrences: 1,
+          flows: new Set([scenario.id]),
+        });
+      }
     }
   }
-  return bugs;
+  return [...grouped.values()].map((bug) => formatBug(
+    bug.step,
+    bug.scenarioName,
+    credentialsType,
+    bug.occurrences,
+    bug.flows.size,
+  ));
 }
 
 export interface SlackBugReport {

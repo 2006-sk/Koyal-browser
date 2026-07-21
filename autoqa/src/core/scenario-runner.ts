@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { AgentBrowser } from './agent-browser.js';
 import {
@@ -5,15 +6,20 @@ import {
   captureNetworkAll,
   capturePageErrors,
   captureStepArtifacts,
+  patchStepSummaryVerdict,
+  writeJson,
 } from './evidence.js';
 import type { TestStep, VerificationExpectation, VerificationResult } from './types.js';
 import { VerificationLayer } from './verification.js';
+import type { LlmClient } from './llm/client.js';
+import { assessScreenshot } from './visual-verification.js';
 
 export interface StepContext {
   browser: AgentBrowser;
   verification: VerificationLayer;
   evidenceDir: string;
   stepsToReproduce: string[];
+  llm?: LlmClient;
 }
 
 function slugify(workflow: string): string {
@@ -30,6 +36,8 @@ export async function recordVerifiedStep(
     waitOptions?: { maxWaitMs?: number; pollMs?: number };
     /** LLM/explorer step log for this milestone, if the explorer ran (not a recipe replay/probe). */
     explorerSteps?: string[];
+    /** Run screenshot review for real milestones (not every probe). */
+    visualVerification?: boolean;
   },
 ): Promise<TestStep> {
   const result = await ctx.verification.verifyAfterAction(meta.expectation, meta.waitOptions);
@@ -67,6 +75,31 @@ export async function recordVerifiedStep(
 
   capturePageErrors(stepDir, result.signals.pageErrors);
   files.push(path.join(stepDir, 'page-errors.json'));
+
+  const screenshotPath = path.join(stepDir, 'screenshot.png');
+  if (meta.visualVerification && ctx.llm && fs.existsSync(screenshotPath)) {
+    try {
+      const visual = await assessScreenshot(ctx.llm, screenshotPath, {
+        action: meta.action,
+        expected: meta.expected,
+        url: result.signals.url,
+        observations: meta.explorerSteps?.join('\n'),
+      });
+      result.visualAssessment = visual;
+      const visualPath = path.join(stepDir, 'visual-assessment.json');
+      writeJson(visualPath, visual);
+      files.push(visualPath);
+      // Vision is corroborating only: it may request review, never create a
+      // hard failure and never erase a deterministic failure.
+      if (visual.status === 'concern' && result.verdict === 'pass') {
+        result.verdict = 'needs-review';
+        result.reasons.push(`Visual review found a concrete concern: ${visual.summary}`);
+        patchStepSummaryVerdict(stepDir, result.verdict, result.reasons);
+      }
+    } catch (error) {
+      console.warn(`[vision] screenshot review unavailable: ${error instanceof Error ? error.message : error}`);
+    }
+  }
 
   const step: TestStep = {
     workflow: meta.workflow,

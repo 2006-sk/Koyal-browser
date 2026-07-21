@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config, requireBaseUrl, requireLlm } from '../config.js';
 import { AgentBrowser } from '../core/agent-browser.js';
-import { Explorer } from '../core/explorer.js';
+import { Explorer, isSensitiveFieldLabel } from '../core/explorer.js';
 import { LlmClient } from '../core/llm/client.js';
 import type { AuthContext } from '../agent/auth.js';
 import { Guard } from '../agent/guard.js';
@@ -11,6 +11,7 @@ import { RecipePlayer } from '../agent/recipes.js';
 import { SiteState } from '../agent/site-state.js';
 import { Statements } from '../agent/statements.js';
 import { matchPage } from '../agent/sitemap.js';
+import { resolveHumanFieldValue } from '../agent/field-values.js';
 
 export interface Session {
   browser: AgentBrowser;
@@ -79,9 +80,6 @@ export function bootstrap(): Session {
   const browser = new AgentBrowser({ session: `${config.session}-${state.hostname}` });
   const llm = new LlmClient();
   const guard = new Guard(state, interact);
-  const player = new RecipePlayer(browser, state, guard);
-  const statements = new Statements(state, interact, llm);
-
   const pageIdNow = (): string => {
     try {
       const url = browser.getUrl();
@@ -93,6 +91,40 @@ export function bootstrap(): Session {
       return 'unknown';
     }
   };
+
+  const resolveFillValue = async (
+    label: string,
+    proposedValue: string,
+    context?: { sensitive: boolean },
+  ): Promise<string> => {
+    const sensitive = context?.sensitive || isSensitiveFieldLabel(label);
+    if (!sensitive) return resolveHumanFieldValue(state, interact, pageIdNow(), label, proposedValue);
+
+    const passwordLike = /\b(password|passcode|pin)\b/i.test(label);
+    const identityLike = /\b(email|e-mail|user\s*name|username)\b/i.test(label);
+    if (passwordLike && state.secrets.password) return state.secrets.password;
+    if (identityLike && state.secrets.email) return state.secrets.email;
+    // applyCliOverrides scopes these environment values to Koyal before bootstrap.
+    // Use them directly through the protected channel after --wipeout instead of
+    // asking again or copying them into field-values/decisions/recipes.
+    if (passwordLike && process.env.AUTOQA_PASSWORD) return process.env.AUTOQA_PASSWORD;
+    if (identityLike && process.env.AUTOQA_EMAIL) return process.env.AUTOQA_EMAIL;
+
+    const answer = await interact.ask(`Enter ${label}`, { secret: true });
+    if (!answer.trim()) throw new Error(`No protected value provided for "${label}"`);
+    if (passwordLike) state.secrets.password = answer;
+    else if (identityLike) state.secrets.email = answer;
+    state.saveSecrets();
+    return answer;
+  };
+  const player = new RecipePlayer(
+    browser,
+    state,
+    guard,
+    resolveFillValue,
+    (suggestedPath) => interact.askPath('A saved recipe is ready to upload a file. Local path?', [suggestedPath]),
+  );
+  const statements = new Statements(state, interact, llm);
 
   const explorer = new Explorer(browser, {
     llm,
@@ -111,6 +143,7 @@ export function bootstrap(): Session {
           return null;
         }
       },
+      onFillRequested: resolveFillValue,
     },
   });
 

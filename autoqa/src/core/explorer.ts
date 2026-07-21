@@ -1,6 +1,10 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { config } from '../config.js';
 import { parseJsonArrayFromEvalStdout, resolveBlockingDialog, type AgentBrowser } from './agent-browser.js';
 import { LlmBudgetExceededError, LlmClient, parseJsonFromLlm, type LlmMessage } from './llm/client.js';
+import { captureRuntimeFailure } from './runtime-failure.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
@@ -33,6 +37,18 @@ export interface ExplorerHooks {
   beforeClick?: (label: string, ref: string) => Promise<boolean>;
   /** Called when the LLM signals a file upload is needed; return a local path or null to decline */
   onUploadRequested?: (selectorHint: string | undefined, reason: string | undefined) => Promise<string | null>;
+  /** Ask-once resolver for every non-secret free-text fill. */
+  onFillRequested?: (
+    label: string,
+    proposedValue: string,
+    context?: { sensitive: boolean },
+  ) => Promise<string>;
+}
+
+const SENSITIVE_FIELD_RE = /\b(password|passcode|pin|secret|token|api\s*key|email|e-mail|user\s*name|username)\b/i;
+
+export function isSensitiveFieldLabel(label: string): boolean {
+  return SENSITIVE_FIELD_RE.test(label);
 }
 
 /**
@@ -44,11 +60,15 @@ export interface ExplorerHooks {
  * "Delivery est. 5 days") that would otherwise trigger a multi-minute dead wait.
  */
 const IN_PROGRESS_RE =
-  /(analy[sz]ing|generating|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|\bplease wait\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed)/i;
-const IN_PROGRESS_DONE_RE = /processing complete|100\s?%|\bdone\b\s*[!.]/i;
+  /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
+const IN_PROGRESS_DONE_RE = /(?:processing|rendering|export) complete|100\s?%|\bdone\b\s*[!.]/i;
 
 export function hasInlineProcessing(snapshot: string): boolean {
   return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
+}
+
+export function explicitGoalValue(goal: string): string | undefined {
+  return goal.match(/When entering test text, use exactly:\s*"([^"]+)"/i)?.[1];
 }
 
 function buildSystemPrompt(siteDescription: string, siteHints: string[]): string {
@@ -63,6 +83,10 @@ Rules:
 - Only use refs that appear in the current snapshot.
 - Prefer semantic matches (button names, field labels) over guessing.
 - For fill actions, use the exact value provided in the goal when filling credentials. EXCEPTION: if the goal specifies an exact literal value for a NAME-like field (not credentials), and the current snapshot shows a visible format constraint near that field (e.g. "letters only", "no numbers", "no spaces or special characters") that the literal value would violate, adapt the value to satisfy the constraint (e.g. strip digits/hyphens/spaces) instead of typing it verbatim and letting the site reject it — the goal's intent is a plausible test value, not that exact string.
+- Keep user-provided seed values unless a visible validation rule requires a minimal correction. Never replace one with an unrelated fictional, celebrity, themed, joke, or QA-looking value.
+- For a person/character name when no value is supplied, use a normal human name such as "Jason" (and obey visible letters/spacing rules). Never invent handles such as CommanderZephyr123.
+- For a character description when no value is supplied, use a natural description such as "A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression." Never enter random tokens, test markers, or nonsense prose.
+- When the goal is to CREATE or GENERATE an artifact and a duplicate/existing-item dialog offers both "use existing" and "replace/create new", choose the safe replace/create-new path. Reusing an existing item does not prove that generation works. Only use an existing artifact when the goal explicitly asks to reuse/select one, or when replacement is visibly destructive beyond this test artifact.
 - For a native <select> dropdown (snapshot shows "combobox" with nested "option" lines, NOT a custom-styled widget), use action "select" with the ref of the combobox itself and "value" set to the exact visible text of the target option — do NOT use "click" on the option, clicking native select options is unreliable.
 - If a field must be submitted with a keyboard key (e.g. a search/todo/tag input with NO visible submit button, only responds to pressing Enter), first "fill" the field with the text, THEN issue a SEPARATE action "press" with "value" set to the key name (e.g. "Enter") as the very next step — do NOT put a key name into a "fill" value, "fill" only ever sets the field's text content, it can never submit anything.
 - If the goal requires attaching a local file, respond with action "upload" (you cannot attach files yourself; the harness will do it mechanically). Include a "selector" if a file input's CSS id/selector is apparent.
@@ -123,6 +147,20 @@ export class Explorer {
     return out;
   }
 
+  /** Capture a short-lived screenshot for a bounded stuck-path vision recheck. */
+  private captureVisionImage(): { data: string; mediaType: 'image/png' } | undefined {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-vision-'));
+    const filePath = path.join(dir, 'page.png');
+    try {
+      this.browser.screenshotAnnotated(filePath);
+      return { data: fs.readFileSync(filePath).toString('base64'), mediaType: 'image/png' };
+    } catch {
+      return undefined;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   constructor(
     private readonly browser: AgentBrowser,
     options?: {
@@ -143,7 +181,7 @@ export class Explorer {
     this.siteHints = hints;
   }
 
-  async achieveGoal(goal: string, options?: { maxSteps?: number }): Promise<ExplorerResult> {
+  async achieveGoal(goal: string, options?: { maxSteps?: number; visionFirst?: boolean }): Promise<ExplorerResult> {
     const maxSteps = options?.maxSteps ?? config.llm.maxStepsPerGoal;
     const actions: ExplorerAction[] = [];
     const stepsTaken: string[] = [];
@@ -201,11 +239,48 @@ export class Explorer {
       }
       if (!isBlank || (url && !url.startsWith('about:'))) lastRealUrl = url || lastRealUrl;
 
+      // A normal edit with an explicit human value is complete once Save was
+      // clicked and that exact value is visible in the resulting full page.
+      // Do not reopen a different row and refill forever. Creation milestones
+      // carry their own explicit persistence clause and must continue onward.
+      const explicitValue = explicitGoalValue(goal);
+      if (
+        explicitValue &&
+        !goal.includes('This is a real content-creation step') &&
+        stepsTaken.some((s) => /click .*\bSave\b/i.test(s))
+      ) {
+        const full = this.browser.snapshotFull();
+        if (full.toLowerCase().includes(explicitValue.toLowerCase())) {
+          stepsTaken.push('deterministic edit check: explicit human value remains visible after Save');
+          return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: full };
+        }
+      }
+
       // Multi-minute server-side work (script engines, scene generation) renders as
       // spinner text on the same URL. Burning LLM steps on 1.5s "wait" actions
       // starves it and fails the goal — wait it out deterministically instead,
       // without consuming steps, bounded by one processing budget per goal.
-      if (hasInlineProcessing(snapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+      // Accessibility's interactive-only tree may omit the spinner/status text
+      // entirely (Koyal avatar generation showed disabled Create/Finalize here,
+      // while "Generating avatar... Est. 0:01 remaining" existed only in the
+      // full tree). Consult the full snapshot before asking the LLM to poke a
+      // disabled form during genuine server-side work.
+      let processingSnapshot = snapshot;
+      if (!hasInlineProcessing(processingSnapshot)) {
+        try {
+          processingSnapshot = this.browser.snapshotFull();
+        } catch {
+          // keep the interactive snapshot
+        }
+      }
+      if (hasInlineProcessing(processingSnapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+        const existingFailure = captureRuntimeFailure(this.browser);
+        if (existingFailure) {
+          stepsTaken.push(
+            `Recorded product ${existingFailure.kind} during processing: ${existingFailure.detail}; continuing while the UI remains usable`,
+          );
+          this.browser.clearSignals();
+        }
         console.log(
           `  [explorer] in-page processing detected — waiting it out deterministically (max ${Math.round((config.deep.processingWaitMs - processingWaitedMs) / 1000)}s)`,
         );
@@ -213,7 +288,21 @@ export class Explorer {
         try {
           while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
             this.browser.wait(5000);
-            const now = this.browser.snapshotInteractive();
+            const processingFailure = captureRuntimeFailure(this.browser);
+            if (processingFailure) {
+              stepsTaken.push(
+                `Recorded product ${processingFailure.kind} during processing: ${processingFailure.detail}; continuing while the UI remains usable`,
+              );
+              this.browser.clearSignals();
+            }
+            let now = this.browser.snapshotInteractive();
+            if (!hasInlineProcessing(now)) {
+              try {
+                now = this.browser.snapshotFull();
+              } catch {
+                // keep interactive snapshot
+              }
+            }
             // empty snapshot = capture/daemon error, NOT "processing finished" —
             // stop waiting and let the normal loop re-snapshot and decide
             if (!now.trim() || !hasInlineProcessing(now)) break;
@@ -225,7 +314,15 @@ export class Explorer {
         snapshot = this.browser.snapshotInteractive();
         url = this.browser.getUrl();
         const waitedS = Math.round((Date.now() - t0) / 1000);
-        if (hasInlineProcessing(snapshot)) {
+        let stillProcessingSnapshot = snapshot;
+        if (!hasInlineProcessing(stillProcessingSnapshot)) {
+          try {
+            stillProcessingSnapshot = this.browser.snapshotFull();
+          } catch {
+            // keep interactive snapshot
+          }
+        }
+        if (hasInlineProcessing(stillProcessingSnapshot)) {
           // Loop exited on the budget, NOT because processing cleared — server-side
           // work (script/scene generation, final render) can take several minutes,
           // longer than one wait budget. Tell the LLM plainly it just needs MORE
@@ -245,7 +342,13 @@ export class Explorer {
 
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
       const llmStart = Date.now();
-      const decision = await this.decideNextAction(goal, url, snapshot, stepsTaken);
+      let decision = await this.decideNextAction(
+        goal,
+        url,
+        snapshot,
+        stepsTaken,
+        options?.visionFirst && step === 0 ? this.captureVisionImage() : undefined,
+      );
       console.log(
         `  [explorer] LLM responded in ${Date.now() - llmStart}ms → ${decision.action}${decision.ref ? ` ${decision.ref}` : ''}${decision.reason ? ` (${decision.reason})` : ''}`,
       );
@@ -254,6 +357,36 @@ export class Explorer {
         const resolved = resolveRefLabel(snapshot, decision.ref);
         decision.resolvedLabel = resolved.label;
         decision.resolvedRole = resolved.role;
+      }
+
+      if (decision.action === 'fill' && decision.value !== undefined && this.hooks.onFillRequested) {
+        const proposedValue = decision.value;
+        const label = decision.resolvedLabel ?? decision.ref ?? 'unlabelled field';
+        const sensitive =
+          isSensitiveFieldLabel(label) ||
+          this.redactions.some((secret) => secret === proposedValue);
+        try {
+          decision.value = await this.hooks.onFillRequested(label, decision.value, { sensitive });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          stepsTaken.push(`required human field input was unavailable: ${detail}`);
+          return {
+            goal,
+            success: false,
+            actions,
+            stepsTaken,
+            finalUrl: url,
+            finalSnapshot: snapshot,
+            error: `Human input unavailable for required field "${label}"`,
+          };
+        }
+        if (sensitive) {
+          stepsTaken.push('credential field resolved through the protected secret channel');
+        } else if (decision.value !== proposedValue) {
+          stepsTaken.push(
+            `human field-value resolver replaced the proposed text with "${decision.value}"; this explicit human value is authoritative and satisfies the goal's requested test text—do not replace or "correct" it back to an old marker`,
+          );
+        }
       }
 
       const signature = `${decision.action}|${decision.ref ?? ''}|${decision.value ?? ''}`;
@@ -289,27 +422,45 @@ export class Explorer {
           const fullSnapshot = this.browser.snapshotFull();
           const recheck = await this.decideNextAction(goal, url, fullSnapshot, [
             ...stepsTaken,
-            'note: the interactive view showed no change after repeating this action — check the FULL page content below for a non-interactive result/confirmation you may have missed before giving up.',
-          ]);
+            'note: the interactive view showed no change after repeating this action. Use the screenshot plus FULL page content to check for a non-interactive result, visible validation rule, modal, disabled GENERATING control, or other progress state before giving up.',
+          ], this.captureVisionImage());
           if (recheck.action === 'done') {
             stepsTaken.push(
               `note: full-snapshot recheck confirmed the goal was already satisfied (a non-interactive result was present) — ${recheck.reason ?? ''}`.trim(),
             );
             return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: fullSnapshot };
           }
+          if (decision.action === 'wait' && recheck.action === 'wait') {
+            decision = recheck;
+            repeatCount = 0;
+            lastSignature = '';
+            stepsTaken.push('vision/full-page recheck confirmed that waiting is still appropriate; repeat-loop abort suppressed');
+          } else {
+            return {
+              goal,
+              success: false,
+              actions,
+              stepsTaken,
+              finalUrl: url,
+              finalSnapshot: snapshot,
+              error: `Explorer stuck repeating "${signature}" — aborting`,
+            };
+          }
         } catch {
           // recheck itself failed (e.g. LLM/browser hiccup) — fall through to the
           // original abort rather than letting a diagnostic-only step crash the run
         }
-        return {
-          goal,
-          success: false,
-          actions,
-          stepsTaken,
-          finalUrl: url,
-          finalSnapshot: snapshot,
-          error: `Explorer stuck repeating "${signature}" — aborting`,
-        };
+        if (repeatCount >= 2) {
+          return {
+            goal,
+            success: false,
+            actions,
+            stepsTaken,
+            finalUrl: url,
+            finalSnapshot: snapshot,
+            error: `Explorer stuck repeating "${signature}" — aborting`,
+          };
+        }
       }
 
       actions.push(decision);
@@ -323,6 +474,28 @@ export class Explorer {
       }
 
       if (decision.action === 'done') {
+        // The interactive snapshot can omit a non-interactive spinner/overlay.
+        // Never accept the LLM's "done" while the FULL page still visibly says
+        // generation/processing is active (live beta.koyal.ai avatar case).
+        const fullSnapshot = this.browser.snapshotFull();
+        if (hasInlineProcessing(fullSnapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+          const t0 = Date.now();
+          stepsTaken.push('done suppressed: full page still shows active generation/processing');
+          while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
+            this.browser.wait(5000);
+            const failure = captureRuntimeFailure(this.browser);
+            if (failure) {
+              stepsTaken.push(
+                `Recorded product ${failure.kind} during processing: ${failure.detail}; continuing while the UI remains usable`,
+              );
+              this.browser.clearSignals();
+            }
+            const now = this.browser.snapshotFull();
+            if (!now.trim() || !hasInlineProcessing(now)) break;
+          }
+          processingWaitedMs += Date.now() - t0;
+          continue;
+        }
         return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: snapshot };
       }
 
@@ -376,6 +549,7 @@ export class Explorer {
     url: string,
     snapshot: string,
     priorSteps: string[],
+    image?: { data: string; mediaType: 'image/png' },
   ): Promise<ExplorerAction> {
     const userPrompt = [
       `Goal: ${goal}`,
@@ -416,6 +590,7 @@ export class Explorer {
                       'Your previous reply could not be parsed as JSON. Respond with ONLY a single JSON object matching the schema above — no second object, no explanation, no markdown.',
                   },
                 ],
+          image,
         });
         const parsed = parseJsonFromLlm<ExplorerAction>(raw);
         if (!parsed.action) throw new Error(`Invalid explorer response: ${raw}`);

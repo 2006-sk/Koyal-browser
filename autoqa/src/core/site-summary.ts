@@ -67,7 +67,7 @@ export function writeSiteSummary(input: SiteSummaryInput): string {
   L.push('');
   L.push('## Flows');
   L.push('');
-  L.push(`- **Designed:** ${input.flowsTotal} (${input.flowsApproved} approved & tested)`);
+  L.push(`- **Designed:** ${input.flowsTotal} (${input.flowsApproved} selected exploratory/deterministic flows tested)`);
   L.push(
     `- **Verdicts:** ${input.verdicts.pass} PASS · ${input.verdicts.fail} FAIL · ${input.verdicts.review} NEEDS-REVIEW`,
   );
@@ -90,7 +90,7 @@ export function writeSiteSummary(input: SiteSummaryInput): string {
   );
   L.push('');
   L.push(
-    `_Future-run estimate = this run's **test-phase** cost. Actual future cost is lower: once the site is mapped, a run skips exploration entirely, and every passing milestone replays its recorded recipe at **0 LLM calls** — only broken/changed milestones re-invoke the LLM._`,
+    `_Future-run estimate = this run's **test-phase** cost. Exploratory flows continue using the LLM until every milestone is learned, a terminal/persistent artifact is verified, and one complete recipe-validation run succeeds. Only then does the flow become deterministic and replay at **0 LLM calls**; a broken recipe demotes it for self-healing._`,
   );
   L.push('');
   L.push('## Product bugs');

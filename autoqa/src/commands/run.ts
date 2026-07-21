@@ -9,17 +9,19 @@ export async function runCommand(opts: { fresh?: boolean; only?: string[] } = {}
 
   try {
     const pageCount = Object.keys(session.state.sitemap.pages).length;
-    const approvedFlows = session.state.sitemap.flows.filter((f) => f.status === 'approved').length;
+    const runnableFlows = session.state.sitemap.flows.filter(
+      (f) => f.status === 'exploratory' || f.status === 'deterministic' || f.status === 'approved',
+    ).length;
 
-    if (opts.fresh || pageCount === 0 || approvedFlows === 0) {
+    if (opts.fresh || pageCount === 0 || runnableFlows === 0) {
       console.log(
         opts.fresh
           ? '[autoqa] --fresh: re-exploring'
-          : `[autoqa] sitemap has ${pageCount} pages / ${approvedFlows} approved flows — exploring first`,
+          : `[autoqa] sitemap has ${pageCount} pages / ${runnableFlows} runnable flows — exploring first`,
       );
       await exploreCommand({ session, keepOpen: true });
     } else {
-      console.log(`[autoqa] using cached sitemap (${pageCount} pages, ${approvedFlows} approved flows)`);
+      console.log(`[autoqa] using cached sitemap (${pageCount} pages, ${runnableFlows} runnable flows)`);
     }
 
     const result = await testCommand({ session, keepOpen: true, only: opts.only });

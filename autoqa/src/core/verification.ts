@@ -34,12 +34,77 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeNetworkRequests(raw: unknown): NetworkRequest[] {
+const SENSITIVE_NETWORK_KEY = /password|passcode|pin|secret|token|api[-_]?key|authorization|cookie|email|username/i;
+
+function redactSensitiveString(value: string): string {
+  return value
+    .replace(/(["']?(?:password|passcode|pin|secret|token|api[-_]?key|authorization|cookie|email|username)["']?\s*[:=]\s*["']?)([^"'&\s},]+)/gi, '$1«redacted»')
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 «redacted»');
+}
+
+function sanitizeNetworkValue(value: unknown, key = ''): unknown {
+  if (SENSITIVE_NETWORK_KEY.test(key)) return '«redacted»';
+  if (typeof value === 'string') return redactSensitiveString(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeNetworkValue(item));
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [
+        childKey,
+        sanitizeNetworkValue(childValue, childKey),
+      ]),
+    );
+  }
+  return value;
+}
+
+export function normalizeNetworkRequests(raw: unknown): NetworkRequest[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((item) => {
-    if (typeof item === 'object' && item !== null) return item as NetworkRequest;
-    return { url: String(item) };
+    if (typeof item === 'object' && item !== null) return sanitizeNetworkValue(item) as NetworkRequest;
+    return { url: redactSensitiveString(String(item)) };
   });
+}
+
+/**
+ * Preserve the useful fields from agent-browser's page-error payload even when
+ * the payload has no top-level `message`. `String({ ... })` collapses every
+ * plain object to "[object Object]", destroying the only evidence downstream
+ * reports and Slack notifications have.
+ */
+export function pageErrorFromUnknown(raw: unknown): PageError {
+  if (typeof raw === 'string') return { message: raw };
+  if (raw instanceof Error) return { message: raw.message, stack: raw.stack };
+
+  const record = typeof raw === 'object' && raw !== null
+    ? raw as Record<string, unknown>
+    : undefined;
+  const directMessage = typeof record?.message === 'string' && record.message.trim()
+    ? record.message.trim()
+    : undefined;
+  const stack = typeof record?.stack === 'string' ? record.stack : undefined;
+
+  if (directMessage) return { message: directMessage, stack };
+
+  try {
+    const seen = new WeakSet<object>();
+    const serialized = JSON.stringify(raw, (_key, value: unknown) => {
+      if (typeof value === 'bigint') return value.toString();
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return '[Circular]';
+        seen.add(value);
+      }
+      return value;
+    });
+    if (serialized && serialized !== '{}') return { message: serialized, stack };
+  } catch {
+    // Fall through to a descriptive non-placeholder message below.
+  }
+
+  const primitive = raw === null ? 'null' : String(raw);
+  return {
+    message: primitive === '[object Object]' ? 'Unknown page error object (no serializable fields)' : primitive,
+    stack,
+  };
 }
 
 function extractConsoleErrors(messages: ConsoleMessage[]): ConsoleMessage[] {
@@ -108,10 +173,7 @@ export class VerificationLayer {
     const consoleResp = this.browser.consoleJson();
     const networkResp = this.browser.networkRequestsJson(networkFilter);
 
-    const pageErrors: PageError[] = (errorsResp.data?.errors ?? []).map((e) => ({
-      message: e.message ?? String(e),
-      stack: e.stack,
-    }));
+    const pageErrors: PageError[] = (errorsResp.data?.errors ?? []).map(pageErrorFromUnknown);
 
     const consoleMessages: ConsoleMessage[] = consoleResp.data?.messages ?? [];
     const consoleErrors = extractConsoleErrors(consoleMessages);

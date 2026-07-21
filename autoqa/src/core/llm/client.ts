@@ -11,6 +11,8 @@ export interface LlmCompletionOptions {
   messages: LlmMessage[];
   temperature?: number;
   maxTokens?: number;
+  /** Optional screenshot supplied to a vision-capable model. */
+  image?: { data: string; mediaType: 'image/png' | 'image/jpeg' };
 }
 
 export class LlmBudgetExceededError extends Error {
@@ -70,7 +72,19 @@ export class LlmClient {
       model: this.model,
       temperature: options.temperature ?? 0.1,
       max_tokens: options.maxTokens ?? 800,
-      messages: options.messages,
+      messages: options.messages.map((message, index) => {
+        if (!options.image || message.role !== 'user' || index !== options.messages.length - 1) return message;
+        return {
+          role: message.role,
+          content: [
+            { type: 'text', text: message.content },
+            {
+              type: 'image_url',
+              image_url: { url: `data:${options.image.mediaType};base64,${options.image.data}` },
+            },
+          ],
+        };
+      }),
       response_format: { type: 'json_object' },
     });
 
@@ -118,7 +132,19 @@ export class LlmClient {
     const system = options.messages.find((m) => m.role === 'system')?.content ?? '';
     const messages = options.messages
       .filter((m) => m.role !== 'system')
-      .map((m) => ({ role: m.role, content: m.content }));
+      .map((m, index, filtered) => ({
+        role: m.role,
+        content:
+          options.image && m.role === 'user' && index === filtered.length - 1
+            ? [
+                { type: 'text', text: m.content },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: options.image.mediaType, data: options.image.data },
+                },
+              ]
+            : m.content,
+      }));
 
     const body: Record<string, unknown> = {
       model: this.model,
