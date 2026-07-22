@@ -1,10 +1,33 @@
 import fs from 'node:fs';
 import type { AgentBrowser } from '../core/agent-browser.js';
-import type { Explorer } from '../core/explorer.js';
+import type { Explorer, ExplorerResult } from '../core/explorer.js';
+import {
+  AUTH_URL_RE,
+  describeAuthFailure,
+  loginRetryDecision,
+  pickAuthResponse,
+} from '../core/auth-response.js';
+import { normalizeNetworkRequests } from '../core/verification.js';
 import { looksLikeAuthGate, looksLikeOtpGate } from './page-classifier.js';
 import { recordFromExplorer, RecipePlayer } from './recipes.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
+
+/**
+ * The auth-endpoint response status observed for a login attempt. Prefers the
+ * status the explorer's authWatch already surfaced (it short-circuits on a 4xx);
+ * falls back to scanning the live network so a refused login is still caught even
+ * if the explorer aborted for another reason first (e.g. exhausted its steps).
+ */
+function observedAuthStatus(browser: AgentBrowser, result: ExplorerResult): number | undefined {
+  if (typeof result.authStatus === 'number') return result.authStatus;
+  try {
+    const resp = pickAuthResponse(normalizeNetworkRequests(browser.networkRequestsJson().data?.requests));
+    return typeof resp?.status === 'number' ? resp.status : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export interface AuthContext {
   browser: AgentBrowser;
@@ -218,21 +241,41 @@ export async function ensureAuthenticated(
   const loginGoal =
     `Log in to this site with email "${creds.email}" and password "${creds.password}". ` +
     `The login form may be behind a toggle or "Log In" tab if the page defaults to sign-up. ` +
+    `Click the submit control ONCE, then WAIT for the response — do NOT click submit repeatedly; ` +
+    `if the page is still processing, use action "wait". ` +
     `Use action "done" once you are past the auth gate (URL changes away from login, or the app shell appears).`;
-  let result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12 });
+  let result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12, authWatch: AUTH_URL_RE });
 
-  // one full fresh retry — guards against a transient first-attempt hiccup
-  // (slow backend, one-off form-submit flake) without weakening detection of
-  // genuinely-wrong credentials, which will fail identically on the retry too.
-  if (!result.success) {
-    console.log(`[auth] first login attempt failed (${result.error ?? 'unknown'}) — retrying once fresh`);
+  // The retry is CONDITIONAL on what the auth endpoint actually did, decided from
+  // the observed response status (authWatch surfaces it; observedAuthStatus also
+  // scans the network as a fallback). Blindly re-running a login the backend
+  // already REFUSED just re-submits it — it can only deepen a 429 rate-limit and
+  // fails identically on wrong credentials (live: filmarena.ai spam-clicked
+  // "Start creating" into a self-induced 429). Only the "no auth request was
+  // seen" case (the submit never dispatched — a click-loss) is a transient hiccup
+  // a fresh retry actually fixes.
+  if (!result.success && loginRetryDecision(observedAuthStatus(browser, result)) === 'retry') {
+    console.log(`[auth] first login attempt failed (${result.error ?? 'unknown'}) — no auth response seen, retrying once fresh`);
     browser.open(probe.url);
     browser.wait(1000);
-    result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12 });
+    result = await ctx.explorer.achieveGoal(loginGoal, { maxSteps: 12, authWatch: AUTH_URL_RE });
   }
 
   if (!result.success) {
-    throw new Error(`Login failed: ${result.error ?? 'explorer could not complete login'}`);
+    const status = observedAuthStatus(browser, result);
+    switch (loginRetryDecision(status)) {
+      case 'blocked':
+        // 429/401/403/5xx — the submit reached the backend and was refused.
+        throw new Error(`Login blocked: ${describeAuthFailure(status as number)} — not retrying (a resubmit would only repeat/deepen it)`);
+      case 'retry':
+        // no auth request even after the fresh retry → genuine failure to submit.
+        throw new Error(`Login failed: ${result.error ?? 'explorer could not complete login'}`);
+      case 'verify':
+        // 2xx: the login POST was accepted but the explorer didn't observe the app
+        // shell — don't re-submit; waitForAuthenticated below is the source of truth.
+        console.log(`[auth] login request returned HTTP ${status}; verifying the session directly rather than re-submitting`);
+        break;
+    }
   }
 
   browser.wait(2000);

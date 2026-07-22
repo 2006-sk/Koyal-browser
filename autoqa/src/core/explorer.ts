@@ -5,6 +5,9 @@ import { config } from '../config.js';
 import { parseJsonArrayFromEvalStdout, resolveBlockingDialog, type AgentBrowser } from './agent-browser.js';
 import { LlmBudgetExceededError, LlmClient, parseJsonFromLlm, type LlmMessage } from './llm/client.js';
 import { captureRuntimeFailure } from './runtime-failure.js';
+import { normalizeNetworkRequests } from './verification.js';
+import { classifyAuthStatus, describeAuthFailure, pickAuthResponse } from './auth-response.js';
+import type { NetworkRequest } from './types.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
@@ -30,6 +33,8 @@ export interface ExplorerResult {
   finalUrl: string;
   finalSnapshot: string;
   error?: string;
+  /** Set when authWatch is enabled and an auth-endpoint response was observed. */
+  authStatus?: number;
 }
 
 export interface ExplorerHooks {
@@ -181,7 +186,10 @@ export class Explorer {
     this.siteHints = hints;
   }
 
-  async achieveGoal(goal: string, options?: { maxSteps?: number; visionFirst?: boolean }): Promise<ExplorerResult> {
+  async achieveGoal(
+    goal: string,
+    options?: { maxSteps?: number; visionFirst?: boolean; authWatch?: RegExp },
+  ): Promise<ExplorerResult> {
     const maxSteps = options?.maxSteps ?? config.llm.maxStepsPerGoal;
     const actions: ExplorerAction[] = [];
     const stepsTaken: string[] = [];
@@ -531,6 +539,36 @@ export class Explorer {
         // (rare timing edge) — resolve once more and move on regardless.
         resolveBlockingDialog(this.browser);
       }
+
+      // authWatch (login goals only): after a submit-shaped action, WAIT for the
+      // async auth response rather than letting the LLM re-click a form that
+      // hasn't answered yet. This is the fix for the filmarena login spam →
+      // self-induced 429: the explorer fired ~7 submit clicks because it never
+      // saw the response. A 4xx/5xx ends the attempt immediately with the real
+      // status (no more clicks, and auth.ts won't retry-deepen a rate limit);
+      // a 2xx just tells the LLM the submit landed so it stops re-submitting.
+      if (options?.authWatch && (decision.action === 'click' || decision.action === 'press')) {
+        const authResp = this.awaitAuthResponse(options.authWatch);
+        if (authResp && typeof authResp.status === 'number') {
+          if (classifyAuthStatus(authResp.status) !== 'ok') {
+            const detail = describeAuthFailure(authResp.status);
+            stepsTaken.push(`${detail} — the login submit was refused; stopping (retrying would only re-submit)`);
+            return {
+              goal,
+              success: false,
+              actions,
+              stepsTaken,
+              finalUrl: this.browser.getUrl(),
+              finalSnapshot: this.browser.snapshotInteractive(),
+              error: detail,
+              authStatus: authResp.status,
+            };
+          }
+          stepsTaken.push(
+            `auth request accepted (HTTP ${authResp.status}); wait for the app shell/redirect then use done — do not re-submit`,
+          );
+        }
+      }
     }
 
     return {
@@ -542,6 +580,34 @@ export class Explorer {
       finalSnapshot: this.browser.snapshotInteractive(),
       error: `Exceeded max exploration steps (${maxSteps})`,
     };
+  }
+
+  /**
+   * Poll briefly for the auth endpoint's response after a login submit. The POST
+   * is usually still pending immediately after the click, so give it a bounded
+   * window rather than reading an absent/stale status. Returns the latest matching
+   * COMPLETED request, or undefined if none answered in time.
+   */
+  private awaitAuthResponse(pattern: RegExp, timeoutMs = 8000): NetworkRequest | undefined {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let resp: NetworkRequest | undefined;
+      try {
+        resp = pickAuthResponse(
+          normalizeNetworkRequests(this.browser.networkRequestsJson().data?.requests),
+          pattern,
+        );
+      } catch {
+        resp = undefined;
+      }
+      if (resp) return resp;
+      if (Date.now() >= deadline) return undefined;
+      try {
+        this.browser.wait(1500);
+      } catch {
+        return undefined;
+      }
+    }
   }
 
   private async decideNextAction(
