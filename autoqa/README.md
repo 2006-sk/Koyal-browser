@@ -35,10 +35,11 @@ with almost no LLM calls.
 | `explore` | crawl + classify pages, build the sitemap, propose flows |
 | `test` | run approved flows (`--flow id,id` to filter) |
 | `review` | browse/reclassify statements, approve/skip flows, prune recipes & allowlist |
-| `reset` | clear saved state (`--sitemap --statements --recipes --auth` or `--all`) |
+| `reset` | clear saved state (`--sitemap --statements --recipes --auth --values` or `--all`) |
 
 Flags: `--url <URL>` `--fresh` `--flow id[,id]` `--max-pages N` `--max-steps N`
-`--budget N` (hard LLM-call cap) `--headless`
+`--budget N` (hard LLM-call cap) `--headless` `--reset-values` (keep the map,
+recipes, and login, but ask again for remembered names/field values during replay)
 
 ## How a milestone executes
 

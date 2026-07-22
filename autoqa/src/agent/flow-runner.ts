@@ -417,7 +417,7 @@ export function defaultCreationValue(goal: string): string {
     return 'A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression.';
   }
   if (/character|person|name/i.test(goal)) return 'Jason';
-  return 'AutoQA Test Item';
+  return 'Summer Journey';
 }
 
 export function fillFieldHintFromGoal(goal: string): string | undefined {
@@ -1058,6 +1058,10 @@ async function runMilestone(
   // into agreement once the verdict is truly final (see patchStepSummaryVerdict).
   const writtenVerdict = step.result.verdict;
   const writtenReasons = [...step.result.reasons];
+  let humanRejectedSuccessHint = false;
+  const fieldHintForRecipe =
+    fillFieldHintFromGoal(milestone.goal) ??
+    (isSearchShapedGoal(milestone.goal) ? milestone.successHint : undefined);
 
   // The explorer's own success/failure signal was previously consulted ONLY for
   // the mid-flow auth-wall retry above — verifyAfterAction's deterministic health
@@ -1207,6 +1211,10 @@ async function runMilestone(
 
     // still ambiguous → the human is the escalation path
     if (step.result.verdict === 'needs-review' && !automationBlockedWithoutProductEvidence) {
+      const hintWasOnlyConcern =
+        Boolean(milestone.successHint) &&
+        step.result.reasons.length > 0 &&
+        step.result.reasons.every((reason) => reason.startsWith('Expected snapshot to include'));
       const answer = await interact.askChoice(
         `Step "${milestone.goal.slice(0, 80)}" is ambiguous (${step.result.reasons.join('; ').slice(0, 120)}). Verdict?`,
         ['pass', 'fail', 'skip'],
@@ -1216,6 +1224,13 @@ async function runMilestone(
         step.result.kbTriage = step.result.kbTriage ?? { statementsSeen: [], newlyClassified: [] };
         step.result.kbTriage.verdictFlippedFrom = 'needs-review';
         step.result.verdict = answer;
+        if (answer === 'pass' && hintWasOnlyConcern) {
+          // The human just proved that the LLM-authored literal was not a valid
+          // post-action landmark (common for placeholders that disappear after
+          // typing). Do not bake that rejected hint into the recipe forever.
+          milestone.successHint = undefined;
+          humanRejectedSuccessHint = true;
+        }
       }
     }
 
@@ -1226,9 +1241,10 @@ async function runMilestone(
       recordFromExplorer(state, recipeId, explored, {
         secrets: { email: state.secrets.email, password: state.secrets.password },
         successCheck:
-          milestone.successHint && isLiteralHint(milestone.successHint)
+          !humanRejectedSuccessHint && milestone.successHint && isLiteralHint(milestone.successHint)
             ? { snapshotAnyOf: [milestone.successHint] }
             : undefined,
+        fallbackFieldHint: fieldHintForRecipe,
       });
     }
   } catch (error) {

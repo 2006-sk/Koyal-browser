@@ -15,13 +15,14 @@ Commands:
   explore   crawl the site, build/refresh the sitemap, propose flows
   test      run selected flows (--flow id[,id] to filter)
   review    browse/reclassify the knowledge base (statements, flows, recipes, allowlist)
-  reset     clear saved state (--sitemap --statements --recipes --auth or --all)
+  reset     clear saved state (--sitemap --statements --recipes --auth --values or --all)
 
 Flags:
   --url <URL>        target site (or AUTOQA_URL in .env)
   --flow id[,id]     only these flow ids (test/run)
   --fresh            re-explore even if a sitemap exists (run)
   --wipeout          delete all saved state for this site, then explore + test from zero (run)
+  --reset-values     forget saved names/field values, then ask again during explore or replay
   --max-pages N      crawl page cap (default 25)
   --max-steps N      LLM steps per goal (default 12)
   --budget N         hard cap on total LLM calls (default unlimited)
@@ -61,6 +62,17 @@ async function main(): Promise<number> {
 
   const only = flagValue(argv, '--flow')?.split(',').map((s) => s.trim()).filter(Boolean);
 
+  const resetValuesBeforeCommand = () => {
+    if (!argv.includes('--reset-values')) return;
+    const state = new SiteState(requireBaseUrl());
+    const removed = state.reset({ values: true });
+    console.log(
+      removed.length
+        ? `[autoqa] --reset-values removed:\n${removed.map((item) => `  ${item}`).join('\n')}`
+        : '[autoqa] --reset-values: no remembered field values existed',
+    );
+  };
+
   switch (command) {
     case 'run':
       if (argv.includes('--wipeout')) {
@@ -72,11 +84,14 @@ async function main(): Promise<number> {
             : '[autoqa] --wipeout: no prior site state existed',
         );
       }
+      resetValuesBeforeCommand();
       return runCommand({ fresh: argv.includes('--fresh'), only });
     case 'explore':
+      resetValuesBeforeCommand();
       await exploreCommand();
       return 0;
     case 'test': {
+      resetValuesBeforeCommand();
       const { failed } = await testCommand({ only });
       return failed > 0 ? 1 : 0;
     }
@@ -90,9 +105,10 @@ async function main(): Promise<number> {
         statements: argv.includes('--statements'),
         recipes: argv.includes('--recipes'),
         auth: argv.includes('--auth'),
+        values: argv.includes('--values'),
         all: argv.includes('--all'),
       });
-      console.log(removed.length ? `Removed:\n${removed.map((r) => `  ${r}`).join('\n')}` : 'Nothing removed (pass --sitemap/--statements/--recipes/--auth/--all)');
+      console.log(removed.length ? `Removed:\n${removed.map((r) => `  ${r}`).join('\n')}` : 'Nothing removed (pass --sitemap/--statements/--recipes/--auth/--values/--all)');
       return 0;
     }
     default:

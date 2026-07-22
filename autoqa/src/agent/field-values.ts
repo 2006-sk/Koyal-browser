@@ -12,8 +12,38 @@ function normalize(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 140);
 }
 
-export function fieldValueKey(pageId: string, label: string): string {
-  return `${normalize(pageId || 'unknown')}::${normalize(label || 'unlabelled field')}`;
+const SYNTHETIC_VALUE_RE = /\b(?:qamark(?:[-_][a-z0-9]+)*|autoqa(?:[-_][a-z0-9]+)*|autoqa test item|qa[-_][a-z0-9]+|sweep\d+|zephyr)\b/gi;
+
+function naturalValueForContext(context: string): string {
+  if (/character|avatar|person/i.test(context) && /description|appearance|bio|prompt/i.test(context)) {
+    return 'A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression.';
+  }
+  if (/character|avatar|person|name/i.test(context)) return 'Jason';
+  if (/asset|object|prop/i.test(context)) return 'Black Ceramic Cup';
+  if (/outfit|clothing|wardrobe/i.test(context)) return 'Navy Flight Jacket';
+  if (/location|place|room|setting/i.test(context)) return 'Cozy Corner Café';
+  return 'Summer Journey';
+}
+
+/** Last-resort guard against LLM-authored junk leaking into real customer data. */
+export function sanitizeProposedFlowText(text: string): string {
+  const withoutQuotedJunk = text.replace(/(['"])([^'"]*(?:qamark|autoqa|qa[-_]|sweep\d|zephyr)[^'"]*)\1/gi, () =>
+    `"${naturalValueForContext(text)}"`,
+  );
+  return withoutQuotedJunk
+    .replace(SYNTHETIC_VALUE_RE, () => naturalValueForContext(text))
+    .replace(/\bunique\s+(?:test\s+)?marker\s+text\b/gi, 'realistic user-provided text')
+    .replace(/\btest marker\b/gi, 'user-provided value');
+}
+
+export function fieldValueKey(pageId: string, label: string, proposed?: string): string {
+  const base = `${normalize(pageId || 'unknown')}::${normalize(label || 'unlabelled field')}`;
+  // The same control can legitimately need different values in different
+  // milestones (5→3 in a triangle test, or a Koyal search retry changing
+  // "script"→"video"). Remember the human answer for the intended value, not
+  // forever for the DOM field itself, or the first answer overrides every later
+  // goal and makes a correct flow impossible to learn.
+  return proposed ? `${base}::intent:${normalize(proposed)}` : base;
 }
 
 /** Suggestion text only. It is never submitted unless the human explicitly enters it. */
@@ -37,7 +67,7 @@ export async function resolveHumanFieldValue(
   label: string,
   proposed?: string,
 ): Promise<string> {
-  const key = fieldValueKey(pageId, label);
+  const key = fieldValueKey(pageId, label, proposed);
   const saved = state.fieldValues[key];
   if (saved?.value) return saved.value;
 

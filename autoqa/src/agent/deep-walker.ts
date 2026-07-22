@@ -149,6 +149,46 @@ function stableStateSignature(page: PageNode, snapshot: string): string {
   return `${page.id}|${stableSnapshot}`;
 }
 
+export interface BlockedStateRecovery {
+  direction: 'back' | 'forward' | 'none';
+  changed: boolean;
+  url: string;
+}
+
+/**
+ * Leave a state that has exhausted its bounded recovery. Back is safest for a
+ * wizard; Forward is attempted only when Back did not change the document.
+ * The caller always ends the current walk afterwards, so this can never turn a
+ * timeout into a false continuation/success.
+ */
+export function recoverAwayFromBlockedState(
+  browser: AgentBrowser,
+  page: PageNode,
+  snapshot: string,
+): BlockedStateRecovery {
+  const beforeUrl = browser.getUrl();
+  const beforeSignature = stableStateSignature(page, snapshot);
+  const attempts: Array<{ direction: 'back' | 'forward'; run: () => void }> = [
+    { direction: 'back', run: () => browser.back() },
+    { direction: 'forward', run: () => browser.forward() },
+  ];
+  for (const attempt of attempts) {
+    try {
+      attempt.run();
+      browser.wait(1500);
+      const url = browser.getUrl();
+      const afterSnapshot = browser.snapshotInteractive();
+      const changed =
+        Boolean(url && !url.startsWith('about:')) &&
+        (url !== beforeUrl || stableStateSignature(page, afterSnapshot) !== beforeSignature);
+      if (changed) return { direction: attempt.direction, changed: true, url };
+    } catch {
+      // Try the other bounded direction; the caller records/ends the walk.
+    }
+  }
+  return { direction: 'none', changed: false, url: browser.getUrl() };
+}
+
 function hasPossibleCompletionAction(result: ExplorerResult): boolean {
   return result.actions.some(
     (action) =>
@@ -225,6 +265,7 @@ async function visuallyAffirmWalkProcessing(
 function collectActions(explored: ExplorerResult): WalkAction[] {
   const out: WalkAction[] = [];
   for (const a of explored.actions) {
+    if (a.executionFailed) continue;
     if (a.action === 'upload' && a.uploadedPath) {
       out.push({ type: 'upload', assetPath: a.uploadedPath, selector: a.selector });
     } else if (a.action === 'fill' && a.resolvedLabel && a.value !== undefined) {
@@ -261,7 +302,7 @@ export async function deepWalk(
   entry: DeepWalkEntry,
   opts: { evidenceDir: string; maxSteps?: number },
 ): Promise<DeepWalkResult> {
-  const { browser, state, llm, explorer, interact, nav } = deps;
+  const { browser, state, llm, explorer, nav } = deps;
   const maxSteps = opts.maxSteps ?? config.deep.walkMaxSteps;
   const trailId = `walk:${entry.pageId}:${slug(entry.interactive.label)}`;
   const marker = randomEditMarker('autoqa-walk');
@@ -296,6 +337,38 @@ export async function deepWalk(
     // Prevent one already-recorded exception from being mistaken for a new
     // blocker on every subsequent state/poll.
     browser.clearSignals();
+  };
+
+  const noteProcessingTimeout = (
+    page: PageNode,
+    waitedMs: number,
+    context: string,
+    screenshot?: string,
+  ): void => {
+    const detail =
+      `Processing on "${page.title}" exceeded the configured wait ceiling ` +
+      `(${Math.round(waitedMs / 1000)}s) and remained visibly active.`;
+    (trail.runtimeSignals ??= []).push({
+      at: new Date().toISOString(),
+      context,
+      kind: 'processing-timeout',
+      detail,
+      screenshot,
+    });
+    console.warn(`[walk] ! processing-timeout ${context}: ${detail}`);
+  };
+
+  const recoverAndEndBlockedWalk = (
+    page: PageNode,
+    snapshot: string,
+    reason: string,
+  ): void => {
+    const recovery = recoverAwayFromBlockedState(browser, page, snapshot);
+    console.warn(
+      recovery.changed
+        ? `[walk] ${reason} — moved ${recovery.direction} to ${recovery.url}; ending this walk and continuing the queue`
+        : `[walk] ${reason} — Back/Forward did not leave the state; ending this walk and continuing the queue`,
+    );
   };
 
   console.log(`\n[walk] ▶ ${trailId} — entering via "${entry.interactive.label}"`);
@@ -518,21 +591,8 @@ export async function deepWalk(
         let waitBudget = config.deep.processingWaitMs;
         let polls = 0;
         let resolved = false;
-        let extended = false;
         for (;;) {
           if (Date.now() - t0 > waitBudget) {
-            if (!extended) {
-              const ans = await interact.askChoice(
-                `"${page.title}" still processing after ${Math.round(waitBudget / 60000)} min — keep waiting?`,
-                ['wait', 'skip'],
-                'skip',
-              );
-              if (ans === 'wait') {
-                extended = true;
-                waitBudget += config.deep.terminalWaitMs;
-                continue;
-              }
-            }
             break;
           }
           browser.wait(5000);
@@ -576,8 +636,16 @@ export async function deepWalk(
           action: { type: 'wait-processing' },
         });
         if (!resolved) {
-          trail.outcome = 'no-progress';
-          console.log('[walk] processing never resolved — stopping walk');
+          let screenshot: string | undefined;
+          try {
+            screenshot = path.join(opts.evidenceDir, `${slug(trailId)}-processing-timeout-${i}.png`);
+            browser.screenshotAnnotated(screenshot);
+          } catch {
+            screenshot = undefined;
+          }
+          noteProcessingTimeout(page, Date.now() - t0, `while waiting on state "${page.id}"`, screenshot);
+          recoverAndEndBlockedWalk(page, snapshot, 'processing wait ceiling exceeded');
+          trail.outcome = 'error';
           break;
         }
         prev = { page, snapshot };
@@ -591,6 +659,7 @@ export async function deepWalk(
         console.log(`[walk] inline processing on "${page.id}" — waiting for it to clear`);
         const t0 = Date.now();
         let polls = 0;
+        let resolved = false;
         while (Date.now() - t0 < config.deep.processingWaitMs) {
           browser.wait(5000);
           polls++;
@@ -606,7 +675,10 @@ export async function deepWalk(
             }
           }
           const currentSnapshot = browser.snapshotInteractive();
-          if (!hasInlineProcessing(currentSnapshot)) break;
+          if (!hasInlineProcessing(currentSnapshot)) {
+            resolved = true;
+            break;
+          }
           if (polls === 3) {
             const visualStatus = await visuallyAffirmWalkProcessing(
               deps,
@@ -614,11 +686,14 @@ export async function deepWalk(
               `Wait for inline processing on "${page.title}" to finish`,
               'The text detector still reports inline processing after three polls.',
             );
-            if (visualStatus === 'complete' || visualStatus === 'blocked') break;
+            if (visualStatus === 'complete' || visualStatus === 'blocked') {
+              resolved = true;
+              break;
+            }
           }
         }
         const waited = Date.now() - t0;
-        console.log(`[walk] inline processing cleared/capped after ${Math.round(waited / 1000)}s`);
+        console.log(`[walk] inline processing ${resolved ? 'cleared/released' : 'timed out'} after ${Math.round(waited / 1000)}s`);
         steps.push({
           index: i,
           pageId: page.id,
@@ -627,6 +702,19 @@ export async function deepWalk(
           processingMs: waited,
           action: { type: 'wait-processing' },
         });
+        if (!resolved) {
+          let screenshot: string | undefined;
+          try {
+            screenshot = path.join(opts.evidenceDir, `${slug(trailId)}-inline-processing-timeout-${i}.png`);
+            browser.screenshotAnnotated(screenshot);
+          } catch {
+            screenshot = undefined;
+          }
+          noteProcessingTimeout(page, waited, `during inline processing on "${page.id}"`, screenshot);
+          recoverAndEndBlockedWalk(page, snapshot, 'inline processing wait ceiling exceeded');
+          trail.outcome = 'error';
+          break;
+        }
         prev = { page, snapshot };
         continue;
       }
@@ -651,6 +739,7 @@ export async function deepWalk(
           }
 
           console.log(`[walk] no progress on "${page.id}" — invoking screenshot-first control recovery`);
+          const recoveryFromUrl = browser.getUrl();
           const recovery = await explorer.achieveGoal(
             `The automation is stuck while completing the creation flow started by "${entry.interactive.label}". ` +
               `Use the screenshot and full page state to locate the actual enabled control, modal, validation message, or required field that advances toward a saved terminal artifact. ` +
@@ -671,6 +760,31 @@ export async function deepWalk(
           if (afterRecoveryFailure) {
             noteRuntimeSignal(afterRecoveryFailure, `during screenshot recovery on "${page.id}"`);
           }
+          if (!recovery.success) {
+            const currentUrl = browser.getUrl();
+            const currentSnapshot = browser.snapshotInteractive();
+            const sameState =
+              currentUrl === recoveryFromUrl &&
+              stableStateSignature(page, currentSnapshot) === stableStateSignature(page, snapshot);
+            if (sameState) {
+              if (recovery.processingTimedOut) {
+                noteProcessingTimeout(
+                  page,
+                  config.deep.processingWaitMs,
+                  `during screenshot recovery on "${page.id}"`,
+                );
+              }
+              recoverAndEndBlockedWalk(
+                page,
+                snapshot,
+                `Screenshot recovery exhausted the unchanged state: ${recovery.error ?? 'unknown failure'}`,
+              );
+              trail.outcome = recovery.processingTimedOut || /error|server|processing|timeout|failed/i.test(recovery.error ?? '')
+                ? 'error'
+                : 'no-progress';
+              break;
+            }
+          }
           noProgress = 0;
           lastSignature = '';
           prev = await identify(snapshot);
@@ -682,6 +796,7 @@ export async function deepWalk(
       }
 
       const triedChoices = Array.from(deps.triedChoicesByPage?.get(page.id) ?? []);
+      const exploredFromUrl = browser.getUrl();
       const explored = await explorer.achieveGoal(advanceGoal(page, marker, triedChoices), {
         maxSteps: config.probes.exhaustive ? Math.max(12, config.llm.maxStepsPerGoal) : 6,
       });
@@ -715,6 +830,38 @@ export async function deepWalk(
         trail.outcome = 'aborted';
         console.warn(`[walk] current walk stopped: ${explored.error}`);
         break;
+      }
+      if (explored.processingTimedOut) {
+        let screenshot: string | undefined;
+        try {
+          screenshot = path.join(opts.evidenceDir, `${slug(trailId)}-explorer-processing-timeout-${i}.png`);
+          browser.screenshotAnnotated(screenshot);
+        } catch {
+          screenshot = undefined;
+        }
+        noteProcessingTimeout(
+          page,
+          config.deep.processingWaitMs,
+          `inside Explorer on state "${page.id}"`,
+          screenshot,
+        );
+        recoverAndEndBlockedWalk(page, snapshot, 'Explorer processing wait ceiling exceeded');
+        trail.outcome = 'error';
+        break;
+      }
+      if (!explored.success) {
+        const currentUrl = browser.getUrl();
+        const currentSnapshot = browser.snapshotInteractive();
+        const sameState =
+          currentUrl === exploredFromUrl &&
+          stableStateSignature(page, currentSnapshot) === stableStateSignature(page, snapshot);
+        if (sameState) {
+          recoverAndEndBlockedWalk(page, snapshot, `Explorer exhausted the unchanged state: ${explored.error ?? 'unknown failure'}`);
+          trail.outcome = /error|server|processing|timeout|failed/i.test(explored.error ?? '') ? 'error' : 'no-progress';
+          break;
+        }
+        prev = await identify(snapshot);
+        continue;
       }
       if (explored.success && hasPossibleCompletionAction(explored)) {
         const after = await identify(snapshot);
@@ -911,10 +1058,10 @@ export function recordWalkRecipes(state: SiteState, flow: Flow, trail: WalkTrail
   for (let i = 0; i < flow.milestones.length; i++) {
     const milestone = flow.milestones[i];
     const step = actionable[i];
-    if (!step?.action) continue;
 
     const recipeSteps: RecipeStep[] = [];
-    for (const action of step.actions?.length ? step.actions : [step.action]) {
+    const recordedActions = step?.actions?.length ? step.actions : step?.action ? [step.action] : [];
+    for (const action of recordedActions) {
       if (action.type === 'click' && action.label) {
         recipeSteps.push({ kind: 'click', label: action.label, role: action.role });
       } else if (action.type === 'fill' && action.label && action.value) {
@@ -927,8 +1074,6 @@ export function recordWalkRecipes(state: SiteState, flow: Flow, trail: WalkTrail
         recipeSteps.push({ kind: 'upload', assetPath: action.assetPath, selector: action.selector });
       }
     }
-    if (recipeSteps.length === 0) continue;
-
     if (milestone.successHint) {
       recipeSteps.push({
         kind: 'waitFor',

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
+import { config } from '../config.js';
 import type { AgentBrowser } from './agent-browser.js';
 import type { LlmClient, LlmCompletionOptions } from './llm/client.js';
 import {
@@ -30,6 +31,10 @@ test('rendering status prose is treated as active processing', () => {
     true,
   );
   assert.equal(hasInlineProcessing('NOW IN PRODUCTION 00:10'), true);
+});
+
+test('server-busy timeout prose is treated as active processing', () => {
+  assert.equal(hasInlineProcessing('Taking longer than expected. Server may be busy. 5:28 elapsed'), true);
 });
 
 test('static rendering settings copy is not treated as active processing', () => {
@@ -84,6 +89,42 @@ test('prolonged text-only processing is released by visual completion after thre
   assert.equal(waits, PROCESSING_VISION_POLL_THRESHOLD);
   assert.equal(llmCalls, 2);
   assert.match(result.stepsTaken.join('\n'), /vision processing affirmation: complete/i);
+});
+
+test('processing that exceeds its deterministic ceiling returns a structured timeout', async () => {
+  const originalWait = config.deep.processingWaitMs;
+  config.deep.processingWaitMs = 5;
+  const processingSnapshot = '- text "Taking longer than expected. Server may be busy."';
+  const browser = {
+    getUrl: () => 'https://example.test/scriptEdit',
+    snapshotInteractive: () => processingSnapshot,
+    snapshotFull: () => processingSnapshot,
+    dialogStatus: () => undefined,
+    wait: () => {
+      const deadline = Date.now() + 6;
+      while (Date.now() < deadline) {
+        // Simulate the browser's blocking wait without spending real seconds.
+      }
+    },
+    errorsJson: () => ({ data: { errors: [] } }),
+    consoleJson: () => ({ data: { messages: [] } }),
+    networkRequestsJson: () => ({ data: { requests: [] } }),
+    clearSignals: () => undefined,
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete() {
+      throw new Error('LLM must not be called after a deterministic processing timeout');
+    },
+  } as unknown as LlmClient;
+
+  try {
+    const result = await new Explorer(browser, { llm }).achieveGoal('Wait for script generation', { maxSteps: 2 });
+    assert.equal(result.success, false);
+    assert.equal(result.processingTimedOut, true);
+    assert.match(result.error ?? '', /processing-timeout/i);
+  } finally {
+    config.deep.processingWaitMs = originalWait;
+  }
 });
 
 test('extracts the authoritative explicit edit value from a goal', () => {

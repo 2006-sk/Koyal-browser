@@ -2,6 +2,7 @@ import { LlmClient, parseJsonFromLlm } from '../core/llm/client.js';
 import { config } from '../config.js';
 import type { Flow, PageNode, SiteMap } from './sitemap.js';
 import { normalizePath } from './sitemap.js';
+import { sanitizeProposedFlowText } from './field-values.js';
 
 function truncate(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n…[truncated]`;
@@ -153,11 +154,11 @@ Propose 3-6 end-to-end flows a QA tester should walk, ordered by importance. Kee
 
 DEEP FUNCTIONAL COVERAGE (important): the goal is to prove the PLATFORM works, not just that pages render. So for any content-creation app, include flows/milestones that actually EXERCISE features end-to-end, not just navigate past them:
 - CREATE content where the app allows it (e.g. create a character, add a scene, add an item) and verify the new thing appears.
-- EDIT content (script/scene/prompt/profile text) by inserting unique marker text and verifying it persists.
+- EDIT content (script/scene/prompt/profile text) using realistic user-provided prose and verify it persists.
 - Walk multi-step creation wizards to their real terminal artifact, exercising the meaningful choice at each step.
 - A creation flow MUST include the actual submit/generate action, wait for generation, every required follow-up field, Finalize/Save, and a final verification that the new item is visible in its persistent list/library. Filling a prompt or reaching a generated preview is not completion.
 - A video flow MUST continue beyond Edit scenes: wait for scenes, click Create Video/render, wait for rendering, and verify a playable video or download/final artifact. Do not end the flow merely because Edit scenes or a Create Video button is visible.
-Include real content edits/creations wherever the app supports them (the agent inserts unique marker text and verifies it appears). Prefer flows that end in a verifiable outcome.
+Include real content edits/creations wherever the app supports them. NEVER invent test-looking names or values such as QAMARK, AutoQA, QA-123, Zephyr, random tokens, UUIDs, or nonsense. For people use an ordinary name such as Jason; for descriptions use natural, coherent prose. The runtime asks the human before entering free text, so milestone goals should describe the field and outcome rather than embedding synthetic marker values. Prefer flows that end in a verifiable outcome.
 
 DISTINCT MODE/VARIANT COVERAGE (critical, easy to under-do): scan each page's Interactives list for a CLUSTER of several mutually-exclusive alternative options that represent different WORKFLOWS or generation modes, not settings — e.g. "Best(select), Top 3(select), Custom(select), Battle(select)" next to one Generate action, or "Video(tab), Image(tab), Video Edit(tab)". When you see this pattern, do NOT just pick one option and write a single flow around it — propose a SEPARATE flow (or at minimum clearly separate milestones) that each exercise a DIFFERENT one of those alternatives end-to-end, so every distinct mode gets tested at least once across the flows you propose. This is about covering every distinct FUNCTION, not enumerating combinations — do not multiply this by unrelated parameters (aspect ratio, duration, filters, sort order); use the default/first value for anything that is a parameter of the SAME workflow rather than an alternative workflow itself. If there are more alternative modes than you have flow slots for, still name each one across the milestones you do write (e.g. "Choose the Battle mode" in one flow, "Choose the Custom mode" in another) rather than repeating the same mode in more than one flow.
 
@@ -214,8 +215,8 @@ Respond with JSON only:
   return (parsed.flows ?? []).map((f) => {
     return {
       id: (f.id || 'flow').replace(/[^a-z0-9-]/gi, '-').toLowerCase(),
-      title: f.title ?? f.id,
-      description: f.description ?? '',
+      title: sanitizeProposedFlowText(f.title ?? f.id),
+      description: sanitizeProposedFlowText(f.description ?? ''),
       status: 'proposed' as const,
       entry: { pageId: f.entryPageId ?? '', url: f.entryUrl ?? undefined },
       milestones: (f.milestones ?? []).map((m, i) => {
@@ -233,7 +234,7 @@ Respond with JSON only:
         }
         return {
           id: m.id || `m${i + 1}`,
-          goal: m.goal,
+          goal: sanitizeProposedFlowText(m.goal),
           kind: ([
             'navigate',
             'edit',

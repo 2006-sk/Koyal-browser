@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { defaultCreationValue, fillFieldHintFromGoal } from './flow-runner.js';
 import { isProvenTrailOutcomeForFlow } from './deep-walker.js';
+import { sanitizeProposedFlowText } from './field-values.js';
 
 test('character names default to a normal human name', () => {
   assert.equal(defaultCreationValue('Enter a character name and continue'), 'Jason');
@@ -25,4 +26,14 @@ test('only terminal deep walks may generate replayable flows', () => {
   assert.equal(isProvenTrailOutcomeForFlow('no-progress'), false);
   assert.equal(isProvenTrailOutcomeForFlow('step-cap'), false);
   assert.equal(isProvenTrailOutcomeForFlow('aborted'), false);
+});
+
+test('synthetic proposal tokens are converted to realistic content', () => {
+  const description = sanitizeProposedFlowText(
+    "Fill the character description with unique marker text 'QAMARK-CHAR-42 Korean man'",
+  );
+  const verification = sanitizeProposedFlowText("Verify character 'QAMARK-CHAR-42' appears");
+  assert.match(description, /friendly young pilot/i);
+  assert.match(verification, /Jason/);
+  assert.doesNotMatch(`${description} ${verification}`, /QAMARK|AutoQA|QA-\d|Zephyr/i);
 });

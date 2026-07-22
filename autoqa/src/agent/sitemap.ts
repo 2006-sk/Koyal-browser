@@ -111,7 +111,7 @@ export interface WalkTrail {
   runtimeSignals?: Array<{
     at: string;
     context: string;
-    kind: 'page-error' | 'console-error' | 'network-5xx';
+    kind: 'page-error' | 'console-error' | 'network-5xx' | 'processing-timeout';
     detail: string;
     screenshot?: string;
   }>;

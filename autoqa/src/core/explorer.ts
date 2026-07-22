@@ -24,6 +24,8 @@ export interface ExplorerAction {
   resolvedRole?: string;
   /** Set after a successful upload — the local file that was attached */
   uploadedPath?: string;
+  /** The action was attempted but the browser rejected it; never compile it into a recipe. */
+  executionFailed?: boolean;
 }
 
 export interface ExplorerResult {
@@ -36,6 +38,8 @@ export interface ExplorerResult {
   error?: string;
   /** Set when authWatch is enabled and an auth-endpoint response was observed. */
   authStatus?: number;
+  /** Deterministic processing exceeded its configured ceiling while still visibly active. */
+  processingTimedOut?: boolean;
 }
 
 export interface ExplorerHooks {
@@ -66,7 +70,7 @@ export function isSensitiveFieldLabel(label: string): boolean {
  * "Delivery est. 5 days") that would otherwise trigger a multi-minute dead wait.
  */
 const IN_PROGRESS_RE =
-  /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
+  /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\btaking longer than expected\b|\bserver may be busy\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
 const IN_PROGRESS_DONE_RE = /(?:processing|rendering|export) complete|100\s?%|\bdone\b\s*[!.]/i;
 export const PROCESSING_VISION_POLL_THRESHOLD = 3;
 
@@ -337,10 +341,11 @@ export class Explorer {
           `  [explorer] in-page processing detected — waiting it out deterministically (max ${Math.round((config.deep.processingWaitMs - processingWaitedMs) / 1000)}s)`,
         );
         const t0 = Date.now();
+        const remainingWaitBudget = config.deep.processingWaitMs - processingWaitedMs;
         let polls = 0;
         let visualRelease: ProcessingVisualAssessment | undefined;
         try {
-          while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
+          while (Date.now() - t0 < remainingWaitBudget) {
             this.browser.wait(5000);
             polls++;
             const processingFailure = captureRuntimeFailure(this.browser);
@@ -381,6 +386,7 @@ export class Explorer {
         snapshot = this.browser.snapshotInteractive();
         url = this.browser.getUrl();
         const waitedS = Math.round((Date.now() - t0) / 1000);
+        const waitBudgetExhausted = Date.now() - t0 >= remainingWaitBudget;
         let stillProcessingSnapshot = snapshot;
         if (!hasInlineProcessing(stillProcessingSnapshot)) {
           try {
@@ -395,16 +401,24 @@ export class Explorer {
               ? 'vision confirmed the asynchronous operation finished; returning control to the normal goal loop'
               : 'vision found a visible blocker; returning control to the normal goal loop for recovery',
           );
+        } else if (hasInlineProcessing(stillProcessingSnapshot) && waitBudgetExhausted) {
+          const error =
+            `Processing exceeded the configured wait ceiling (${waitedS}s) and is still visibly active. ` +
+            'Classify this as a processing-timeout bug; do not click unrelated controls or restart the same state.';
+          stepsTaken.push(error);
+          return {
+            goal,
+            success: false,
+            actions,
+            stepsTaken,
+            finalUrl: url,
+            finalSnapshot: stillProcessingSnapshot,
+            error,
+            processingTimedOut: true,
+          };
         } else if (hasInlineProcessing(stillProcessingSnapshot)) {
-          // Loop exited on the budget, NOT because processing cleared — server-side
-          // work (script/scene generation, final render) can take several minutes,
-          // longer than one wait budget. Tell the LLM plainly it just needs MORE
-          // time and must NOT navigate away: the observed failure mode was the
-          // explorer giving up here and clicking a sidebar/step link, which
-          // abandoned the in-progress wizard entirely (koyal script-gen, 2026-07-20).
-          // Raise AUTOQA_PROCESSING_WAIT_MS so the whole generation fits in-budget.
           stepsTaken.push(
-            `waited ${waitedS}s but in-page processing is STILL ongoing — this server-side work just needs MORE time. Respond with another "wait"; do NOT click other controls, sidebar/step links, or navigate away, or you will abandon the in-progress work.`,
+            `processing wait ended early after ${waitedS}s while the busy state remained visible; return control for a fresh deterministic assessment`,
           );
         } else {
           stepsTaken.push(
@@ -447,6 +461,9 @@ export class Explorer {
         const resolved = resolveRefLabel(decisionSnapshot, decision.ref);
         decision.resolvedLabel = resolved.label;
         decision.resolvedRole = resolved.role;
+        if (!decision.resolvedLabel && (decision.action === 'fill' || decision.action === 'select')) {
+          decision.resolvedLabel = this.browser.fieldLabelAtRef(decision.ref) || undefined;
+        }
       }
 
       if (decision.action === 'fill' && decision.value !== undefined && this.hooks.onFillRequested) {
@@ -633,6 +650,7 @@ export class Explorer {
           processingVisuallyComplete = false;
         }
       } catch (error) {
+        decision.executionFailed = true;
         const msg = error instanceof Error ? error.message : String(error);
         stepsTaken.push(`action failed: ${msg}`);
         console.warn(`  [explorer] action failed (will re-snapshot): ${msg}`);

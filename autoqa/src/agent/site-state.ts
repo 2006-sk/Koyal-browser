@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import type { SiteMap } from './sitemap.js';
 import type { StatementEntry } from './statements.js';
 import type { Recipe } from './recipes.js';
-import type { SavedFieldValue } from './field-values.js';
+import { sanitizeProposedFlowText, type SavedFieldValue } from './field-values.js';
 
 export interface Secrets {
   email?: string;
@@ -83,6 +83,24 @@ export class SiteState {
       siteHints: [],
     });
     this.sitemap.walks = this.sitemap.walks ?? {};
+    let sanitizedStoredFlows = false;
+    for (const flow of this.sitemap.flows) {
+      const title = sanitizeProposedFlowText(flow.title);
+      const description = sanitizeProposedFlowText(flow.description);
+      if (title !== flow.title || description !== flow.description) sanitizedStoredFlows = true;
+      flow.title = title;
+      flow.description = description;
+      for (const milestone of flow.milestones) {
+        const goal = sanitizeProposedFlowText(milestone.goal);
+        const successHint = milestone.successHint
+          ? sanitizeProposedFlowText(milestone.successHint)
+          : undefined;
+        if (goal !== milestone.goal || successHint !== milestone.successHint) sanitizedStoredFlows = true;
+        milestone.goal = goal;
+        milestone.successHint = successHint;
+      }
+    }
+    if (sanitizedStoredFlows) this.saveSitemap();
     // A bounded walk that explicitly ended in no-progress/step-cap is useful
     // diagnostic evidence, but it never proved an end-to-end flow. Older
     // versions generated and users approved these anyway, producing fill-only
@@ -187,7 +205,14 @@ export class SiteState {
     writeJsonAtomic(this.fieldValuesPath, this.fieldValues);
   }
 
-  reset(parts: { sitemap?: boolean; statements?: boolean; recipes?: boolean; auth?: boolean; all?: boolean }): string[] {
+  reset(parts: {
+    sitemap?: boolean;
+    statements?: boolean;
+    recipes?: boolean;
+    auth?: boolean;
+    values?: boolean;
+    all?: boolean;
+  }): string[] {
     const removed: string[] = [];
     const rm = (p: string) => {
       if (fs.existsSync(p)) {
@@ -203,6 +228,10 @@ export class SiteState {
     if (parts.statements) rm(this.statementsPath);
     if (parts.recipes) rm(this.recipesPath);
     if (parts.auth) rm(this.authStatePath);
+    if (parts.values) {
+      rm(this.fieldValuesPath);
+      this.fieldValues = {};
+    }
     return removed;
   }
 }

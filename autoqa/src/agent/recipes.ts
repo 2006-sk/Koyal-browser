@@ -50,16 +50,22 @@ export function recordFromExplorer(
   state: SiteState,
   id: string,
   result: ExplorerResult,
-  options?: { secrets?: { email?: string; password?: string }; successCheck?: Recipe['successCheck'] },
+  options?: {
+    secrets?: { email?: string; password?: string };
+    successCheck?: Recipe['successCheck'];
+    fallbackFieldHint?: string;
+  },
 ): Recipe | null {
   const steps: RecipeStep[] = [];
 
   for (const action of result.actions) {
+    if (action.executionFailed) continue;
     if (action.action === 'click' && action.resolvedLabel) {
       steps.push({ kind: 'click', label: action.resolvedLabel, role: action.resolvedRole });
-    } else if (action.action === 'fill' && action.resolvedLabel && action.value !== undefined) {
-      const step: RecipeStep = { kind: 'fill', hint: action.resolvedLabel, value: action.value };
-      const labelSecretRef = secretRefForLabel(action.resolvedLabel);
+    } else if (action.action === 'fill' && (action.resolvedLabel || options?.fallbackFieldHint) && action.value !== undefined) {
+      const label = action.resolvedLabel ?? options!.fallbackFieldHint!;
+      const step: RecipeStep = { kind: 'fill', hint: label, value: action.value };
+      const labelSecretRef = secretRefForLabel(label);
       if (labelSecretRef) {
         step.value = '';
         step.secretRef = labelSecretRef;
@@ -71,8 +77,8 @@ export function recordFromExplorer(
         step.secretRef = 'password';
       }
       steps.push(step);
-    } else if (action.action === 'select' && action.resolvedLabel && action.value !== undefined) {
-      steps.push({ kind: 'select', hint: action.resolvedLabel, value: action.value });
+    } else if (action.action === 'select' && (action.resolvedLabel || options?.fallbackFieldHint) && action.value !== undefined) {
+      steps.push({ kind: 'select', hint: action.resolvedLabel ?? options!.fallbackFieldHint!, value: action.value });
     } else if (action.action === 'press' && action.value !== undefined) {
       steps.push({ kind: 'press', key: action.value });
     } else if (action.action === 'upload' && action.uploadedPath) {
@@ -83,8 +89,6 @@ export function recordFromExplorer(
     }
     // 'wait' steps are dropped; replay relies on Nav delays + successCheck
   }
-
-  if (steps.length === 0) return null;
 
   const successCheck: Recipe['successCheck'] = options?.successCheck ?? {};
   if (!successCheck.urlIncludes && result.finalUrl) {
@@ -120,7 +124,6 @@ export function recordWalkRecipe(
   steps: RecipeStep[],
   successCheck: Recipe['successCheck'],
 ): Recipe | null {
-  if (steps.length === 0) return null;
   const existing = state.recipes[id];
   const recipe: Recipe = {
     id,
@@ -237,7 +240,7 @@ export class RecipePlayer {
           let satisfied = false;
           while (Date.now() < deadline) {
             const url = this.browser.getUrl();
-            const snap = this.browser.snapshotInteractive();
+            const snap = this.browser.snapshotFull();
             const urlOk = step.urlIncludes ? url.toLowerCase().includes(step.urlIncludes.toLowerCase()) : true;
             const textOk = step.textIncludes ? snap.toLowerCase().includes(step.textIncludes.toLowerCase()) : true;
             if (urlOk && textOk) {
@@ -258,7 +261,7 @@ export class RecipePlayer {
 
     // final success check
     const url = this.browser.getUrl();
-    const snap = this.browser.snapshotInteractive();
+    const snap = this.browser.snapshotFull();
     const urlOk = recipe.successCheck.urlIncludes
       ? url.toLowerCase().includes(recipe.successCheck.urlIncludes.toLowerCase())
       : true;

@@ -487,6 +487,43 @@ export class AgentBrowser {
     };
   }
 
+  /**
+   * Recover a stable field name when the accessibility snapshot exposes only
+   * `textbox [ref=eN]` with no accessible name. The ref's screen position lets
+   * us inspect the actual DOM control and use its label/aria-label/placeholder
+   * instead of persisting a brittle `e13` recipe hint.
+   */
+  fieldLabelAtRef(ref: string): string {
+    const box = this.getBox(ref.startsWith('@') ? ref : `@${ref}`);
+    if (!box) return '';
+    const x = Math.round(box.x + box.width / 2);
+    const y = Math.round(box.y + box.height / 2);
+    try {
+      return this.evalScript(
+        `(() => {
+          let el = document.elementFromPoint(${x}, ${y});
+          if (!el) return '';
+          const editable = el.matches?.('input,textarea,select,[contenteditable="true"]')
+            ? el
+            : (el.closest?.('label')?.control || el.querySelector?.('input,textarea,select,[contenteditable="true"]'));
+          if (editable) el = editable;
+          const aria = el.getAttribute?.('aria-label') || el.getAttribute?.('placeholder') || '';
+          if (aria.trim()) return aria.trim();
+          const id = el.getAttribute?.('id');
+          if (id) {
+            const label = Array.from(document.querySelectorAll('label')).find((candidate) => candidate.htmlFor === id);
+            if (label?.textContent?.trim()) return label.textContent.trim();
+          }
+          const wrapping = el.closest?.('label');
+          return wrapping?.textContent?.trim() || el.getAttribute?.('name') || '';
+        })()`,
+        { skipEnsure: true },
+      ).trim();
+    } catch {
+      return '';
+    }
+  }
+
   moveOverlayCursor(x: number, y: number): void {
     this.evalScript(
       `(function(){if(window.__qaAgentCursorEnsure)window.__qaAgentCursorEnsure();window.dispatchEvent(new CustomEvent('qa-cursor-move',{detail:{x:${x},y:${y}}}));})();`,
