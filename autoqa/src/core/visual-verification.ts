@@ -7,6 +7,11 @@ export interface VisualAssessment {
   concerns: string[];
 }
 
+export interface ProcessingVisualAssessment {
+  status: 'active' | 'complete' | 'blocked' | 'uncertain';
+  summary: string;
+}
+
 /**
  * Corroborating visual oracle. It may surface a concern for review, but callers
  * must never use it to turn a deterministic failure into a pass.
@@ -47,5 +52,51 @@ export async function assessScreenshot(
     status,
     summary: String(parsed.summary ?? 'No visual summary supplied'),
     concerns: Array.isArray(parsed.concerns) ? parsed.concerns.map(String) : [],
+  };
+}
+
+/**
+ * Resolve a contradiction between the text detector and the rendered page.
+ * "complete" only means the asynchronous operation has finished; it does not
+ * assert that the caller's entire creation flow or milestone is complete.
+ */
+export async function assessProcessingScreenshot(
+  llm: LlmClient,
+  screenshotPath: string,
+  context: { action: string; url: string; observations?: string },
+): Promise<ProcessingVisualAssessment> {
+  const data = fs.readFileSync(screenshotPath).toString('base64');
+  const raw = await llm.complete({
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a conservative visual state verifier for browser automation. Inspect only visible evidence. ' +
+          'Classify whether an asynchronous operation is actively running, visibly finished, visibly blocked, or cannot be determined. ' +
+          'A finished generated preview with usable Edit/Revert/Regenerate/Save/Next controls is complete even when static copy mentions generating. ' +
+          'A spinner, changing progress/ETA, disabled Generating/Rendering control, or explicit wait message is active. ' +
+          'A validation error, failed generation, disabled completion control with a visible reason, or required-field error is blocked. ' +
+          'Do not judge artistic quality. Return JSON only.',
+      },
+      {
+        role: 'user',
+        content:
+          `Operation: ${context.action}\nURL: ${context.url}\n` +
+          `${context.observations ? `Text observations:\n${context.observations}\n` : ''}` +
+          'Return {"status":"active|complete|blocked|uncertain","summary":"one sentence grounded in visible evidence"}. ' +
+          'Use complete only for the async operation, not for the overall workflow.',
+      },
+    ],
+    image: { data, mediaType: 'image/png' },
+    maxTokens: 350,
+  });
+  const parsed = parseJsonFromLlm<Partial<ProcessingVisualAssessment>>(raw);
+  const status = parsed.status;
+  if (status !== 'active' && status !== 'complete' && status !== 'blocked' && status !== 'uncertain') {
+    throw new Error(`Invalid processing visual status: ${String(status)}`);
+  }
+  return {
+    status,
+    summary: String(parsed.summary ?? 'No processing-state summary supplied'),
   };
 }

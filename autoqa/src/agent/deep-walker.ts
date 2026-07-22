@@ -5,7 +5,7 @@ import { randomEditMarker } from '../core/edits.js';
 import { hasInlineProcessing, type Explorer, type ExplorerResult } from '../core/explorer.js';
 import { LlmBudgetExceededError, type LlmClient } from '../core/llm/client.js';
 import type { Nav } from '../core/nav.js';
-import { assessScreenshot } from '../core/visual-verification.js';
+import { assessProcessingScreenshot, assessScreenshot } from '../core/visual-verification.js';
 import { captureRuntimeFailure } from '../core/runtime-failure.js';
 import { classifyPage, looksLikeAuthGate } from './page-classifier.js';
 import { recordWalkRecipe, type RecipeStep } from './recipes.js';
@@ -197,6 +197,27 @@ async function visuallyProveTerminal(
   } catch (error) {
     console.warn(`[walk] terminal vision check unavailable: ${error instanceof Error ? error.message : error}`);
     return false;
+  }
+}
+
+async function visuallyAffirmWalkProcessing(
+  deps: DeepWalkerDeps,
+  screenshot: string,
+  action: string,
+  observations: string,
+): Promise<'active' | 'complete' | 'blocked' | 'uncertain' | undefined> {
+  try {
+    deps.browser.screenshotAnnotated(screenshot);
+    const assessment = await assessProcessingScreenshot(deps.llm, screenshot, {
+      action,
+      url: deps.browser.getUrl(),
+      observations,
+    });
+    console.log(`[walk] vision processing affirmation: ${assessment.status} — ${assessment.summary}`);
+    return assessment.status;
+  } catch (error) {
+    console.warn(`[walk] processing vision check unavailable: ${error instanceof Error ? error.message : error}`);
+    return undefined;
   }
 }
 
@@ -404,6 +425,7 @@ export async function deepWalk(
     let noProgress = 0;
     let lastSignature = '';
     const inlineWaited = new Set<string>();
+    const visionReleasedProcessing = new Set<string>();
 
     steps.push({
       index: 0,
@@ -489,7 +511,7 @@ export async function deepWalk(
         continue;
       }
 
-      if (kind === 'processing') {
+      if (kind === 'processing' && !visionReleasedProcessing.has(page.id)) {
         // 5s poll cadence, screenshot every 4th poll — never one long wait
         console.log(`[walk] processing state "${page.id}" — waiting (max ${config.deep.processingWaitMs / 1000}s)`);
         const t0 = Date.now();
@@ -531,6 +553,19 @@ export async function deepWalk(
             resolved = true;
             break;
           }
+          if (polls === 3) {
+            const visualStatus = await visuallyAffirmWalkProcessing(
+              deps,
+              path.join(opts.evidenceDir, `${slug(trailId)}-processing-affirm-${i}.png`),
+              `Wait for processing state "${page.title}" to finish`,
+              'The deterministic page classifier still labels this state as processing after three polls.',
+            );
+            if (visualStatus === 'complete' || visualStatus === 'blocked') {
+              visionReleasedProcessing.add(page.id);
+              resolved = true;
+              break;
+            }
+          }
         }
         steps.push({
           index: i,
@@ -570,7 +605,17 @@ export async function deepWalk(
               // best-effort
             }
           }
-          if (!hasInlineProcessing(browser.snapshotInteractive())) break;
+          const currentSnapshot = browser.snapshotInteractive();
+          if (!hasInlineProcessing(currentSnapshot)) break;
+          if (polls === 3) {
+            const visualStatus = await visuallyAffirmWalkProcessing(
+              deps,
+              path.join(opts.evidenceDir, `${slug(trailId)}-inline-affirm-${i}.png`),
+              `Wait for inline processing on "${page.title}" to finish`,
+              'The text detector still reports inline processing after three polls.',
+            );
+            if (visualStatus === 'complete' || visualStatus === 'blocked') break;
+          }
         }
         const waited = Date.now() - t0;
         console.log(`[walk] inline processing cleared/capped after ${Math.round(waited / 1000)}s`);

@@ -8,6 +8,7 @@ import { captureRuntimeFailure } from './runtime-failure.js';
 import { normalizeNetworkRequests } from './verification.js';
 import { classifyAuthStatus, describeAuthFailure, pickAuthResponse } from './auth-response.js';
 import type { NetworkRequest } from './types.js';
+import { assessProcessingScreenshot, type ProcessingVisualAssessment } from './visual-verification.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
@@ -67,9 +68,20 @@ export function isSensitiveFieldLabel(label: string): boolean {
 const IN_PROGRESS_RE =
   /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
 const IN_PROGRESS_DONE_RE = /(?:processing|rendering|export) complete|100\s?%|\bdone\b\s*[!.]/i;
+export const PROCESSING_VISION_POLL_THRESHOLD = 3;
 
 export function hasInlineProcessing(snapshot: string): boolean {
   return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
+}
+
+const COMPLETION_CONTROL_RE =
+  /(?:button|link)\s+"[^"]*\b(?:create|generate|regenerate|finalize|save|next|continue|submit|finish|complete)\b[^"]*"[^\n]*(?:disabled|busy)/i;
+const VISIBLE_VALIDATION_RE =
+  /\b(?:not allowed|already (?:exists|used|taken)|only [^.\n]{0,80} allowed|required|invalid|must (?:be|contain|have)|cannot|can't|validation error|failed)\b/i;
+
+/** Narrow vision trigger: a completion control is disabled and a concrete validation reason is visible. */
+export function hasBlockingValidationState(snapshot: string): boolean {
+  return COMPLETION_CONTROL_RE.test(snapshot) && VISIBLE_VALIDATION_RE.test(snapshot);
 }
 
 export function explicitGoalValue(goal: string): string | undefined {
@@ -166,6 +178,31 @@ export class Explorer {
     }
   }
 
+  /** Ask vision to arbitrate only after text-based processing has stayed unchanged for several polls. */
+  private async affirmProcessingState(
+    goal: string,
+    url: string,
+    observations: string,
+  ): Promise<ProcessingVisualAssessment | undefined> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-processing-vision-'));
+    const filePath = path.join(dir, 'page.png');
+    try {
+      this.browser.screenshotAnnotated(filePath);
+      return await assessProcessingScreenshot(this.llm, filePath, {
+        action: goal,
+        url,
+        observations,
+      });
+    } catch (error) {
+      console.warn(
+        `  [vision] processing affirmation unavailable: ${error instanceof Error ? error.message : error}`,
+      );
+      return undefined;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   constructor(
     private readonly browser: AgentBrowser,
     options?: {
@@ -196,8 +233,11 @@ export class Explorer {
     let repeatCount = 0;
     let lastSignature = '';
     let processingWaitedMs = 0;
+    let suppressProcessingUntilAction = false;
+    let processingVisuallyComplete = false;
     let lastRealUrl = this.browser.getUrl();
     let blankRecoveryAttempts = 0;
+    let validationVisionUsed = false;
 
     const goalForLog = this.redact(goal);
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
@@ -281,7 +321,11 @@ export class Explorer {
           // keep the interactive snapshot
         }
       }
-      if (hasInlineProcessing(processingSnapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+      if (
+        hasInlineProcessing(processingSnapshot) &&
+        processingWaitedMs < config.deep.processingWaitMs &&
+        !suppressProcessingUntilAction
+      ) {
         const existingFailure = captureRuntimeFailure(this.browser);
         if (existingFailure) {
           stepsTaken.push(
@@ -293,9 +337,12 @@ export class Explorer {
           `  [explorer] in-page processing detected — waiting it out deterministically (max ${Math.round((config.deep.processingWaitMs - processingWaitedMs) / 1000)}s)`,
         );
         const t0 = Date.now();
+        let polls = 0;
+        let visualRelease: ProcessingVisualAssessment | undefined;
         try {
           while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
             this.browser.wait(5000);
+            polls++;
             const processingFailure = captureRuntimeFailure(this.browser);
             if (processingFailure) {
               stepsTaken.push(
@@ -314,6 +361,18 @@ export class Explorer {
             // empty snapshot = capture/daemon error, NOT "processing finished" —
             // stop waiting and let the normal loop re-snapshot and decide
             if (!now.trim() || !hasInlineProcessing(now)) break;
+            if (polls === PROCESSING_VISION_POLL_THRESHOLD) {
+              const assessment = await this.affirmProcessingState(goal, url, truncateSnapshot(now, 5000));
+              if (assessment) {
+                stepsTaken.push(`vision processing affirmation: ${assessment.status} — ${assessment.summary}`);
+                if (assessment.status === 'complete' || assessment.status === 'blocked') {
+                  visualRelease = assessment;
+                  suppressProcessingUntilAction = true;
+                  processingVisuallyComplete = assessment.status === 'complete';
+                  break;
+                }
+              }
+            }
           }
         } catch (error) {
           stepsTaken.push(`processing-wait interrupted: ${error instanceof Error ? error.message : error}`);
@@ -330,7 +389,13 @@ export class Explorer {
             // keep interactive snapshot
           }
         }
-        if (hasInlineProcessing(stillProcessingSnapshot)) {
+        if (visualRelease) {
+          stepsTaken.push(
+            visualRelease.status === 'complete'
+              ? 'vision confirmed the asynchronous operation finished; returning control to the normal goal loop'
+              : 'vision found a visible blocker; returning control to the normal goal loop for recovery',
+          );
+        } else if (hasInlineProcessing(stillProcessingSnapshot)) {
           // Loop exited on the budget, NOT because processing cleared — server-side
           // work (script/scene generation, final render) can take several minutes,
           // longer than one wait budget. Tell the LLM plainly it just needs MORE
@@ -350,19 +415,36 @@ export class Explorer {
 
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
       const llmStart = Date.now();
+      let decisionSnapshot = snapshot;
+      let decisionImage = options?.visionFirst && step === 0 ? this.captureVisionImage() : undefined;
+      if (!validationVisionUsed) {
+        try {
+          const fullSnapshot = this.browser.snapshotFull();
+          if (hasBlockingValidationState(fullSnapshot)) {
+            validationVisionUsed = true;
+            decisionSnapshot = fullSnapshot;
+            decisionImage = this.captureVisionImage();
+            stepsTaken.push(
+              'narrow vision trigger: a required completion control is disabled beside visible validation text; diagnose the blocker before retrying',
+            );
+          }
+        } catch {
+          // best-effort diagnostic; retain the normal interactive decision path
+        }
+      }
       let decision = await this.decideNextAction(
         goal,
         url,
-        snapshot,
+        decisionSnapshot,
         stepsTaken,
-        options?.visionFirst && step === 0 ? this.captureVisionImage() : undefined,
+        decisionImage,
       );
       console.log(
         `  [explorer] LLM responded in ${Date.now() - llmStart}ms → ${decision.action}${decision.ref ? ` ${decision.ref}` : ''}${decision.reason ? ` (${decision.reason})` : ''}`,
       );
 
       if (decision.ref) {
-        const resolved = resolveRefLabel(snapshot, decision.ref);
+        const resolved = resolveRefLabel(decisionSnapshot, decision.ref);
         decision.resolvedLabel = resolved.label;
         decision.resolvedRole = resolved.role;
       }
@@ -486,11 +568,18 @@ export class Explorer {
         // Never accept the LLM's "done" while the FULL page still visibly says
         // generation/processing is active (live beta.koyal.ai avatar case).
         const fullSnapshot = this.browser.snapshotFull();
-        if (hasInlineProcessing(fullSnapshot) && processingWaitedMs < config.deep.processingWaitMs) {
+        if (
+          hasInlineProcessing(fullSnapshot) &&
+          processingWaitedMs < config.deep.processingWaitMs &&
+          !processingVisuallyComplete
+        ) {
           const t0 = Date.now();
+          let polls = 0;
+          let visualRelease: ProcessingVisualAssessment | undefined;
           stepsTaken.push('done suppressed: full page still shows active generation/processing');
           while (Date.now() - t0 < config.deep.processingWaitMs - processingWaitedMs) {
             this.browser.wait(5000);
+            polls++;
             const failure = captureRuntimeFailure(this.browser);
             if (failure) {
               stepsTaken.push(
@@ -500,8 +589,26 @@ export class Explorer {
             }
             const now = this.browser.snapshotFull();
             if (!now.trim() || !hasInlineProcessing(now)) break;
+            if (polls === PROCESSING_VISION_POLL_THRESHOLD) {
+              const assessment = await this.affirmProcessingState(goal, url, truncateSnapshot(now, 5000));
+              if (assessment) {
+                stepsTaken.push(`vision processing affirmation: ${assessment.status} — ${assessment.summary}`);
+                if (assessment.status === 'complete' || assessment.status === 'blocked') {
+                  visualRelease = assessment;
+                  break;
+                }
+              }
+            }
           }
           processingWaitedMs += Date.now() - t0;
+          if (visualRelease?.status === 'complete') {
+            const finalSnapshot = this.browser.snapshotFull();
+            stepsTaken.push('vision confirmed processing finished after the LLM had already satisfied the goal');
+            return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot };
+          }
+          if (visualRelease?.status === 'blocked') {
+            stepsTaken.push('vision found a visible blocker after done; resuming exploration instead of passing');
+          }
           continue;
         }
         return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: snapshot };
@@ -521,6 +628,10 @@ export class Explorer {
 
       try {
         await this.executeAction(decision, stepsTaken);
+        if (decision.action !== 'wait') {
+          suppressProcessingUntilAction = false;
+          processingVisuallyComplete = false;
+        }
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         stepsTaken.push(`action failed: ${msg}`);
