@@ -5,6 +5,7 @@ import type { SiteMap } from './sitemap.js';
 import type { StatementEntry } from './statements.js';
 import type { Recipe } from './recipes.js';
 import { sanitizeProposedFlowText, type SavedFieldValue } from './field-values.js';
+import { parseContextualControlLabel } from '../core/nav.js';
 
 export interface Secrets {
   email?: string;
@@ -29,6 +30,41 @@ function writeJsonAtomic(filePath: string, data: unknown): void {
   const tmp = `${filePath}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   fs.renameSync(tmp, filePath);
+}
+
+/**
+ * Older walk compilation assumed every successful click navigated to a new
+ * screen. Repeated card mutations often complete in place instead: the card
+ * becomes pending, then usable again. A recipe containing the contextual click
+ * followed by a processing barrier is direct learned evidence of that shape.
+ */
+export function normalizeSamePageContextualMutationGoal(
+  goal: string,
+  recipe: Recipe | undefined,
+): string {
+  if (!recipe?.steps.some((step) => step.kind === 'waitForProcessing')) return goal;
+  if (
+    recipe.steps.some(
+      (step) =>
+        step.kind === 'open' ||
+        (step.kind === 'waitFor' && Boolean(step.urlIncludes || step.textIncludes)),
+    )
+  ) {
+    return goal;
+  }
+  const contextual = [...goal.matchAll(/"([^"]+)"/g)]
+    .map((match) => parseContextualControlLabel(match[1]))
+    .find(
+      (parts) =>
+        parts &&
+        /\b(generate|regenerate|refresh|retry|update|rebuild)\b/i.test(parts.action),
+    );
+  if (!contextual || !/\bthen advance one screen\b/i.test(goal)) return goal;
+  return (
+    `On this page: click "${contextual.action} (${contextual.owner})" exactly once, then wait until ` +
+    `"${contextual.owner}" is visibly finished and usable. Remaining on the same page is valid; ` +
+    'do not submit the action again after processing completes.'
+  );
 }
 
 /**
@@ -118,6 +154,24 @@ export class SiteState {
     if (quarantined) this.saveSitemap();
     this.statements = readJson<StatementEntry[]>(this.statementsPath, []);
     this.recipes = readJson<Record<string, Recipe>>(this.recipesPath, {});
+    let samePageGoalsMigrated = false;
+    for (const flow of this.sitemap.flows) {
+      for (const milestone of flow.milestones) {
+        const recipe = this.recipes[`flow:${flow.id}:${milestone.id}`];
+        const normalizedGoal = normalizeSamePageContextualMutationGoal(
+          milestone.goal,
+          recipe,
+        );
+        if (normalizedGoal === milestone.goal) continue;
+        milestone.goal = normalizedGoal;
+        if (recipe) recipe.goal = normalizedGoal;
+        samePageGoalsMigrated = true;
+      }
+    }
+    if (samePageGoalsMigrated) {
+      this.saveSitemap();
+      this.saveRecipes();
+    }
     // `approved` used to mean only "the human selected this proposal", even if
     // most milestones had never run and had no recipe. That made partial LLM
     // plans look deterministic. Migrate every legacy selected flow into the

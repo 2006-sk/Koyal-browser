@@ -12,7 +12,10 @@ import {
 import type { TestStep, VerificationExpectation, VerificationResult } from './types.js';
 import { VerificationLayer } from './verification.js';
 import type { LlmClient } from './llm/client.js';
-import { assessScreenshot } from './visual-verification.js';
+import {
+  assessArtifactPersistenceScreenshot,
+  assessScreenshot,
+} from './visual-verification.js';
 
 export interface StepContext {
   browser: AgentBrowser;
@@ -38,6 +41,10 @@ export async function recordVerifiedStep(
     explorerSteps?: string[];
     /** Run screenshot review for real milestones (not every probe). */
     visualVerification?: boolean;
+    /** For creation milestones, require the dedicated final-artifact oracle. */
+    artifactPersistenceVerification?: boolean;
+    /** Run-specific name/description the artifact oracle should locate. */
+    artifactPersistenceIdentity?: string;
   },
 ): Promise<TestStep> {
   const result = await ctx.verification.verifyAfterAction(meta.expectation, meta.waitOptions);
@@ -79,13 +86,36 @@ export async function recordVerifiedStep(
   const screenshotPath = path.join(stepDir, 'screenshot.png');
   if (meta.visualVerification && ctx.llm && fs.existsSync(screenshotPath)) {
     try {
-      const visual = await assessScreenshot(ctx.llm, screenshotPath, {
-        action: meta.action,
-        expected: meta.expected,
-        url: result.signals.url,
-        observations: meta.explorerSteps?.join('\n'),
-      });
+      const visual = meta.artifactPersistenceVerification
+          ? await assessArtifactPersistenceScreenshot(ctx.llm, screenshotPath, {
+            action: meta.action,
+            url: result.signals.url,
+            expectedArtifact: meta.artifactPersistenceIdentity,
+            observations: [
+              ...(meta.explorerSteps ?? []),
+            ]
+              .filter(Boolean)
+              .join('\n'),
+          }).then((assessment) => ({
+            status:
+              assessment.status === 'persisted'
+                ? ('clear' as const)
+                : assessment.status === 'blocked'
+                  ? ('concern' as const)
+                  : ('uncertain' as const),
+            summary: assessment.summary,
+            concerns: assessment.status === 'persisted' ? [] : [assessment.summary],
+          }))
+        : await assessScreenshot(ctx.llm, screenshotPath, {
+            action: meta.action,
+            expected: meta.expected,
+            url: result.signals.url,
+            observations: meta.explorerSteps?.join('\n'),
+          });
       result.visualAssessment = visual;
+      if (meta.artifactPersistenceVerification) {
+        result.artifactPersistenceVerified = visual.status === 'clear';
+      }
       const visualPath = path.join(stepDir, 'visual-assessment.json');
       writeJson(visualPath, visual);
       files.push(visualPath);

@@ -20,13 +20,18 @@ import { ensureAuthenticated, type AuthContext } from './auth.js';
 import { extractCandidates, type Statements } from './statements.js';
 import { runProbesForMilestone, type ProbeContext } from './probes.js';
 import { recordFromExplorer, type RecipePlayer } from './recipes.js';
-import { Nav } from '../core/nav.js';
+import { Nav, parseContextualControlLabel } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
 import { looksLikeAuthGate, looksLikeSoft404 } from './page-classifier.js';
 import type { LlmClient } from '../core/llm/client.js';
-import { resolveHumanFieldValue } from './field-values.js';
+import {
+  fieldValueKey,
+  isLikelyUniqueCreationIdentityField,
+  resolveFreshHumanFieldValue,
+  resolveHumanFieldValue,
+} from './field-values.js';
 import {
   flowRunMode,
   hasEveryMilestoneRecipe,
@@ -256,31 +261,20 @@ async function ensureLoggedOutForEntry(
  * Only called at true flow start — never during replayUpTo repositioning, where
  * clicking "start fresh" again would blow away the progress being rebuilt.
  *
- * NOTE: the expected post-entry-navigation page is `flow.entry.pageId` — "the page
- * id where the flow starts" (see page-classifier.ts's entryPageId prompt field) —
- * NOT `flow.milestones[0].guardPhases`. Those two coincide only for deep-walked
- * flows, where milestone 1 acts ON the already-reached entry page. For the far
- * more common case of an LLM-proposed flow whose milestone 1 is itself a
- * *navigation* step (goal: "click X to reach Y"), guardPhases holds Y — the
- * DESTINATION milestone 1 is about to create, not the page entry navigation
- * alone should have already produced. Comparing against guardPhases there
- * always mismatches (since nothing has navigated to Y yet), asking a bogus
- * "did this resume stale state?" question on the very first run of virtually
- * every non-deep-walked flow on any site.
+ * The expected post-entry-navigation page is `flow.entry.pageId`. Current flow
+ * proposals and deep-walked flows use one consistent guard contract:
+ * `guardPhases` describes the page BEFORE a milestone runs, so milestone 1's
+ * guard is also a safe fallback when an older flow omitted entry.pageId.
  */
 async function applyFreshEntryHint(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
   // page-classifier.ts sets entry.pageId from the LLM's JSON directly (defaulting
   // to '' if the LLM omitted entryPageId) — the old guardPhases-based check ran
   // even in that case, so skipping entirely here would leave a flow with zero
   // draft-resume protection instead of the weaker-but-nonzero prior fallback.
-  // Only fall back to milestones[0].guardPhases when milestone 1 is NOT a
-  // navigate-type step — that's the exact condition under which guardPhases[0]
-  // legitimately describes the entry page itself rather than a destination
-  // milestone 1 hasn't reached yet (the original bug this function fixes).
   const firstMilestone = flow.milestones[0];
   const expectedEntryPageId =
     flow.entry.pageId ||
-    (firstMilestone?.kind !== 'navigate' ? firstMilestone?.guardPhases?.[0] : undefined);
+    firstMilestone?.guardPhases?.[0];
   if (!expectedEntryPageId) return;
 
   const needsAnonEntry = looksLikeAuthEntryPageId(expectedEntryPageId);
@@ -424,18 +418,29 @@ export function fillFieldHintFromGoal(goal: string): string | undefined {
   return goal.match(/\bfill\s+"([^"]+)"/i)?.[1];
 }
 
-function requiresPersistedCreation(flow: Flow, milestone: FlowMilestone): boolean {
-  const context = `${flow.id} ${flow.title} ${flow.description} ${milestone.goal}`;
-  if (milestone.kind === 'edit') {
-    // Do not inherit broad words from the FLOW title (e.g. every transcript
-    // edit lives inside "Create video"). Only this milestone's own wording can
-    // make an edit responsible for persisted creation.
-    return /character|asset|outfit|avatar|generate|regenerate|finalize/i.test(milestone.goal);
-  }
+export function requiresPersistedCreation(flow: Flow, milestone: FlowMilestone): boolean {
+  const finalMilestone = flow.milestones.at(-1);
+  if (!finalMilestone || finalMilestone.id !== milestone.id) return false;
   return (
-    milestone.kind === 'create' &&
-    /complete (?:adding|creation)|submit|generate|regenerate|try outfit|finalize|save|create video|render/i.test(milestone.goal)
+    flow.milestones.some((item) => item.kind === 'create' || item.kind === 'upload') ||
+    /\b(create|generate|regenerate|render|upload|add asset|new character|new outfit|checkout|order)\b/i.test(
+      `${flow.title} ${flow.description}`,
+    )
   );
+}
+
+export function artifactIdentityForMilestone(
+  milestone: FlowMilestone,
+  marker?: string,
+): string | undefined {
+  if (marker?.trim()) return marker.trim();
+  for (const match of milestone.goal.matchAll(/"([^"]+)"/g)) {
+    const contextual = parseContextualControlLabel(match[1]);
+    if (contextual && /generate|regenerate|create|edit|save|update/i.test(contextual.action)) {
+      return contextual.owner;
+    }
+  }
+  return undefined;
 }
 
 function hasCompletionAction(explored: ExplorerResult | null, recipe: typeof SiteState.prototype.recipes[string] | undefined): boolean {
@@ -450,16 +455,54 @@ function hasCompletionAction(explored: ExplorerResult | null, recipe: typeof Sit
   );
 }
 
+export function flowHasCompletionAction(
+  flow: Flow,
+  state: SiteState,
+  explored: ExplorerResult | null,
+): boolean {
+  if (hasCompletionAction(explored, undefined)) return true;
+  return flow.milestones.some((candidate) =>
+    hasCompletionAction(null, state.recipes[`flow:${flow.id}:${candidate.id}`]),
+  );
+}
+
 /** Rebuild flow position by replaying prior milestones' recipes from the entry. */
 async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): Promise<void> {
-  await navigateToEntry(deps, flow);
-  for (let j = 0; j < milestoneIndex; j++) {
+  // Prefer continuing from a verified intermediate state over resetting to the
+  // entry URL. Stateful wizards often make a direct entry URL resume a draft or
+  // redirect past its real first screen; resetting there can make an otherwise
+  // valid early recipe impossible to replay. Start at the latest prior
+  // milestone whose guard explicitly matches the live page.
+  const livePageId = currentPageId(deps);
+  let startIndex = -1;
+  for (let j = milestoneIndex - 1; j >= 0; j--) {
+    if (flow.milestones[j].guardPhases?.includes(livePageId)) {
+      startIndex = j;
+      break;
+    }
+  }
+  if (startIndex < 0) {
+    await navigateToEntry(deps, flow);
+    startIndex = 0;
+  } else {
+    console.log(
+      `[replay] resuming position recovery from verified intermediate page "${livePageId}" at ${flow.milestones[startIndex].id}`,
+    );
+  }
+
+  for (let j = startIndex; j < milestoneIndex; j++) {
     const recipeId = `flow:${flow.id}:${flow.milestones[j].id}`;
     if (!deps.player.has(recipeId)) continue;
-    await deps.player.tryReplay(recipeId, {
+    const replay = await deps.player.tryReplay(recipeId, {
       pageId: flow.milestones[j].guardPhases?.[0],
       secrets: { email: deps.state.secrets.email, password: deps.state.secrets.password },
     });
+    if (!replay.ok) {
+      console.warn(
+        `[replay] stopped position recovery: ${recipeId} failed at step ${replay.failedAtStep ?? 'unknown'}${replay.detail ? ` (${replay.detail})` : ''}`,
+      );
+      return;
+    }
   }
 }
 
@@ -640,6 +683,18 @@ export function orderRunnableFlows(flows: Flow[]): Flow[] {
     .map(({ flow }) => flow);
 }
 
+export function boundaryConstrainedGoal(goal: string): string {
+  if (!/\bclick\s+"[^"]+"[\s\S]*\badvance one screen\b/i.test(goal)) return goal;
+  return (
+    `${goal}\nMilestone boundary: stop as soon as the click reveals the next distinct dialog, form, wizard step, or page. ` +
+    'Do not fill, select, generate, save, or submit anything in that newly revealed state; that belongs to the next milestone.'
+  );
+}
+
+export function milestoneReturnsOnUrlChange(goal: string): boolean {
+  return /\badvance (?:exactly )?one screen\b/i.test(goal);
+}
+
 /**
  * A random marker string is meaningless as a search query — it deterministically
  * returns zero results, so a milestone that then asserts results appear always
@@ -667,10 +722,74 @@ function isSearchShapedGoal(goal: string): boolean {
  * "Select the delivery option and add special delivery instructions" contains
  * "option" but no action verb, even though it also has a genuine text field.
  */
-function isSelectionShapedGoal(goal: string): boolean {
+export function isSelectionShapedGoal(goal: string): boolean {
   return (
-    /\b(select|choose|checkbox|dropdown|combobox|toggle|checked|radio|option)\b/i.test(goal) &&
-    !/\b(type|enter|fill|write|comment|note|instructions?|feedback|message|describe|explain|details?)\b/i.test(goal)
+    (
+      /\b(select|choose|checkbox|dropdown|combobox|toggle|checked|radio|option)\b/i.test(goal) ||
+      /\b(?:adjust|change|set)\s+(?:the\s+)?(?:character\s+)?(?:voices?|emotion|style|theme|setting|mode)\b/i.test(goal)
+    ) &&
+    !(
+      /\b(?:enter|fill|write|comment|note|instructions?|feedback|message|describe|explain|details?)\b/i.test(goal) ||
+      // "story type", "content type", etc. use type as a noun. Treat it as a
+      // text-entry verb only when the surrounding wording actually asks to type
+      // a value. The old bare `type` check injected a random edit marker into
+      // Koyal's "Select the Character Driven story type" milestone.
+      /\btype\s+(?:in(?:to)?\b|the\b|a\b|an\b|some\b|text\b|value\b|['"])/i.test(goal)
+    )
+  );
+}
+
+function meaningfulPageTokens(value: string): string[] {
+  const ignored = new Set([
+    'a', 'an', 'and', 'at', 'in', 'of', 'on', 'page', 'screen', 'step', 'the',
+    'to', 'wizard',
+  ]);
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !ignored.has(token));
+}
+
+/**
+ * Flow proposals sometimes split one transition into an action milestone and a
+ * second "reach X" navigation milestone. When the previous milestone already
+ * left the browser on X, running the second goal through the LLM makes it invent
+ * another action and can leave the correct page. Only no-op a pure destination
+ * goal whose destination words are all grounded in the currently matched page
+ * id; compound "advance through ... and reach Y" goals remain actionable.
+ */
+export function isAlreadySatisfiedNavigationMilestone(
+  milestone: FlowMilestone,
+  pageId: string,
+): boolean {
+  if (milestone.kind !== 'navigate') return false;
+  if (/\b(click|choose|select|upload|fill|enter|edit|change|generate|create|save|submit|wait|verify)\b/i.test(milestone.goal)) {
+    return false;
+  }
+  const destination =
+    milestone.goal.match(
+      /\b(?:advance|navigate|go|return|open)\s+(?:back\s+)?to\s+(?:the\s+)?([^.;]+)/i,
+    )?.[1] ??
+    milestone.goal.match(/\breach\s+(?:the\s+)?([^.;]+)/i)?.[1];
+  if (!destination) return false;
+  const targetTokens = meaningfulPageTokens(destination);
+  if (targetTokens.length === 0) return false;
+  const pageTokens = new Set(meaningfulPageTokens(pageId));
+  return targetTokens.every((token) => pageTokens.has(token));
+}
+
+export function laterMilestoneStartingOnPage(
+  flow: Flow,
+  currentIndex: number,
+  pageId: string,
+  isInitialEntryPage: boolean,
+): number {
+  if (isInitialEntryPage || pageId === 'unknown') return -1;
+  return flow.milestones.findIndex(
+    (milestone, index) =>
+      index > currentIndex && milestone.guardPhases?.includes(pageId),
   );
 }
 
@@ -843,7 +962,7 @@ async function runMilestone(
   const selectionShaped = isSelectionShapedGoal(milestone.goal);
   const literalValueShaped = isLiteralValueShapedGoal(milestone.goal);
   const creationMustPersist = requiresPersistedCreation(flow, milestone);
-  let goal = milestone.goal;
+  let goal = boundaryConstrainedGoal(milestone.goal);
   let marker: string | undefined;
   if (milestone.kind === 'edit' && !authRelated && !searchShaped && !selectionShaped && !literalValueShaped) {
     // If a recipe already exists for this milestone (walked-flow recipes are
@@ -863,11 +982,18 @@ async function runMilestone(
     // replay fails and falls through to a fresh explore below — the goal's
     // "use exactly" instruction stays consistent with what a retry should type.
     const existingRecipe = state.recipes[recipeId];
+    const fieldHint = fillFieldHintFromGoal(milestone.goal);
     const recordedFillValue = existingRecipe?.steps
-      .filter((s) => s.kind === 'fill' && !s.secretRef)
+      .filter(
+        (s) =>
+          s.kind === 'fill' &&
+          !s.secretRef &&
+          (!fieldHint ||
+            s.hint.toLowerCase().replace(/\s+/g, ' ').trim() ===
+              fieldHint.toLowerCase().replace(/\s+/g, ' ').trim()),
+      )
       .map((s) => (s as { value: string }).value)
       .pop();
-    const fieldHint = fillFieldHintFromGoal(milestone.goal);
     if (fieldHint) {
       marker = await resolveHumanFieldValue(
         state,
@@ -876,6 +1002,35 @@ async function runMilestone(
         fieldHint,
         milestone.seedValue ?? recordedFillValue ?? defaultCreationValue(milestone.goal),
       );
+      // The preflight's intended value can differ from the final human answer
+      // (especially after --reset-values). The explorer is then instructed to
+      // propose that final answer verbatim. Store the equivalent intent alias
+      // now so its onFillRequested hook reuses the answer instead of asking the
+      // human for the identical field/value a second time in the same run.
+      const finalIntentKey = fieldValueKey(pageId, fieldHint, marker);
+      if (!state.fieldValues[finalIntentKey]) {
+        state.fieldValues[finalIntentKey] = {
+          pageId,
+          label: fieldHint,
+          value: marker,
+          updatedAt: new Date().toISOString(),
+        };
+        state.saveFieldValues();
+      }
+      // The human's run-specific answer is authoritative for the matching
+      // recipe field. Update that one step before replay so the preflight and
+      // RecipePlayer do not ask twice with two different intended values.
+      const matchingFill = existingRecipe?.steps.find(
+        (step) =>
+          step.kind === 'fill' &&
+          !step.secretRef &&
+          step.hint.toLowerCase().replace(/\s+/g, ' ').trim() ===
+            fieldHint.toLowerCase().replace(/\s+/g, ' ').trim(),
+      );
+      if (matchingFill?.kind === 'fill' && matchingFill.value !== marker) {
+        matchingFill.value = marker;
+        state.saveRecipes();
+      }
     } else if (recordedFillValue) {
       // A recipe already carries the value that will actually be typed on replay —
       // reuse it so verification and replay never diverge (see the long note above).
@@ -900,8 +1055,58 @@ async function runMilestone(
   let replayOk = false;
   let execution: MilestoneExecution['execution'] = 'none';
   const forceExplore = runMode === 'learning';
+  const alreadySatisfiedNavigation = isAlreadySatisfiedNavigationMilestone(milestone, pageId);
+  const replayFillHint =
+    fillFieldHintFromGoal(milestone.goal) ??
+    (isSearchShapedGoal(milestone.goal) ? milestone.successHint : undefined);
+  const replayFillOverrides: Record<string, string> = {};
+  if (replayFillHint && marker) {
+    replayFillOverrides[replayFillHint.toLowerCase().replace(/\s+/g, ' ').trim()] = marker;
+  }
 
-  if (loginShaped) {
+  // A deterministic creation replay that reuses a consumed name/title is
+  // structurally correct but guaranteed to be rejected on many real sites.
+  // Refresh identity-shaped fields before replay, while leaving descriptions
+  // and other reusable content on the normal ask-once path.
+  const replayRecipe = state.recipes[recipeId];
+  if (!forceExplore && replayRecipe && creationMustPersist) {
+    for (const step of replayRecipe.steps) {
+      if (
+        step.kind !== 'fill' ||
+        step.secretRef ||
+        !isLikelyUniqueCreationIdentityField(step.hint)
+      ) {
+        continue;
+      }
+      const fresh = await resolveFreshHumanFieldValue(
+        state,
+        deps.interact,
+        pageId,
+        step.hint,
+        step.value,
+        step.value,
+      );
+      replayFillOverrides[step.hint.toLowerCase().replace(/\s+/g, ' ').trim()] = fresh;
+    }
+  }
+
+  if (alreadySatisfiedNavigation) {
+    console.log(
+      `[flow] navigation milestone "${milestone.id}" is already at its grounded destination "${pageId}" — recording a zero-action recipe`,
+    );
+    const finalUrl = browser.getUrl();
+    const finalSnapshot = browser.snapshotFull();
+    explored = {
+      goal,
+      success: true,
+      actions: [],
+      stepsTaken: [`already at destination page "${pageId}"; no navigation action was needed`],
+      finalUrl,
+      finalSnapshot,
+    };
+    replayOk = true;
+    execution = forceExplore ? 'explore' : 'replay';
+  } else if (loginShaped) {
     console.log('[flow] auth milestone — delegating to the auth module');
     try {
       await ensureAuthenticated(authCtx);
@@ -932,10 +1137,16 @@ async function runMilestone(
       console.log(`[flow] auth milestone failed: ${err instanceof Error ? err.message : err}`);
     }
     if (replayOk) execution = 'auth';
-  } else if (!forceExplore && player.has(recipeId) && (!creationMustPersist || hasCompletionAction(null, state.recipes[recipeId]))) {
+  } else if (
+    !forceExplore &&
+    player.has(recipeId) &&
+    (!creationMustPersist || flowHasCompletionAction(flow, state, null))
+  ) {
     const replay = await player.tryReplay(recipeId, {
       pageId,
       secrets: { email: state.secrets.email, password: state.secrets.password },
+      fillOverrides:
+        Object.keys(replayFillOverrides).length > 0 ? replayFillOverrides : undefined,
     });
     replayOk = replay.ok;
     if (replayOk) execution = 'replay';
@@ -947,7 +1158,9 @@ async function runMilestone(
 
   if (!replayOk && !loginShaped) {
     execution = 'explore';
-    explored = await deps.explorer.achieveGoal(goal);
+    explored = await deps.explorer.achieveGoal(goal, {
+      returnOnUrlChange: milestoneReturnsOnUrlChange(goal),
+    });
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
     // duplicate version of looksLikeAuthGate's own OLD false-positive bug that
@@ -970,7 +1183,9 @@ async function runMilestone(
       console.log('[flow] hit an auth wall mid-flow — re-authenticating');
       await ensureAuthenticated(authCtx);
       await navigateToEntry(deps, flow);
-      explored = await deps.explorer.achieveGoal(goal);
+      explored = await deps.explorer.achieveGoal(goal, {
+        returnOnUrlChange: milestoneReturnsOnUrlChange(goal),
+      });
     }
   }
 
@@ -1048,6 +1263,10 @@ async function runMilestone(
     },
     explorerSteps: explored?.stepsTaken,
     visualVerification: true,
+    artifactPersistenceVerification: creationMustPersist,
+    artifactPersistenceIdentity: creationMustPersist
+      ? artifactIdentityForMilestone(milestone, marker)
+      : undefined,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
 
@@ -1083,7 +1302,8 @@ async function runMilestone(
     explored && !explored.success && !hasConcreteProductFailureEvidence(step),
   );
   const visualConcernDowngrade = step.result.visualAssessment?.status === 'concern';
-  const creationCompletionMissing = creationMustPersist && !hasCompletionAction(explored, state.recipes[recipeId]);
+  const creationCompletionMissing =
+    creationMustPersist && !flowHasCompletionAction(flow, state, explored);
   const creationVisuallyUnproven =
     creationMustPersist && step.result.visualAssessment?.status !== 'clear';
   if (creationCompletionMissing && step.result.verdict === 'pass') {
@@ -1238,14 +1458,47 @@ async function runMilestone(
 
     // success + explored → cache the recipe for next time
     if (step.result.verdict === 'pass' && explored?.success) {
-      recordFromExplorer(state, recipeId, explored, {
-        secrets: { email: state.secrets.email, password: state.secrets.password },
-        successCheck:
-          !humanRejectedSuccessHint && milestone.successHint && isLiteralHint(milestone.successHint)
-            ? { snapshotAnyOf: [milestone.successHint] }
-            : undefined,
-        fallbackFieldHint: fieldHintForRecipe,
-      });
+      const existingRecipe = state.recipes[recipeId];
+      const normalizedPrimaryHint = fieldHintForRecipe?.toLowerCase().replace(/\s+/g, ' ').trim();
+      const existingHasPrimaryFill = Boolean(
+        normalizedPrimaryHint &&
+          existingRecipe?.steps.some(
+            (recipeStep) =>
+              recipeStep.kind === 'fill' &&
+              recipeStep.hint.toLowerCase().replace(/\s+/g, ' ').trim() === normalizedPrimaryHint,
+          ),
+      );
+      const exploredHasPrimaryFill = Boolean(
+        normalizedPrimaryHint &&
+          explored.actions.some(
+            (action) =>
+              action.action === 'fill' &&
+              action.resolvedLabel?.toLowerCase().replace(/\s+/g, ' ').trim() === normalizedPrimaryHint,
+          ),
+      );
+
+      if (existingHasPrimaryFill && !exploredHasPrimaryFill) {
+        // Replay may fail only after completing a valid prefix (most notably a
+        // processing wait timing out while the artifact is still generating).
+        // Explorer then resumes from that halfway state and records only the
+        // suffix: Name → Finalize → wait. Replacing the original recipe with
+        // that suffix makes the next clean replay start on the entry form and
+        // immediately look for a field that cannot exist. Preserve the
+        // stronger full recipe unless recovery actually revisited its primary
+        // input and therefore proved a complete replacement sequence.
+        console.log(
+          `[flow] preserving full recipe ${recipeId}; fallback resumed after its primary fill and only learned a suffix`,
+        );
+      } else {
+        recordFromExplorer(state, recipeId, explored, {
+          secrets: { email: state.secrets.email, password: state.secrets.password },
+          successCheck:
+            !humanRejectedSuccessHint && milestone.successHint && isLiteralHint(milestone.successHint)
+              ? { snapshotAnyOf: [milestone.successHint] }
+              : undefined,
+          fallbackFieldHint: fieldHintForRecipe,
+        });
+      }
     }
   } catch (error) {
     console.warn(
@@ -1372,9 +1625,12 @@ export async function runFlows(
         // milestone's position (not just the unstarted flow start) — unconditionally
         // disabling fast-forward for every iteration would block that legitimate case.
         const isEntryPage = mi === 0 && hereId !== 'unknown' && hereId === flow.entry.pageId;
-        const aheadIdx = runMode !== 'deterministic' || isEntryPage
-          ? -1
-          : flow.milestones.findIndex((m, j) => j > mi && m.guardPhases?.includes(hereId));
+        const aheadIdx = laterMilestoneStartingOnPage(
+          flow,
+          mi,
+          hereId,
+          isEntryPage,
+        );
         if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
           console.log(
             `[flow] resumed mid-wizard on "${hereId}" — fast-forwarding ${aheadIdx - mi} milestone(s)`,
@@ -1539,7 +1795,17 @@ export async function runFlows(
     scenario.finishedAt = new Date().toISOString();
     report.scenarios.push(scenario);
 
-    const milestoneSteps = scenario.steps.filter((step) => flow.milestones.some((m) => m.id === step.workflow));
+    // Real report workflow ids are namespaced as "<flow-id>:<milestone-id>".
+    // Comparing them only to bare milestone ids made this collection empty on
+    // every live run, so even a dedicated artifact-persistence `true` could
+    // never qualify a learned flow for replay validation.
+    const milestoneWorkflowIds = new Set(
+      flow.milestones.flatMap((milestone) => [
+        milestone.id,
+        `${flow.id}:${milestone.id}`,
+      ]),
+    );
+    const milestoneSteps = scenario.steps.filter((step) => milestoneWorkflowIds.has(step.workflow));
     let finalPageKind: string | undefined;
     try {
       finalPageKind = matchPage(state.sitemap, deps.browser.getUrl(), deps.browser.snapshotInteractive())?.kind;

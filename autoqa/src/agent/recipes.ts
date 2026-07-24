@@ -2,9 +2,13 @@ import fs from 'node:fs';
 import { config } from '../config.js';
 import type { AgentBrowser } from '../core/agent-browser.js';
 import { snapshotIncludesAny } from '../core/agent-browser.js';
-import { fillFieldByHint } from '../core/edits.js';
+import { fillEditableByIndex, fillFieldByHint } from '../core/edits.js';
 import type { ExplorerResult } from '../core/explorer.js';
-import { Nav } from '../core/nav.js';
+import {
+  contextualMutationTargetLabel,
+  hasPostMutationProcessing,
+} from '../core/explorer.js';
+import { Nav, parseContextualControlLabel } from '../core/nav.js';
 import type { SiteState } from './site-state.js';
 import type { Guard } from './guard.js';
 
@@ -15,6 +19,7 @@ export type RecipeStep =
   | { kind: 'select'; hint: string; value: string }
   | { kind: 'press'; key: string }
   | { kind: 'upload'; assetPath: string; selector?: string }
+  | { kind: 'waitForProcessing'; maxMs: number }
   | { kind: 'waitFor'; urlIncludes?: string; textIncludes?: string; maxMs: number };
 
 export interface Recipe {
@@ -24,6 +29,28 @@ export interface Recipe {
   steps: RecipeStep[];
   successCheck: { urlIncludes?: string; snapshotAnyOf?: string[] };
   stats: { successes: number; failures: number; lastSuccessAt?: string };
+}
+
+/**
+ * Validation recovery may refill the same field immediately with a replacement.
+ * Keep only the final consecutive fill so replay asks once and never types a
+ * value that the learning run already proved invalid.
+ */
+export function compactSupersededFills(steps: RecipeStep[]): RecipeStep[] {
+  const compacted: RecipeStep[] = [];
+  for (const step of steps) {
+    const previous = compacted.at(-1);
+    if (
+      step.kind === 'fill' &&
+      previous?.kind === 'fill' &&
+      normalizedHint(previous.hint) === normalizedHint(step.hint)
+    ) {
+      compacted[compacted.length - 1] = step;
+    } else {
+      compacted.push(step);
+    }
+  }
+  return compacted;
 }
 
 function secretRefForLabel(label: string): 'email' | 'password' | undefined {
@@ -57,11 +84,24 @@ export function recordFromExplorer(
   },
 ): Recipe | null {
   const steps: RecipeStep[] = [];
+  const contextualTarget = contextualMutationTargetLabel(result.goal);
+  const contextualParts = contextualTarget
+    ? parseContextualControlLabel(contextualTarget)
+    : null;
 
   for (const action of result.actions) {
     if (action.executionFailed) continue;
     if (action.action === 'click' && action.resolvedLabel) {
-      steps.push({ kind: 'click', label: action.resolvedLabel, role: action.resolvedRole });
+      // Accessibility exposes repeated card buttons by their generic name,
+      // while the milestone goal retains the owning item. Preserve that owner
+      // in the deterministic recipe or replay would click the first matching
+      // control in the grid.
+      const label =
+        contextualParts &&
+        normalizedHint(contextualParts.action) === normalizedHint(action.resolvedLabel)
+          ? contextualTarget!
+          : action.resolvedLabel;
+      steps.push({ kind: 'click', label, role: action.resolvedRole });
     } else if (action.action === 'fill' && (action.resolvedLabel || options?.fallbackFieldHint) && action.value !== undefined) {
       const label = action.resolvedLabel ?? options!.fallbackFieldHint!;
       const step: RecipeStep = { kind: 'fill', hint: label, value: action.value };
@@ -83,11 +123,24 @@ export function recordFromExplorer(
       steps.push({ kind: 'press', key: action.value });
     } else if (action.action === 'upload' && action.uploadedPath) {
       steps.push({ kind: 'upload', assetPath: action.uploadedPath, selector: action.selector });
+    } else if (action.action === 'wait' && action.waitForProcessing) {
+      steps.push({
+        kind: 'waitForProcessing',
+        // A single successful sample is not an upper bound. Async generation
+        // routinely varies by several minutes under load; replay should keep
+        // polling while the UI still proves work is active, up to the same
+        // generous site-agnostic ceiling used by exploration.
+        maxMs: Math.max(
+          config.deep.processingWaitMs,
+          Math.round((action.waitedMs ?? 10000) * 1.5),
+        ),
+      });
     } else if (action.action === 'click' || action.action === 'fill' || action.action === 'select') {
       // Un-resolvable ref (no label) — recipe would be brittle; skip recording entirely
       return null;
     }
-    // 'wait' steps are dropped; replay relies on Nav delays + successCheck
+    // Ordinary LLM "wait" decisions are dropped. Deterministic processing
+    // barriers are preserved explicitly so replay cannot race async work.
   }
 
   const successCheck: Recipe['successCheck'] = options?.successCheck ?? {};
@@ -103,11 +156,14 @@ export function recordFromExplorer(
   const recipe: Recipe = {
     id,
     goal: redactRecipeGoal(result.goal, options?.secrets),
-    steps,
+    steps: compactSupersededFills(steps),
     successCheck,
     stats: {
       successes: existing?.stats.successes ?? 0,
-      failures: existing?.stats.failures ?? 0,
+      // A successful exploration just replaced/repaired this recipe. Failures
+      // belonged to the old step sequence and must not immediately evict the
+      // newly learned one on its first recovery replay.
+      failures: 0,
       lastSuccessAt: new Date().toISOString(),
     },
   };
@@ -132,7 +188,7 @@ export function recordWalkRecipe(
     successCheck,
     stats: {
       successes: existing?.stats.successes ?? 0,
-      failures: existing?.stats.failures ?? 0,
+      failures: 0,
       lastSuccessAt: new Date().toISOString(),
     },
   };
@@ -145,6 +201,118 @@ export interface ReplayResult {
   ok: boolean;
   failedAtStep?: number;
   detail?: string;
+}
+
+function normalizedHint(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** A prior choice/navigation click may be absent because the app resumed one
+ * screen later. A missing click is safely idempotent only when the immediately
+ * following recipe step is already visibly actionable. */
+export function nextRecipeStepAppearsReady(
+  step: RecipeStep | undefined,
+  snapshot: string,
+  url: string,
+): boolean {
+  if (!step) return false;
+  const lower = snapshot.toLowerCase();
+  if (step.kind === 'fill' || step.kind === 'select') {
+    const hint = normalizedHint(step.hint).replace(/^"+|"+$/g, '');
+    return hint.length >= 3 && lower.includes(hint);
+  }
+  if (step.kind === 'click') {
+    const target = normalizedHint(step.label);
+    return snapshot.split('\n').some((line) => {
+      const match = line.match(/(?:button|link|tab|radio|checkbox|generic|labeltext)\s+"([^"]+)"[^\n]*\[ref=e\d+\]/i);
+      return (
+        Boolean(match) &&
+        !/\bdisabled\b/i.test(line) &&
+        normalizedHint(match![1]).includes(target)
+      );
+    });
+  }
+  if (step.kind === 'waitFor') {
+    const urlReady = step.urlIncludes
+      ? url.toLowerCase().includes(step.urlIncludes.toLowerCase())
+      : true;
+    const textReady = step.textIncludes
+      ? lower.includes(step.textIncludes.toLowerCase())
+      : true;
+    return urlReady && textReady;
+  }
+  return false;
+}
+
+/** Dynamic dialogue/copy changes after every edit, so its old text is not a
+ * stable replay selector. Choose a substantive content paragraph while
+ * excluding instructional/wizard chrome; the immediately following fill step
+ * then targets the editor opened by this structural click. */
+export function refForDynamicEditableParagraph(snapshot: string): string | undefined {
+  for (const line of snapshot.split('\n')) {
+    const match = line.match(/paragraph\s+"([^"]+)"[^\n]*\[ref=(e\d+)\]/i);
+    if (!match || match[1].trim().length < 12) continue;
+    if (
+      /\b(click|edit|instruction|upload|story type|review transcript|theme|style|locations?|final video|step)\b/i.test(
+        match[1],
+      )
+    ) {
+      continue;
+    }
+    return `@${match[2]}`;
+  }
+  return undefined;
+}
+
+/**
+ * Wait through the async mount race and require a stable clear state after
+ * processing was observed. One early spinner-free render is not completion.
+ */
+export function waitForProcessingBarrier(
+  browser: AgentBrowser,
+  maxMs: number,
+  options: {
+    now?: () => number;
+    pollMs?: number;
+    mountGraceMs?: number;
+    stableClearPolls?: number;
+  } = {},
+): void {
+  const now = options.now ?? Date.now;
+  const pollMs = options.pollMs ?? 1000;
+  const started = now();
+  const deadline = started + maxMs;
+  // A recorded waitForProcessing step exists because exploration really saw an
+  // asynchronous transition here. Production SPAs can take well over five
+  // seconds after a successful click before their spinner/progress UI mounts
+  // (live Koyal Asset replay: the 5s grace released into a still-unmounted name
+  // form and guaranteed the next fill would fail). Give the async UI a
+  // realistic mount window. We deliberately do NOT retry the preceding
+  // mutation: absence of a spinner can be latency, and resubmission can create
+  // duplicate artifacts.
+  const mountDeadline = started + Math.min(options.mountGraceMs ?? 30000, maxMs);
+  const requiredClear = options.stableClearPolls ?? 2;
+  let sawProcessing = false;
+  let clearPolls = 0;
+
+  while (now() < deadline) {
+    const active = hasPostMutationProcessing(browser.snapshotFull());
+    if (active) {
+      sawProcessing = true;
+      clearPolls = 0;
+    } else if (sawProcessing) {
+      clearPolls++;
+      if (clearPolls >= requiredClear) return;
+    } else if (now() >= mountDeadline) {
+      // Some synchronous actions legitimately never show processing.
+      return;
+    }
+    browser.wait(pollMs);
+  }
+
+  if (hasPostMutationProcessing(browser.snapshotFull())) {
+    throw new Error(`waitForProcessing timeout (${maxMs}ms)`);
+  }
 }
 
 export class RecipePlayer {
@@ -170,13 +338,24 @@ export class RecipePlayer {
    */
   async tryReplay(
     id: string,
-    context: { pageId?: string; secrets?: { email?: string; password?: string } } = {},
+    context: {
+      pageId?: string;
+      secrets?: { email?: string; password?: string };
+      /** Explicit values already approved during this milestone's preflight. */
+      fillOverrides?: Record<string, string>;
+    } = {},
   ): Promise<ReplayResult> {
     const recipe = this.state.recipes[id];
     if (!recipe) return { ok: false, detail: 'no recipe' };
+    const compactedSteps = compactSupersededFills(recipe.steps);
+    if (compactedSteps.length !== recipe.steps.length) {
+      recipe.steps = compactedSteps;
+      this.state.saveRecipes();
+    }
 
     console.log(`[replay] ${id} (${recipe.steps.length} steps, ${recipe.stats.successes} prior successes)`);
 
+    let dynamicEditableOpened = false;
     for (let i = 0; i < recipe.steps.length; i++) {
       const step = recipe.steps[i];
       try {
@@ -191,11 +370,55 @@ export class RecipePlayer {
             }
           }
           const role = step.role === 'button' || step.role === 'link' || step.role === 'tab' ? step.role : undefined;
-          const clicked = this.nav.click({ label: step.label, role, optional: true });
-          if (!clicked) throw new Error(`could not click "${step.label}"`);
+          let clicked = this.nav.click({ label: step.label, role, optional: true });
+          if (
+            !clicked &&
+            step.role === 'paragraph' &&
+            recipe.steps[i + 1]?.kind === 'fill'
+          ) {
+            const ref = refForDynamicEditableParagraph(this.browser.snapshotFull());
+            if (ref) {
+              this.browser.clickVisible(ref);
+              this.browser.wait(config.actionDelayMs);
+              dynamicEditableOpened = true;
+              clicked = true;
+              console.log(
+                `[replay] old paragraph text changed; opened the current editable content structurally via ${ref}`,
+              );
+            }
+          }
+          if (!clicked) {
+            const next = recipe.steps[i + 1];
+            let nextReady = nextRecipeStepAppearsReady(
+              next,
+              this.browser.snapshotFull(),
+              this.browser.getUrl(),
+            );
+            if (next?.kind === 'upload') {
+              try {
+                const selector = next.selector ?? 'input[type=file]';
+                nextReady =
+                  this.browser.evalScript(
+                    `Boolean(document.querySelector(${JSON.stringify(selector)}))`,
+                  ).trim() === 'true';
+              } catch {
+                nextReady = false;
+              }
+            }
+            if (nextReady) {
+              console.log(
+                `[replay] skipping absent click "${step.label}" because the next ${next?.kind} step is already actionable`,
+              );
+              continue;
+            }
+            throw new Error(`could not click "${step.label}"`);
+          }
         } else if (step.kind === 'fill') {
+          const authoritative = context.fillOverrides?.[normalizedHint(step.hint)];
           const value = step.secretRef
             ? (context.secrets?.[step.secretRef] ?? '')
+            : authoritative
+              ? authoritative
             : this.resolveFillValue
               ? await this.resolveFillValue(step.hint, step.value)
               : step.value;
@@ -206,6 +429,16 @@ export class RecipePlayer {
           }
           const filled = fillFieldByHint(this.browser, step.hint, value);
           if (!filled.ok) {
+            if (dynamicEditableOpened) {
+              const structuralFill = fillEditableByIndex(this.browser, 0, value);
+              if (!structuralFill.ok) {
+                throw new Error(
+                  `could not fill structurally opened editor: ${structuralFill.detail}`,
+                );
+              }
+              dynamicEditableOpened = false;
+              continue;
+            }
             // fall back to ref-based fill via snapshot label match
             const snap = this.browser.snapshotInteractive();
             const line = snap
@@ -215,6 +448,7 @@ export class RecipePlayer {
             if (!ref) throw new Error(`could not fill "${step.hint}": ${filled.detail}`);
             this.browser.fillVisible(`@${ref}`, value);
           }
+          dynamicEditableOpened = false;
         } else if (step.kind === 'select') {
           const snap = this.browser.snapshotInteractive();
           const line = snap
@@ -235,6 +469,13 @@ export class RecipePlayer {
           }
           this.browser.upload(step.selector ?? 'input[type=file]', assetPath);
           this.browser.wait(3000);
+        } else if (step.kind === 'waitForProcessing') {
+          // Honor the current generous processing policy even for recipes
+          // persisted by older builds with narrowly sampled ceilings.
+          waitForProcessingBarrier(
+            this.browser,
+            Math.max(step.maxMs, config.deep.processingWaitMs),
+          );
         } else if (step.kind === 'waitFor') {
           const deadline = Date.now() + step.maxMs;
           let satisfied = false;

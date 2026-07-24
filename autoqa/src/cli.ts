@@ -4,6 +4,7 @@ import { SiteState } from './agent/site-state.js';
 import { exploreCommand } from './commands/explore.js';
 import { reviewCommand } from './commands/review.js';
 import { runCommand } from './commands/run.js';
+import { teardownActiveSessions } from './commands/shared.js';
 import { testCommand } from './commands/test.js';
 
 const HELP = `autoqa — autonomous site-agnostic QA agent
@@ -32,6 +33,18 @@ Flags:
   --quick            skip QA probes during testing (back/forward, matrices, edit sweeps)
   --upload-file <p>  force this file for every upload this run (format-parity testing)
 `;
+
+let shuttingDown = false;
+function handleTermination(signal: 'SIGINT' | 'SIGTERM'): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.warn(`\n[autoqa] ${signal} received — closing this run's browser session`);
+  teardownActiveSessions();
+  process.exit(signal === 'SIGINT' ? 130 : 143);
+}
+
+process.once('SIGINT', () => handleTermination('SIGINT'));
+process.once('SIGTERM', () => handleTermination('SIGTERM'));
 
 function flagValue(argv: string[], name: string): string | undefined {
   const idx = argv.indexOf(name);

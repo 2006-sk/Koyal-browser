@@ -7,6 +7,35 @@ export interface FillResult {
 
 /** Fill textarea / contenteditable matched by label text, placeholder, or aria-label. */
 export function fillFieldByHint(browser: AgentBrowser, hint: string, text: string): FillResult {
+  // Prefer agent-browser's real fill path. Directly assigning `el.value`
+  // can make a React/Vue-controlled input LOOK filled in the DOM while leaving
+  // framework state unchanged; the dependent submit button then stays disabled.
+  // Live Koyal replay reproduced this exactly: the description echoed in the
+  // snapshot, but Generate Asset was a no-op until Explorer re-filled it using
+  // the browser command.
+  const hintLower = hint.toLowerCase();
+  const refLine = browser
+    .snapshotInteractive()
+    .split('\n')
+    .find(
+      (line) =>
+        line.toLowerCase().includes(hintLower) &&
+        /\b(textbox|searchbox|combobox|spinbutton)\b/i.test(line) &&
+        /\[ref=e\d+\]/.test(line),
+    );
+  const ref = refLine?.match(/\[ref=(e\d+)\]/)?.[1];
+  if (ref) {
+    try {
+      browser.fillVisible(`@${ref}`, text);
+      browser.wait(600);
+      if (snapshotIncludes(browser.snapshotInteractive(), text.slice(0, Math.min(24, text.length)))) {
+        return { ok: true, detail: `filled by browser ref for hint "${hint}"` };
+      }
+    } catch {
+      // Fall through to the DOM label/placeholder lookup below.
+    }
+  }
+
   const hintJson = JSON.stringify(hint);
   const textJson = JSON.stringify(text);
   browser.evalScript(`
@@ -19,11 +48,16 @@ export function fillFieldByHint(browser: AgentBrowser, hint: string, text: strin
         if (!el) return false;
         el.focus();
         if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-          el.value = value;
+          const proto = el.tagName === 'TEXTAREA'
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, value);
+          else el.value = value;
         } else {
           el.textContent = value;
         }
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
       }
@@ -67,9 +101,15 @@ export function fillEditableByIndex(browser: AgentBrowser, index: number, text: 
       if (!el) return false;
       el.focus();
       const value = ${textJson};
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') el.value = value;
-      else el.textContent = value;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        const proto = el.tagName === 'TEXTAREA'
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, value);
+        else el.value = value;
+      } else el.textContent = value;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     })();

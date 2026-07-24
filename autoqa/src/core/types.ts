@@ -86,6 +86,11 @@ export interface VerificationResult {
     summary: string;
     concerns: string[];
   };
+  /**
+   * True only when the dedicated creation-artifact oracle (not the generic
+   * screenshot reviewer) visibly confirmed that the created item persisted.
+   */
+  artifactPersistenceVerified?: boolean;
   /** Set when knowledge-base triage touched this verdict */
   kbTriage?: {
     statementsSeen: string[];

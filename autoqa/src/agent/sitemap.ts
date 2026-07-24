@@ -73,6 +73,7 @@ export interface WalkAction {
   selector?: string;
   assetPath?: string;
   value?: string;
+  processingMs?: number;
 }
 
 export interface WalkStep {
@@ -111,7 +112,7 @@ export interface WalkTrail {
   runtimeSignals?: Array<{
     at: string;
     context: string;
-    kind: 'page-error' | 'console-error' | 'network-5xx' | 'processing-timeout';
+    kind: 'page-error' | 'console-error' | 'network-5xx' | 'processing-timeout' | 'visual-blocker';
     detail: string;
     screenshot?: string;
   }>;
@@ -127,7 +128,7 @@ export interface FlowMilestone {
   id: string;
   /** Natural-language goal handed to the Explorer */
   goal: string;
-  /** Page ids that should be current for/after this milestone */
+  /** Page ids that must be current before this milestone starts. */
   guardPhases?: string[];
   kind: 'navigate' | 'edit' | 'create' | 'upload' | 'verify';
   successHint?: string;
@@ -334,7 +335,11 @@ export function matchPage(sitemap: SiteMap, url: string, snapshot: string): Page
   // is gone once the character exists). Without this, a broad LLM fragment such
   // as `/characters` on another theme can steal `/space/characters` at runtime.
   const exactStateful = Object.values(sitemap.pages).filter(
-    (page) => !isPlainPage(page) && page.urlPatterns.includes(normalized),
+    (page) =>
+      !isPlainPage(page) &&
+      page.kind !== 'processing' &&
+      page.kind !== 'error' &&
+      page.urlPatterns.includes(normalized),
   );
   if (exactStateful.length === 1) return exactStateful[0];
 
@@ -459,6 +464,22 @@ export function summarizeSitemap(sitemap: SiteMap): string {
   lines.push('', 'Navigation edges:');
   for (const edge of sitemap.edges.slice(0, 60)) {
     lines.push(`- ${edge.from} --"${edge.actionLabel}"--> ${edge.to}`);
+  }
+  const trails = Object.values(sitemap.walks ?? {});
+  if (trails.length > 0) {
+    lines.push(
+      '',
+      'Observed deep-walk trails (authoritative path provenance; do not mix a page/control from one variant into another variant unless an observed trail or edge proves it):',
+    );
+    for (const trail of trails.slice(0, 30)) {
+      const states = trail.steps
+        .map((step) => {
+          const action = step.action?.label ?? step.action?.type;
+          return `${step.pageId}${action ? ` --"${action}"` : ''}`;
+        })
+        .join(' -> ');
+      lines.push(`- ${trail.id} [${trail.outcome}]: ${states || '(entry did not progress)'}`);
+    }
   }
   return lines.join('\n');
 }

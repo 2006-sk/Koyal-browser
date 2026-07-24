@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,6 +28,7 @@ export class AgentBrowser {
   private readonly showCursor: boolean;
   private readonly binary: string;
   private cursorInjected = false;
+  private watchdogStarted = false;
   /** Consecutive subprocess timeouts — a wedged daemon; drives recycle decisions in the runner. */
   consecutiveTimeouts = 0;
 
@@ -39,6 +40,39 @@ export class AgentBrowser {
     // deep/exhaustive runs where throughput + stability matter more than the demo cursor.
     this.showCursor = config.showCursor && !config.probes.exhaustive;
     this.binary = path.join(config.projectRoot, 'node_modules', '.bin', 'agent-browser');
+  }
+
+  /**
+   * Start an independent, exact-session watchdog. npm/tsx can terminate the
+   * whole foreground process group before Node gets a chance to run SIGINT
+   * handlers; this detached child survives that event, notices its owner PID
+   * disappear, and asks agent-browser to close only this session.
+   */
+  startExitWatchdog(): void {
+    if (this.watchdogStarted) return;
+    this.watchdogStarted = true;
+    const code = [
+      "const { spawnSync } = require('node:child_process');",
+      "const [ownerRaw, binary, session] = process.argv.slice(1);",
+      "const owner = Number(ownerRaw);",
+      "const timer = setInterval(() => {",
+      "  try { process.kill(owner, 0); } catch {",
+      "    clearInterval(timer);",
+      "    spawnSync(binary, ['--session', session, 'close'], { stdio: 'ignore', timeout: 30000 });",
+      "    process.exit(0);",
+      "  }",
+      "}, 500);",
+    ].join('\n');
+    try {
+      const watchdog = spawn(
+        process.execPath,
+        ['-e', code, String(process.pid), this.binary, this.session],
+        { detached: true, stdio: 'ignore' },
+      );
+      watchdog.unref();
+    } catch {
+      // The ordinary finally/signal teardown remains available.
+    }
   }
 
   /**
@@ -724,6 +758,56 @@ export class AgentBrowser {
     this.wait(config.actionDelayMs);
     if (stdout.includes('NO_MATCH')) return false;
     return true;
+  }
+
+  /**
+   * Click a repeated control inside the nearest visible container that also
+   * contains an owning item label. Listing pages commonly expose several
+   * identical buttons ("Edit", "Regenerate", "Remove") while the crawler
+   * disambiguates them as "REGENERATE (Wayfinder Compass)". Accessibility
+   * snapshots correctly keep the button's own name generic, so replay needs
+   * both pieces of identity instead of either looking for the synthetic full
+   * label (no match) or clicking the first generic control (wrong item).
+   */
+  clickButtonWithinText(actionText: string, ownerText: string): boolean {
+    const stdout = this.evalScript(`
+      (function() {
+        const action = ${JSON.stringify(actionText)}.replace(/\\s+/g, ' ').trim().toLowerCase();
+        const owner = ${JSON.stringify(ownerText)}.replace(/\\s+/g, ' ').trim().toLowerCase();
+        const visible = (el) =>
+          (el.offsetParent !== null || el.getClientRects().length) &&
+          !el.disabled &&
+          el.getAttribute('aria-disabled') !== 'true';
+        const normalizedText = (el) =>
+          ((el.getAttribute && el.getAttribute('aria-label')) || el.textContent || '')
+            .replace(/\\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+        const controls = [...document.querySelectorAll(
+          'button,a,[role=button],[role=link],[role=tab],[onclick]'
+        )].filter((el) => visible(el) && normalizedText(el) === action);
+        let best = null;
+        for (const control of controls) {
+          let ancestor = control.parentElement;
+          for (let depth = 1; ancestor && depth <= 10; depth++, ancestor = ancestor.parentElement) {
+            if (ancestor === document.body || ancestor === document.documentElement) break;
+            const text = normalizedText(ancestor);
+            if (!text.includes(owner)) continue;
+            // Prefer the closest shared container. Text length breaks ties in
+            // favour of the most specific card/row rather than a whole grid.
+            const score = depth * 1000000 + text.length;
+            if (!best || score < best.score) best = { control, score };
+            break;
+          }
+        }
+        if (!best) return 'NO_MATCH';
+        best.control.scrollIntoView({block:'center'});
+        best.control.click();
+        return 'CLICKED';
+      })();
+    `);
+    this.wait(config.actionDelayMs);
+    return stdout.includes('CLICKED');
   }
 
   /** DOM-level password-input check — catches login forms whose <input type=password> has no accessible name/label, which the accessibility-tree snapshot then renders as an unlabeled "textbox" the text-based auth-gate heuristic can't see. */

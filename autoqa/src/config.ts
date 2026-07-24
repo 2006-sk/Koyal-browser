@@ -45,6 +45,7 @@ export const config = {
   deep: {
     enabled: process.env.AUTOQA_DEEP !== 'false',
     walksPerExplore: Number(process.env.AUTOQA_DEEP_FLOWS ?? '3'),
+    walksPerExploreExplicit: process.env.AUTOQA_DEEP_FLOWS !== undefined,
     walkMaxSteps: Number(process.env.AUTOQA_DEEP_WALK_MAX_STEPS ?? '60'),
     processingWaitMs: Number(process.env.AUTOQA_PROCESSING_WAIT_MS ?? '1200000'),
     terminalWaitMs: Number(process.env.AUTOQA_TERMINAL_WAIT_MS ?? '1200000'),
@@ -120,7 +121,10 @@ export function applyCliOverrides(overrides: CliOverrides): void {
   if (overrides.maxSteps) config.llm.maxStepsPerGoal = overrides.maxSteps;
   if (overrides.headless) config.headed = false;
   if (overrides.budget !== undefined) config.llm.callBudget = overrides.budget;
-  if (overrides.deepFlows !== undefined) config.deep.walksPerExplore = overrides.deepFlows;
+  if (overrides.deepFlows !== undefined) {
+    config.deep.walksPerExplore = overrides.deepFlows;
+    config.deep.walksPerExploreExplicit = true;
+  }
   if (overrides.noDeep) config.deep.enabled = false;
   if (overrides.quick) config.probes.thorough = false;
   if (overrides.uploadFile) config.uploadFileOverride = overrides.uploadFile;

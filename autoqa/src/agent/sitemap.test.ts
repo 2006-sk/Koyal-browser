@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { matchPage, mergePage, type PageNode, type SiteMap } from './sitemap.js';
+import { matchPage, mergePage, summarizeSitemap, type PageNode, type SiteMap } from './sitemap.js';
 
 test('stateful wizard sidebar landmarks cannot absorb a different URL state', () => {
   const sitemap: SiteMap = {
@@ -173,4 +173,74 @@ test('broad terminal urlIncludes cannot label an unseen theme export as Titanic'
     matchPage(sitemap, 'https://example.test/bollywood/export', 'Download your film'),
     null,
   );
+});
+
+test('a transient processing state is not kept solely because it owns the route', () => {
+  const processing: PageNode = {
+    id: 'transcript-processing',
+    title: 'Processing transcript',
+    kind: 'processing',
+    description: '',
+    urlPatterns: ['/transcript'],
+    detection: { snapshotAnyOf: ['Transcribing audio...'] },
+    requiresAuth: true,
+    interactives: [],
+    firstSeenAt: '',
+    lastSeenAt: '',
+  };
+  const sitemap: SiteMap = {
+    origin: 'https://example.test',
+    updatedAt: '',
+    pages: { [processing.id]: processing },
+    edges: [],
+    flows: [],
+    siteHints: [],
+  };
+
+  assert.equal(
+    matchPage(sitemap, 'https://example.test/transcript', 'Transcribing audio...')?.id,
+    processing.id,
+  );
+  assert.equal(
+    matchPage(sitemap, 'https://example.test/transcript', 'Review transcript\nNext'),
+    null,
+  );
+});
+
+test('flow proposal summary preserves observed branch provenance', () => {
+  const sitemap: SiteMap = {
+    origin: 'https://example.test',
+    updatedAt: '',
+    pages: {},
+    edges: [],
+    flows: [],
+    siteHints: [],
+    walks: {
+      'walk:upload:start-audio': {
+        id: 'walk:upload:start-audio',
+        entry: { pageId: 'upload', actionLabel: 'Start with Audio' },
+        startedAt: '',
+        finishedAt: '',
+        outcome: 'no-progress',
+        steps: [
+          {
+            index: 0,
+            pageId: 'upload',
+            kind: 'wizard-step',
+            action: { type: 'click', label: 'Start with Audio' },
+          },
+          {
+            index: 1,
+            pageId: 'audio-transcript',
+            kind: 'wizard-step',
+            action: { type: 'click', label: 'Next' },
+          },
+        ],
+      },
+    },
+  };
+
+  const summary = summarizeSitemap(sitemap);
+  assert.match(summary, /authoritative path provenance/i);
+  assert.match(summary, /upload --"Start with Audio".*audio-transcript --"Next"/);
 });

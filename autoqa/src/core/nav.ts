@@ -20,6 +20,74 @@ export interface ClickIntent {
 }
 
 /**
+ * The crawler may synthesize "ACTION (owning item)" when a list contains many
+ * identically named controls. Keep that useful context separate from the
+ * control's real accessible name for deterministic replay.
+ */
+export function parseContextualControlLabel(
+  label: string,
+): { action: string; owner: string } | null {
+  const match = label.trim().match(/^(.{1,80}?)\s+\(([^()\n]{1,160})\)$/);
+  if (!match) return null;
+  const action = match[1].trim();
+  const owner = match[2].trim();
+  if (!action || !owner) return null;
+  return { action, owner };
+}
+
+/**
+ * Accessible names often include volatile counters, balances, timestamps, or
+ * availability values. Recipes should survive those numbers changing while
+ * retaining every stable word (for example, "Standard553 seconds available"
+ * must still match "Standard536 seconds available"). The placeholder is kept
+ * rather than deleting numbers so labels with and without a numeric component
+ * cannot accidentally collapse together.
+ */
+export function normalizeVolatileAccessibleName(label: string): string {
+  return label
+    .toLowerCase()
+    .replace(/\d+(?:[.,]\d+)*/g, '<n>')
+    // Accessibility names assembled from nested nodes are inconsistent about
+    // whether a boundary before a number contains whitespace
+    // ("Standard553" vs "Standard 536"). Numeric replacement already keeps a
+    // structural placeholder, so whitespace can safely be ignored here.
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+export function refForUniqueVolatileLabel(
+  snapshot: string,
+  label: string,
+  role?: ClickIntent['role'],
+): string | undefined {
+  const target = normalizeVolatileAccessibleName(label);
+  if (!target.includes('<n>')) return undefined;
+  const matches: Array<{ ref: string; role: string }> = [];
+  for (const line of snapshot.split('\n')) {
+    const match = line.match(
+      /^\s*-\s*([a-zA-Z]+)\s+"([^"]+)"[^\n]*\bref=(e\d+)\b/,
+    );
+    if (!match || /\bdisabled\b/i.test(line)) continue;
+    const candidateRole = match[1].toLowerCase();
+    if (role && candidateRole !== role) continue;
+    if (normalizeVolatileAccessibleName(match[2]) === target) {
+      matches.push({ ref: `@${match[3]}`, role: candidateRole });
+    }
+  }
+  // Nav.snapshot() deliberately concatenates interactive + full trees, so the
+  // same DOM ref can appear twice. That is one candidate, not ambiguity.
+  const uniqueMatches = [
+    ...new Map(matches.map((match) => [match.ref, match])).values(),
+  ];
+  if (uniqueMatches.length === 1) return uniqueMatches[0].ref;
+  // A labelled wrapper and its nested radio may expose the same accessible
+  // name. Prefer one unique clickable label wrapper; multiple same-role
+  // candidates remain ambiguous and are never guessed.
+  const labelledWrappers = uniqueMatches.filter((match) => match.role === 'labeltext');
+  return labelledWrappers.length === 1 ? labelledWrappers[0].ref : undefined;
+}
+
+/**
  * Resilient UI interaction — tries snapshot ref (interactive + full),
  * find role click, then DOM text click. Survives minor UI reflows.
  */
@@ -87,6 +155,42 @@ export class Nav {
           }
         } catch {
           // fall through
+        }
+      }
+    }
+
+    // Exact accessible names can legitimately change only in their numeric
+    // portions between learning and replay (credits, seconds available, item
+    // counts, timestamps). Use this strictly-equal normalized fallback only
+    // when it resolves to ONE enabled control; ambiguity is safer than guessing.
+    if (typeof intent.label === 'string') {
+      const snapshot = this.snapshot();
+      const volatileRef = refForUniqueVolatileLabel(snapshot, intent.label, intent.role);
+      if (volatileRef) {
+        try {
+          this.browser.clickVisible(volatileRef);
+          this.afterClick();
+          return true;
+        } catch {
+          // fall through to contextual matching / optional result
+        }
+      }
+    }
+
+    // Repeated per-item controls have a generic accessible label even when the
+    // crawler stored a contextual synthetic label. Only use this after every
+    // ordinary exact/role/text route failed, and require a shared card/row
+    // ancestor containing the owner text; never degrade to "first button".
+    if (typeof intent.label === 'string') {
+      const contextual = parseContextualControlLabel(intent.label);
+      if (contextual) {
+        try {
+          if (this.browser.clickButtonWithinText(contextual.action, contextual.owner)) {
+            this.afterClick();
+            return true;
+          }
+        } catch {
+          // fall through to the normal optional/throw result
         }
       }
     }

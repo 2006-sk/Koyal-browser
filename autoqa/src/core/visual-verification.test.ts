@@ -4,7 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { LlmClient, LlmCompletionOptions } from './llm/client.js';
-import { assessProcessingScreenshot, assessScreenshot } from './visual-verification.js';
+import {
+  assessArtifactPersistenceScreenshot,
+  assessProcessingScreenshot,
+  assessScreenshot,
+} from './visual-verification.js';
 
 test('visual assessment sends the screenshot and parses a conservative concern', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-visual-test-'));
@@ -52,6 +56,30 @@ test('processing affirmation distinguishes a finished async operation from overa
     assert.match(captured?.messages[0]?.content ?? '', /asynchronous operation.*visibly finished/i);
     assert.match(captured?.messages[1]?.content ?? '', /not for the overall workflow/i);
     assert.equal(captured?.image?.data, Buffer.from('finished-location').toString('base64'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('artifact persistence vision preserves processing as a distinct post-mutation state', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-artifact-visual-test-'));
+  const screenshot = path.join(dir, 'shot.png');
+  fs.writeFileSync(screenshot, Buffer.from('sofia-processing-card'));
+  let captured: LlmCompletionOptions | undefined;
+  const fakeLlm = {
+    async complete(options: LlmCompletionOptions) {
+      captured = options;
+      return '{"status":"processing","summary":"Sofia is visible with a Processing badge."}';
+    },
+  } as LlmClient;
+  try {
+    const result = await assessArtifactPersistenceScreenshot(fakeLlm, screenshot, {
+      action: 'Finalize character',
+      url: 'https://example.test/characters',
+    });
+    assert.equal(result.status, 'processing');
+    assert.match(captured?.messages[0]?.content ?? '', /must NOT be repeated/i);
+    assert.equal(captured?.image?.data, Buffer.from('sofia-processing-card').toString('base64'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

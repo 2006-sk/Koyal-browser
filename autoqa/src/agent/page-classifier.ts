@@ -156,6 +156,7 @@ DEEP FUNCTIONAL COVERAGE (important): the goal is to prove the PLATFORM works, n
 - CREATE content where the app allows it (e.g. create a character, add a scene, add an item) and verify the new thing appears.
 - EDIT content (script/scene/prompt/profile text) using realistic user-provided prose and verify it persists.
 - Walk multi-step creation wizards to their real terminal artifact, exercising the meaningful choice at each step.
+- Treat the "Observed deep-walk trails" section as authoritative branch provenance. Never borrow a page, control, or milestone observed only on one branch (for example a script-upload branch) and assert that it exists on a different branch (for example audio upload). If a variant is visible but not yet walked, propose only goals grounded in controls actually mapped for that variant; do not invent variant-specific intermediate features.
 - A creation flow MUST include the actual submit/generate action, wait for generation, every required follow-up field, Finalize/Save, and a final verification that the new item is visible in its persistent list/library. Filling a prompt or reaching a generated preview is not completion.
 - A video flow MUST continue beyond Edit scenes: wait for scenes, click Create Video/render, wait for rendering, and verify a playable video or download/final artifact. Do not end the flow merely because Edit scenes or a Create Video button is visible.
 Include real content edits/creations wherever the app supports them. NEVER invent test-looking names or values such as QAMARK, AutoQA, QA-123, Zephyr, random tokens, UUIDs, or nonsense. For people use an ordinary name such as Jason; for descriptions use natural, coherent prose. The runtime asks the human before entering free text, so milestone goals should describe the field and outcome rather than embedding synthetic marker values. Prefer flows that end in a verifiable outcome.
@@ -172,7 +173,7 @@ Respond with JSON only:
       "entryPageId": "page id where the flow starts",
       "entryUrl": "/path to open, if direct navigation works, else null",
       "milestones": [
-        { "id": "m1", "goal": "natural-language instruction", "kind": "navigate|edit|create|upload|verify", "successHint": "SHORT LITERAL text fragment (2-6 words) expected to be VISIBLE ON THE PAGE after this milestone — it is substring-matched against the page snapshot, so it must be exact on-page wording (e.g. a heading or button label from the site map), NEVER a description of the outcome", "guardPhases": ["pageId that should be current after this milestone"] }
+        { "id": "m1", "goal": "natural-language instruction", "kind": "navigate|edit|create|upload|verify", "successHint": "SHORT LITERAL text fragment (2-6 words) expected to be VISIBLE ON THE PAGE after this milestone — it is substring-matched against the page snapshot, so it must be exact on-page wording (e.g. a heading or button label from the site map), NEVER a description of the outcome", "guardPhases": ["pageId that must be current BEFORE this milestone starts"] }
       ]
     }
   ]

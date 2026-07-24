@@ -12,6 +12,11 @@ export interface ProcessingVisualAssessment {
   summary: string;
 }
 
+export interface ArtifactPersistenceVisualAssessment {
+  status: 'persisted' | 'processing' | 'blocked' | 'incomplete' | 'uncertain';
+  summary: string;
+}
+
 /**
  * Corroborating visual oracle. It may surface a concern for review, but callers
  * must never use it to turn a deterministic failure into a pass.
@@ -98,5 +103,61 @@ export async function assessProcessingScreenshot(
   return {
     status,
     summary: String(parsed.summary ?? 'No processing-state summary supplied'),
+  };
+}
+
+/**
+ * Classify the rendered state immediately after a create/generate/finalize-like
+ * mutation. Unlike the generic visual oracle, this preserves the distinction
+ * between "the saved artifact is still processing" and "the flow is merely
+ * incomplete" so callers can poll the former without replaying the mutation.
+ */
+export async function assessArtifactPersistenceScreenshot(
+  llm: LlmClient,
+  screenshotPath: string,
+  context: { action: string; url: string; expectedArtifact?: string; observations?: string },
+): Promise<ArtifactPersistenceVisualAssessment> {
+  const data = fs.readFileSync(screenshotPath).toString('base64');
+  const raw = await llm.complete({
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a conservative visual state verifier for browser automation immediately after a create, generate, save, submit, or finalize action. ' +
+          'Inspect only visible evidence and classify the CURRENT artifact state. ' +
+          'persisted means the newly created artifact is visibly saved and fully usable in its final list, library, receipt, player, or download state, with no pending/processing badge. ' +
+          'When an expected artifact identity is supplied, finding that identity on a completed library/list card with usable controls is direct persistence evidence. ' +
+          'The intermediate input form disappearing after save is expected and must not cause uncertainty. Do not try to re-verify the old fill action; verify the final artifact state. ' +
+          'processing means the submitted artifact visibly exists but is still pending, processing, generating, rendering, finalizing, or has a spinner/progress badge; this status must be polled and the create/finalize action must NOT be repeated. ' +
+          'blocked means a concrete validation error, generation failure, server error, or disabled completion control with a visible reason prevents completion. ' +
+          'incomplete means an ordinary intermediate form, preview, selection, or next required control is visible and no async operation is active. ' +
+          'uncertain means the screenshot cannot establish any of those states. Do not judge artistic quality. Return JSON only.',
+      },
+      {
+        role: 'user',
+        content:
+          `Mutation/goal (background only): ${context.action}\nURL: ${context.url}\n` +
+          `${context.expectedArtifact ? `Expected newly created artifact identity/text: "${context.expectedArtifact}"\n` : ''}` +
+          `${context.observations ? `Recorded actions and text observations:\n${context.observations}\n` : ''}` +
+          'Return {"status":"persisted|processing|blocked|incomplete|uncertain","summary":"one sentence grounded in visible evidence"}.',
+      },
+    ],
+    image: { data, mediaType: 'image/png' },
+    maxTokens: 400,
+  });
+  const parsed = parseJsonFromLlm<Partial<ArtifactPersistenceVisualAssessment>>(raw);
+  const status = parsed.status;
+  if (
+    status !== 'persisted' &&
+    status !== 'processing' &&
+    status !== 'blocked' &&
+    status !== 'incomplete' &&
+    status !== 'uncertain'
+  ) {
+    throw new Error(`Invalid artifact-persistence visual status: ${String(status)}`);
+  }
+  return {
+    status,
+    summary: String(parsed.summary ?? 'No artifact-persistence summary supplied'),
   };
 }

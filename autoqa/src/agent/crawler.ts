@@ -4,7 +4,7 @@ import { parseJsonArrayFromEvalStdout, type AgentBrowser } from '../core/agent-b
 import type { Explorer } from '../core/explorer.js';
 import type { LlmClient } from '../core/llm/client.js';
 import { Nav } from '../core/nav.js';
-import { deepWalk, type DeepWalkEntry } from './deep-walker.js';
+import { deepWalk, isMutatingControlLabel, type DeepWalkEntry } from './deep-walker.js';
 import { classifyPage, looksLikeSoft404, proposeFlows } from './page-classifier.js';
 import { LOGOUT_RE } from './guard.js';
 import type { Interact } from './interact.js';
@@ -112,6 +112,20 @@ function transientErrorPage(url: string): PageNode {
  * click-probing nav elements to discover SPA transitions, then proposing flows.
  * Discovery only — no form submits, uploads, or edits happen here.
  */
+/** Resolve the walk budget without letting exhaustive mode erase a caller's
+ * explicit safety/time cap. Infinity is intentional only when exhaustive was
+ * requested and neither CLI nor environment supplied a deep-walk count. */
+export function resolveDeepWalkCap(
+  requested: number | undefined,
+  configured: number,
+  configuredExplicitly: boolean,
+  exhaustive: boolean,
+): number {
+  if (requested !== undefined) return requested;
+  if (configuredExplicitly) return configured;
+  return exhaustive ? Number.POSITIVE_INFINITY : configured;
+}
+
 export async function explore(
   browser: AgentBrowser,
   state: SiteState,
@@ -293,8 +307,12 @@ export async function explore(
 
       // click probes for SPA nav (buttons/links without hrefs): nav-tagged first,
       // then unknown-tagged as fallback — never destructive/submit/upload
-      const navTargets = page.interactives.filter((el) => el.category === 'nav' && !el.probed);
-      const unknownTargets = page.interactives.filter((el) => el.category === 'unknown' && !el.probed);
+      const navTargets = page.interactives.filter(
+        (el) => el.category === 'nav' && !el.probed && !isMutatingControlLabel(el.label),
+      );
+      const unknownTargets = page.interactives.filter(
+        (el) => el.category === 'unknown' && !el.probed && !isMutatingControlLabel(el.label),
+      );
       const probeTargets = [...navTargets, ...unknownTargets].slice(0, probesPerPage);
 
       for (const el of probeTargets) {
@@ -380,6 +398,7 @@ export async function explore(
           .findClickableCandidates()
           .filter((t) => !knownLabels.has(t.toLowerCase()))
           .filter((t) => !DESTRUCTIVE_TEXT_RE.test(t))
+          .filter((t) => !isMutatingControlLabel(t))
           .slice(0, probesPerPage);
         for (const label of candidates) {
           const beforeUrl = browser.getUrl();
@@ -503,15 +522,16 @@ export async function explore(
   // explicit --deep-flows budget. The old default cap of 3 silently left Koyal's
   // character/assets/outfit/audio entries untouched while claiming the crawl
   // was complete.
-  const deepCap =
-    opts.deepFlows !== undefined
-      ? opts.deepFlows
-      : config.probes.exhaustive
-        ? Number.POSITIVE_INFINITY
-        : config.deep.walksPerExplore;
+  const deepCap = resolveDeepWalkCap(
+    opts.deepFlows,
+    config.deep.walksPerExplore,
+    config.deep.walksPerExploreExplicit,
+    config.probes.exhaustive,
+  );
   if (config.deep.enabled && deepCap > 0) {
-    const entries: DeepWalkEntry[] = [];
-    for (const page of Object.values(state.sitemap.pages)) {
+    const collectEntries = (): DeepWalkEntry[] => {
+      const entries: DeepWalkEntry[] = [];
+      for (const page of Object.values(state.sitemap.pages)) {
       // flows start from plain pages, or from directly-openable wizard steps
       // (a fork like /upload hosts the branch choices — each branch is its own walk)
       const kind = page.kind ?? 'page';
@@ -581,31 +601,17 @@ export async function explore(
             };
           }
         }
-        entries.push({ pageId: page.id, interactive: el, entryUrl, via });
+          entries.push({ pageId: page.id, interactive: el, entryUrl, via });
+        }
       }
-    }
+      return entries;
+    };
 
     // priority: never-walked entries first, then stale trails; new-this-run beats old
     const walks = state.sitemap.walks ?? {};
     const trailIdFor = (e: DeepWalkEntry) =>
       `walk:${e.pageId}:${e.interactive.label.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 40)}`;
     const isNew = (e: DeepWalkEntry) => !inventoryBefore.interactiveKeys.has(`${e.pageId}::${e.interactive.label}`);
-    entries.sort((a, b) => {
-      const aScore = (walks[trailIdFor(a)] ? 2 : 0) - (isNew(a) ? 1 : 0);
-      const bScore = (walks[trailIdFor(b)] ? 2 : 0) - (isNew(b) ? 1 : 0);
-      return aScore - bScore;
-    });
-
-    // Only terminal walks are complete. no-progress/step-cap/error/budget walks
-    // stay queued and are retried on every explore; previously only `aborted`
-    // retried, so one weak button-discovery attempt permanently suppressed that
-    // creation surface from all future crawls.
-    const toWalk = entries
-      .filter((e) => !walks[trailIdFor(e)] || walks[trailIdFor(e)].outcome !== 'terminal')
-      .slice(0, deepCap);
-    if (toWalk.length === 0) {
-      console.log('[crawl] deep: all known entry points already walked (delete a walk via `review` to re-walk)');
-    }
     const walkEvidenceDir = path.join(state.dir, 'walks');
     // Shared across every entry walked this crawl — lets a later walk (or a later
     // retry within one walk) know which mode/tab options an earlier one already
@@ -613,7 +619,36 @@ export async function explore(
     // converging on the same 1-2 options every time. See deep-walker.ts's
     // DeepWalkerDeps.triedChoicesByPage doc comment for the live repro this fixes.
     const triedChoicesByPage = new Map<string, Set<string>>();
-    for (const entry of toWalk) {
+    const attemptedThisRun = new Set<string>();
+    let walksStarted = 0;
+    while (walksStarted < deepCap) {
+      // A successful walk can discover a brand-new wizard/fork page whose
+      // create/upload choices did not exist when the crawl phase ended. Refresh
+      // the candidate inventory after every walk so sibling branches (Script /
+      // Audio, alternate creators, etc.) join this SAME run instead of waiting
+      // for a warm second exploration.
+      const entries = collectEntries()
+        .filter((entry) => {
+          const id = trailIdFor(entry);
+          return (
+            !attemptedThisRun.has(id) &&
+            (!walks[id] || walks[id].outcome !== 'terminal')
+          );
+        })
+        .sort((a, b) => {
+          const aScore = (walks[trailIdFor(a)] ? 2 : 0) - (isNew(a) ? 1 : 0);
+          const bScore = (walks[trailIdFor(b)] ? 2 : 0) - (isNew(b) ? 1 : 0);
+          return aScore - bScore;
+        });
+      const entry = entries[0];
+      if (!entry) {
+        if (walksStarted === 0) {
+          console.log('[crawl] deep: all known entry points already walked (delete a walk via `review` to re-walk)');
+        }
+        break;
+      }
+      attemptedThisRun.add(trailIdFor(entry));
+      walksStarted++;
       try {
         const result = await deepWalk(
           { browser, state, llm, explorer, interact, nav, ensureAuth: opts.ensureAuth, triedChoicesByPage },

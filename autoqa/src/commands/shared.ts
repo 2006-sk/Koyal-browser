@@ -11,7 +11,13 @@ import { RecipePlayer } from '../agent/recipes.js';
 import { SiteState } from '../agent/site-state.js';
 import { Statements } from '../agent/statements.js';
 import { matchPage } from '../agent/sitemap.js';
-import { resolveHumanFieldValue } from '../agent/field-values.js';
+import {
+  fieldValueKey,
+  isLikelyUniqueCreationIdentityField,
+  replaceRejectedHumanFieldValue,
+  resolveFreshHumanFieldValue,
+  resolveHumanFieldValue,
+} from '../agent/field-values.js';
 
 export interface Session {
   browser: AgentBrowser;
@@ -24,6 +30,12 @@ export interface Session {
   explorer: Explorer;
   authCtx: AuthContext;
 }
+
+// `finally` handles ordinary command completion, but an OS signal can arrive
+// while a command is awaiting a browser/LLM operation. Keep only sessions
+// created by this process so the CLI signal handler can close the exact browser
+// it owns instead of leaking Chrome profiles (or broad-killing other runs).
+const activeSessions = new Set<Session>();
 
 export type UploadKind = 'pdf' | 'audio' | 'any';
 
@@ -78,6 +90,7 @@ export function bootstrap(): Session {
     Number(process.env.AUTOQA_PROMPT_TIMEOUT_MS ?? '300000'),
   );
   const browser = new AgentBrowser({ session: `${config.session}-${state.hostname}` });
+  browser.startExitWatchdog();
   const llm = new LlmClient();
   const guard = new Guard(state, interact);
   const pageIdNow = (): string => {
@@ -95,10 +108,37 @@ export function bootstrap(): Session {
   const resolveFillValue = async (
     label: string,
     proposedValue: string,
-    context?: { sensitive: boolean },
+    context?: { sensitive: boolean; requiresFreshValue: boolean },
   ): Promise<string> => {
     const sensitive = context?.sensitive || isSensitiveFieldLabel(label);
-    if (!sensitive) return resolveHumanFieldValue(state, interact, pageIdNow(), label, proposedValue);
+    if (!sensitive) {
+      const pageId = pageIdNow();
+      if (context?.requiresFreshValue && isLikelyUniqueCreationIdentityField(label)) {
+        const exact = state.fieldValues[fieldValueKey(pageId, label, proposedValue)]?.value;
+        const prior =
+          exact ??
+          Object.values(state.fieldValues)
+            .filter(
+              (saved) =>
+                saved.pageId.toLowerCase() === pageId.toLowerCase() &&
+                saved.label.toLowerCase().replace(/\s+/g, ' ').trim() ===
+                  label.toLowerCase().replace(/\s+/g, ' ').trim(),
+            )
+            .map((saved) => saved.value)
+            .at(-1);
+        if (prior) {
+          return resolveFreshHumanFieldValue(
+            state,
+            interact,
+            pageId,
+            label,
+            prior,
+            proposedValue,
+          );
+        }
+      }
+      return resolveHumanFieldValue(state, interact, pageId, label, proposedValue);
+    }
 
     const passwordLike = /\b(password|passcode|pin)\b/i.test(label);
     const identityLike = /\b(email|e-mail|user\s*name|username)\b/i.test(label);
@@ -144,19 +184,52 @@ export function bootstrap(): Session {
         }
       },
       onFillRequested: resolveFillValue,
+      onRejectedFill: async (label, rejectedValue, proposedValue) =>
+        replaceRejectedHumanFieldValue(
+          state,
+          interact,
+          pageIdNow(),
+          label,
+          rejectedValue,
+          proposedValue,
+        ),
     },
   });
 
   const authCtx: AuthContext = { browser, state, interact, explorer, player };
 
-  return { browser, state, interact, llm, guard, player, statements, explorer, authCtx };
+  const session = { browser, state, interact, llm, guard, player, statements, explorer, authCtx };
+  activeSessions.add(session);
+  return session;
 }
 
 export function teardown(session: Session): void {
+  // Delete before closing so a second signal cannot attempt the same teardown.
+  activeSessions.delete(session);
   try {
     session.browser.close();
   } catch {
     // browser may already be closed
   }
   session.interact.close();
+}
+
+/** Close every browser session created by this CLI process. Signal-safe in the
+ * practical Node sense: all operations are synchronous and bounded. */
+export function teardownActiveSessions(): void {
+  const sessions = [...activeSessions];
+  activeSessions.clear();
+  for (const session of sessions) {
+    try {
+      session.browser.close();
+    } catch {
+      // The session may already be closed or its daemon may be wedged. Never
+      // broaden this into a system-wide kill: another AutoQA run may be active.
+    }
+    try {
+      session.interact.close();
+    } catch {
+      // best-effort during process shutdown
+    }
+  }
 }

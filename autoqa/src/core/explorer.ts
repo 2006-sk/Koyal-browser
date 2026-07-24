@@ -24,8 +24,15 @@ export interface ExplorerAction {
   resolvedRole?: string;
   /** Set after a successful upload — the local file that was attached */
   uploadedPath?: string;
+  /** Original LLM suggestion before the human-value resolver replaced it. */
+  proposedValue?: string;
   /** The action was attempted but the browser rejected it; never compile it into a recipe. */
   executionFailed?: boolean;
+  /** The human/destructive-action guard denied this click. */
+  deniedByUser?: boolean;
+  /** Synthetic deterministic barrier learned after a submitted async mutation. */
+  waitForProcessing?: boolean;
+  waitedMs?: number;
 }
 
 export interface ExplorerResult {
@@ -51,7 +58,13 @@ export interface ExplorerHooks {
   onFillRequested?: (
     label: string,
     proposedValue: string,
-    context?: { sensitive: boolean },
+    context?: { sensitive: boolean; requiresFreshValue: boolean },
+  ) => Promise<string>;
+  /** Replace a non-secret value that the rendered page explicitly rejected. */
+  onRejectedFill?: (
+    label: string,
+    rejectedValue: string,
+    proposedValue?: string,
   ) => Promise<string>;
 }
 
@@ -73,23 +86,316 @@ const IN_PROGRESS_RE =
   /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\btaking longer than expected\b|\bserver may be busy\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
 const IN_PROGRESS_DONE_RE = /(?:processing|rendering|export) complete|100\s?%|\bdone\b\s*[!.]/i;
 export const PROCESSING_VISION_POLL_THRESHOLD = 3;
+/** Maximum observations of one normalized page state within a single goal. */
+export const EXPLORER_STATE_VISIT_LIMIT = 4;
 
 export function hasInlineProcessing(snapshot: string): boolean {
   return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
 }
 
+const MUTATION_CONTROL_RE =
+  /\b(new|add|create|generate|regenerate|finalize|save|submit|finish|complete|download|place order|reserve|book|upload|render|export)\b/i;
+
+function mutationControlKey(label: string): string | undefined {
+  return label
+    .toLowerCase()
+    .match(/\b(regenerate|generate|finalize|create|save|submit|finish|complete|render|export|upload|add|new)\b/)?.[1];
+}
+
+export function isLikelyMutationLabel(label: string): boolean {
+  return MUTATION_CONTROL_RE.test(label);
+}
+
+/** Exact walk-entry target embedded by deep-walker when deterministic navigation needs LLM fallback. */
+export function exactEntryTargetLabel(goal: string): string | undefined {
+  return goal.match(/Click the element labeled exactly "([^"]+)" to start that flow/i)?.[1]?.trim();
+}
+
+/**
+ * A walked list-card mutation is also a one-shot entry even when its generated
+ * milestone uses the normal `click "ACTION (owner)"` wording rather than the
+ * deep-walker's fallback-only "labeled exactly" sentence.
+ */
+export function contextualMutationTargetLabel(goal: string): string | undefined {
+  for (const match of goal.matchAll(/\bclick\s+"([^"]+)"/gi)) {
+    const label = match[1]?.trim();
+    if (
+      label &&
+      /^.{1,80}\s+\([^()\n]{1,160}\)$/.test(label) &&
+      isLikelyMutationLabel(label)
+    ) {
+      return label;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * After async generation, many apps expose one explicit continuation such as
+ * "Review and finalize" or "Finalize Asset". Returning control to the LLM
+ * before honoring that control lets it misread a still-disabled outer Next as
+ * failed generation and start a second item instead. Only return a candidate
+ * when exactly one enabled, explicitly finalizing button is visible.
+ */
+export function uniquePostProcessingCompletionControl(
+  snapshot: string,
+): { ref: string; label: string } | null {
+  const matches: Array<{ ref: string; label: string }> = [];
+  for (const line of snapshot.split('\n')) {
+    if (!/\bbutton\s+"/i.test(line) || /\[disabled\b/i.test(line)) continue;
+    const match = line.match(/\bbutton\s+"([^"]+)"[^\n]*\[ref=(e\d+)\]/i);
+    if (!match) continue;
+    const label = match[1].replace(/\s+/g, ' ').trim();
+    if (
+      !/^(?:review\s+(?:and|&)\s+finalize|finalize(?:\s+[\w -]+)?|finish|complete|save(?:\s+(?:changes?|item|character|asset|outfit|project))?)$/i.test(
+        label,
+      )
+    ) {
+      continue;
+    }
+    matches.push({ ref: `@${match[2]}`, label });
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/** Narrow post-mutation detector; bare badges are safe only after a real mutation. */
+export function hasPostMutationProcessing(snapshot: string): boolean {
+  return (
+    hasInlineProcessing(snapshot) ||
+    /(?:text|status|badge)\s+"(?:processing|pending|finalizing|generating|rendering|uploading)"|\b(?:processing|pending|finalizing|generating|rendering|uploading)\s+(?:badge|status)\b/i.test(snapshot)
+  );
+}
+
+/** Persistent-library proof that the artifact itself is still pending. */
+export function hasPendingArtifactBadge(snapshot: string): boolean {
+  return (
+    /(?:statictext|text|status|badge)\s+"(?:processing|pending|finalizing|generating|rendering|uploading)"/i.test(snapshot) ||
+    /button\s+"[^"]*\bregenerate\b[^"]*"[^\n]*disabled/i.test(snapshot)
+  );
+}
+
 const COMPLETION_CONTROL_RE =
   /(?:button|link)\s+"[^"]*\b(?:create|generate|regenerate|finalize|save|next|continue|submit|finish|complete)\b[^"]*"[^\n]*(?:disabled|busy)/i;
 const VISIBLE_VALIDATION_RE =
-  /\b(?:not allowed|already (?:exists|used|taken)|only [^.\n]{0,80} allowed|required|invalid|must (?:be|contain|have)|cannot|can't|validation error|failed)\b/i;
+  /\b(?:not allowed|already (?:exists|used|taken|in use)|only [^.\n]{0,80} allowed|required|invalid|must (?:be|contain|have)|cannot|can't|validation error|failed)\b/i;
+const RECOVERABLE_FIELD_VALIDATION_RE =
+  /\b(?:not allowed|already (?:exists|used|taken|in use)|(?:name|value|entry)\s+is\s+taken|invalid (?:name|value|entry)|only [^.\n]{0,80} allowed|must (?:be|contain|have))\b/i;
 
 /** Narrow vision trigger: a completion control is disabled and a concrete validation reason is visible. */
 export function hasBlockingValidationState(snapshot: string): boolean {
   return COMPLETION_CONTROL_RE.test(snapshot) && VISIBLE_VALIDATION_RE.test(snapshot);
 }
 
+export function hasRecoverableFieldValidation(snapshot: string): boolean {
+  return COMPLETION_CONTROL_RE.test(snapshot) && RECOVERABLE_FIELD_VALIDATION_RE.test(snapshot);
+}
+
+function refForFieldLabel(snapshot: string, label: string): string | undefined {
+  const target = label.toLowerCase().replace(/\s+/g, ' ').trim();
+  for (const line of snapshot.split('\n')) {
+    const match = line.match(
+      /(?:textbox|searchbox|combobox|spinbutton)\s+"([^"]*)"[^\n]*\[ref=(e\d+)\]/i,
+    );
+    if (!match) continue;
+    const visible = match[1].toLowerCase().replace(/\s+/g, ' ').trim();
+    if (visible === target || visible.includes(target) || target.includes(visible)) {
+      return `@${match[2]}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Some forms leave the previous textarea visible when a new required field
+ * appears. If that new field's own accessible name contains the validation
+ * constraint, the rejection belongs to it—not to the most recent old fill.
+ */
+export function validationTargetsDifferentField(snapshot: string, recentLabel: string): boolean {
+  const recentRef = refForFieldLabel(snapshot, recentLabel);
+  if (!recentRef) return false;
+  for (const line of snapshot.split('\n')) {
+    const match = line.match(
+      /(?:textbox|searchbox|combobox|spinbutton)\s+"([^"]*)"[^\n]*\[ref=(e\d+)\]/i,
+    );
+    if (!match || !RECOVERABLE_FIELD_VALIDATION_RE.test(match[1])) continue;
+    if (`@${match[2]}` !== recentRef) return true;
+  }
+  return false;
+}
+
+/**
+ * State-level loop identity for Explorer. Refs and timing/count noise are not
+ * semantic progress; checked/disabled/value/error text and the URL remain.
+ * This catches short cycles whose individual actions differ (A → B → modal →
+ * close → A), which the exact action-signature guard cannot see.
+ */
+export function explorerStateSignature(url: string, snapshot: string): string {
+  const stableSnapshot = snapshot
+    .toLowerCase()
+    .replace(/\[ref=e\d+\]/g, '')
+    // Generated media/cache URLs and opaque task ids change after every retry
+    // while the actionable UI can remain exactly the same. They are evidence,
+    // not state identity.
+    .replace(/https?:\/\/[^\s"']+/g, '<url>')
+    .replace(/\b[a-f0-9]{12,}\b/gi, '<id>')
+    .replace(/\b[a-z0-9_-]{24,}\b/gi, '<token>')
+    .replace(/\b\d+(?:\.\d+)?(?:%|s|sec|seconds?|min|minutes?)?\b/g, '#')
+    .replace(/\s+/g, ' ')
+    .slice(0, 5000);
+  return `${url}|${stableSnapshot}`;
+}
+
+export function isSafeStateCycleRecoveryLabel(label: string): boolean {
+  return /^(?:next|continue|save and continue|proceed|advance|go forward)$/i.test(
+    label.trim(),
+  );
+}
+
+/**
+ * A recurring state may still have one obvious, non-mutating way forward.
+ * Resolve it deterministically so loop arbitration cannot miss a visible Next
+ * merely because the LLM returned `done`/`fail`. Ambiguous or disabled
+ * candidates are deliberately rejected.
+ */
+export function uniqueSafeStateCycleRecoveryControl(
+  snapshot: string,
+): { ref: string; label: string; role: string } | null {
+  const matches = new Map<string, { ref: string; label: string; role: string }>();
+  for (const line of snapshot.split('\n')) {
+    if (/\bdisabled\b|aria-disabled\s*=\s*true/i.test(line)) continue;
+    const match = line.match(
+      /^\s*-\s*(button|link)\s+"([^"]+)"[^\n]*\[ref=(e\d+)\]/i,
+    );
+    if (!match) continue;
+    const label = match[2].replace(/\s+/g, ' ').trim();
+    if (!isSafeStateCycleRecoveryLabel(label)) continue;
+    const ref = `@${match[3]}`;
+    matches.set(ref, { ref, label, role: match[1].toLowerCase() });
+  }
+  return matches.size === 1 ? [...matches.values()][0] : null;
+}
+
 export function explicitGoalValue(goal: string): string | undefined {
   return goal.match(/When entering test text, use exactly:\s*"([^"]+)"/i)?.[1];
+}
+
+/** A create/generate goal consumes name-like identities; saved names must not be reused. */
+export function requiresFreshArtifactIdentity(
+  goal: string,
+  label: string,
+  priorActions: ExplorerAction[],
+): boolean {
+  if (
+    !/\b(name|title|slug|identifier)\b/i.test(label) ||
+    /\b(email|user\s*name|username|login|search|description|prompt)\b/i.test(label)
+  ) {
+    return false;
+  }
+  return (
+    /\b(create|generate|regenerate|add\s+(?:a\s+)?new|new\s+(?:character|asset|outfit|location|project|item|artifact))\b/i.test(goal) ||
+    priorActions.some(
+      (action) =>
+        action.action === 'click' &&
+        !action.executionFailed &&
+        /\b(create|generate|add new|new character|new asset|new outfit|new location)\b/i.test(
+          action.resolvedLabel ?? '',
+        ),
+    )
+  );
+}
+
+/**
+ * Some async generators remount their review form after media generation. The
+ * DOM shows the old name, but the new form's internal state never received an
+ * input event, so its enabled-looking Finalize button becomes a no-op. Refill
+ * only prior non-secret identity fields that are visibly present; descriptions
+ * and prompts are deliberately excluded because re-entering them can trigger a
+ * second generation.
+ */
+export function identityReassertionsForReview(
+  goal: string,
+  priorActions: ExplorerAction[],
+  reviewSnapshot: string,
+): Array<{ ref: string; label: string; value: string }> {
+  const seen = new Set<string>();
+  const out: Array<{ ref: string; label: string; value: string }> = [];
+  for (const action of [...priorActions].reverse()) {
+    if (
+      action.action !== 'fill' ||
+      action.executionFailed ||
+      !action.value ||
+      !action.resolvedLabel ||
+      isSensitiveFieldLabel(action.resolvedLabel) ||
+      !requiresFreshArtifactIdentity(goal, action.resolvedLabel, priorActions)
+    ) {
+      continue;
+    }
+    const key = action.resolvedLabel.trim().toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const ref = refForFieldLabel(reviewSnapshot, action.resolvedLabel);
+    if (ref) out.push({ ref, label: action.resolvedLabel, value: action.value });
+  }
+  return out;
+}
+
+export function shouldDeferUnlabelledProgressClick(
+  returnOnUrlChange: boolean | undefined,
+  resolvedLabel: string | undefined,
+  hasVisualEvidence: boolean,
+): boolean {
+  return Boolean(returnOnUrlChange && !resolvedLabel?.trim() && !hasVisualEvidence);
+}
+
+export function snapshotRefIsDisabled(snapshot: string, ref: string): boolean {
+  const bareRef = ref.replace(/^@/, '');
+  return snapshot
+    .split('\n')
+    .some(
+      (line) =>
+        new RegExp(`\\bref=${bareRef}\\b`).test(line) &&
+        (/\bdisabled\b/i.test(line) || /\baria-disabled=(?:"?true"?)/i.test(line)),
+    );
+}
+
+function isForwardBoundaryLabel(label: string | undefined): boolean {
+  return /^(?:next|proceed|finish|complete step|go forward)(?:\s*[›»→>])?$/i.test(
+    label?.trim() ?? '',
+  );
+}
+
+export function goalRequiresObservableProgress(goal: string): boolean {
+  return /\b(click|open|update|edit|save|advance|navigate|select|choose|fill|enter|upload|create|generate|regenerate|render|submit|remove|add|change|apply|finalize)\b/i.test(
+    goal,
+  );
+}
+
+function reasonClaimsIdempotentCompletion(reason: string | undefined): boolean {
+  return /already (done|exists|added|filled|there|complete|completed|open|opened|selected|saved)|no need to|not needed|nothing (left|more) to do|skip(ping)? (it|this)|appears already done/i.test(
+    reason ?? '',
+  );
+}
+
+/**
+ * A goal that asks for a mutation/navigation cannot become successful merely
+ * because the LLM says "done" after several clicks that left the exact same
+ * page rendered. Require a URL or semantic full-page state transition. Pure
+ * verify/wait goals remain valid on an unchanged page, and explicit idempotent
+ * completion remains valid for goals that intentionally support resume.
+ */
+export function doneHasObservableProgress(
+  goal: string,
+  startUrl: string,
+  startStateSignature: string | undefined,
+  currentUrl: string,
+  currentSnapshot: string,
+  reason?: string,
+): boolean {
+  if (!goalRequiresObservableProgress(goal)) return true;
+  if (reasonClaimsIdempotentCompletion(reason)) return true;
+  if (!startStateSignature) return true;
+  if (currentUrl && startUrl && currentUrl !== startUrl) return true;
+  return explorerStateSignature(currentUrl, currentSnapshot) !== startStateSignature;
 }
 
 function buildSystemPrompt(siteDescription: string, siteHints: string[]): string {
@@ -112,6 +418,7 @@ Rules:
 - If a field must be submitted with a keyboard key (e.g. a search/todo/tag input with NO visible submit button, only responds to pressing Enter), first "fill" the field with the text, THEN issue a SEPARATE action "press" with "value" set to the key name (e.g. "Enter") as the very next step — do NOT put a key name into a "fill" value, "fill" only ever sets the field's text content, it can never submit anything.
 - If the goal requires attaching a local file, respond with action "upload" (you cannot attach files yourself; the harness will do it mechanically). Include a "selector" if a file input's CSS id/selector is apparent.
 - If your step history already shows an "upload" action, and the snapshot still shows that same filename attached (e.g. next to a remove/"×" control) with an advance control (Next/Continue/Submit) now enabled, the file IS attached — do not "upload" again. A tiny or "0.00 MB"/"0 KB"-looking size next to the filename does not mean the upload failed (some real test files are only a few KB, and their true size will never look bigger no matter how many times you retry) — trust the filename + enabled advance control over an ambiguous size readout, and click the advance control (or use "done") instead of repeating the same upload.
+- Never click a control marked disabled. A disabled Next/Continue means the current screen is still processing or has an unmet requirement. Wait or satisfy that requirement. Never bypass it by clicking a wizard sidebar, breadcrumb, progress-step label, or direct route; if the current step cannot advance after reasonable waiting and no corrective field/choice exists, use "fail" and describe the visible blocker.
 - Use action "done" when the goal is clearly achieved in the current snapshot/URL.
 - Use action "fail" only if the goal is impossible (e.g. element missing after reasonable attempt).
 - If a prior step says an action was denied by the user, do not retry it — choose another path.
@@ -227,9 +534,80 @@ export class Explorer {
     this.siteHints = hints;
   }
 
+  /**
+   * Feed a concrete screenshot-only validation diagnosis back into the normal
+   * human field-value channel. Some canvases/modals expose the rejection only
+   * visually, so the in-loop accessibility trigger cannot see it.
+   */
+  async recoverRejectedFillFromVision(
+    result: ExplorerResult,
+    visualSummary: string,
+  ): Promise<boolean> {
+    if (!this.hooks.onRejectedFill || !RECOVERABLE_FIELD_VALIDATION_RE.test(visualSummary)) {
+      return false;
+    }
+    const rejectedFill = [...result.actions]
+      .reverse()
+      .find(
+        (action) =>
+          action.action === 'fill' &&
+          !action.executionFailed &&
+          action.value &&
+          action.resolvedLabel &&
+          !isSensitiveFieldLabel(action.resolvedLabel),
+    );
+    if (!rejectedFill?.value || !rejectedFill.resolvedLabel) return false;
+
+    let fullSnapshot = result.finalSnapshot;
+    try {
+      fullSnapshot = this.browser.snapshotFull();
+    } catch {
+      return false;
+    }
+    const currentRef = refForFieldLabel(fullSnapshot, rejectedFill.resolvedLabel);
+    // A later field's validation must never invalidate an earlier field that
+    // has already disappeared (live Koyal asset description → asset-name step).
+    if (!currentRef) return false;
+    if (validationTargetsDifferentField(fullSnapshot, rejectedFill.resolvedLabel)) return false;
+
+    const replacement = await this.hooks.onRejectedFill(
+      rejectedFill.resolvedLabel,
+      rejectedFill.value,
+      rejectedFill.proposedValue,
+    );
+    if (!replacement || replacement === rejectedFill.value) return false;
+
+    const recoveryFill: ExplorerAction = {
+      action: 'fill',
+      ref: currentRef,
+      value: replacement,
+      proposedValue: rejectedFill.proposedValue,
+      resolvedLabel: rejectedFill.resolvedLabel,
+      resolvedRole: rejectedFill.resolvedRole,
+      reason: `replace value rejected by visual validation: ${visualSummary}`,
+    };
+    await this.executeAction(recoveryFill, result.stepsTaken);
+    result.actions.push(recoveryFill);
+    this.browser.wait(config.actionDelayMs);
+    result.finalSnapshot = this.browser.snapshotFull();
+    result.stepsTaken.push(
+      `vision rejected "${rejectedFill.value}" for "${rejectedFill.resolvedLabel}"; ` +
+        `the human supplied a different authoritative value "${replacement}"`,
+    );
+    return true;
+  }
+
   async achieveGoal(
     goal: string,
-    options?: { maxSteps?: number; visionFirst?: boolean; authWatch?: RegExp },
+    options?: {
+      maxSteps?: number;
+      visionFirst?: boolean;
+      authWatch?: RegExp;
+      /** Controls already fired in this goal chain; never execute them again. */
+      blockedClickLabels?: string[];
+      /** Deep-walk one-screen goals return as soon as navigation proves advancement. */
+      returnOnUrlChange?: boolean;
+    },
   ): Promise<ExplorerResult> {
     const maxSteps = options?.maxSteps ?? config.llm.maxStepsPerGoal;
     const actions: ExplorerAction[] = [];
@@ -240,8 +618,23 @@ export class Explorer {
     let suppressProcessingUntilAction = false;
     let processingVisuallyComplete = false;
     let lastRealUrl = this.browser.getUrl();
+    const goalStartUrl = lastRealUrl;
     let blankRecoveryAttempts = 0;
-    let validationVisionUsed = false;
+    const validationVisionStates = new Set<string>();
+    let rejectedFillRecoveryUsed = false;
+    let stateCycleRecoveryUsed = false;
+    let goalStartStateSignature: string | undefined;
+    const deniedClickLabels = new Set<string>();
+    const stateVisitCounts = new Map<string, number>();
+    const submittedMutation = (): boolean =>
+      actions.some(
+        (action) =>
+          action.action === 'click' &&
+          !action.executionFailed &&
+          isLikelyMutationLabel(action.resolvedLabel ?? ''),
+      );
+    const processingVisible = (value: string): boolean =>
+      hasInlineProcessing(value) || (submittedMutation() && hasPostMutationProcessing(value));
 
     const goalForLog = this.redact(goal);
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
@@ -290,6 +683,35 @@ export class Explorer {
         url = this.browser.getUrl();
       }
       if (!isBlank || (url && !url.startsWith('about:'))) lastRealUrl = url || lastRealUrl;
+      if (!goalStartStateSignature && snapshot.trim() && !url.startsWith('about:')) {
+        let initialSnapshot = snapshot;
+        try {
+          initialSnapshot = this.browser.snapshotFull();
+        } catch {
+          // Interactive state is still a valid conservative baseline.
+        }
+        goalStartStateSignature = explorerStateSignature(url, initialSnapshot);
+      }
+
+      // SPA navigation can commit just after the post-action boundary check.
+      // Re-check at the START of every loop before asking the LLM anything:
+      // otherwise a one-screen milestone can act once inside the next wizard
+      // state (live Koyal upload: Next reached /selectStoryType a beat late,
+      // then the explorer clicked the Story Type sidebar item and escaped to
+      // /dashboard before noticing that the original goal had succeeded).
+      if (
+        options?.returnOnUrlChange &&
+        url &&
+        !url.startsWith('about:') &&
+        goalStartUrl &&
+        !goalStartUrl.startsWith('about:') &&
+        url !== goalStartUrl
+      ) {
+        stepsTaken.push(
+          `one-screen goal observed a delayed URL transition at loop start: ${goalStartUrl} → ${url}; returning before acting in the next state`,
+        );
+        return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: snapshot };
+      }
 
       // A normal edit with an explicit human value is complete once Save was
       // clicked and that exact value is visible in the resulting full page.
@@ -318,7 +740,7 @@ export class Explorer {
       // full tree). Consult the full snapshot before asking the LLM to poke a
       // disabled form during genuine server-side work.
       let processingSnapshot = snapshot;
-      if (!hasInlineProcessing(processingSnapshot)) {
+      if (!processingVisible(processingSnapshot)) {
         try {
           processingSnapshot = this.browser.snapshotFull();
         } catch {
@@ -326,7 +748,7 @@ export class Explorer {
         }
       }
       if (
-        hasInlineProcessing(processingSnapshot) &&
+        processingVisible(processingSnapshot) &&
         processingWaitedMs < config.deep.processingWaitMs &&
         !suppressProcessingUntilAction
       ) {
@@ -356,7 +778,7 @@ export class Explorer {
               this.browser.clearSignals();
             }
             let now = this.browser.snapshotInteractive();
-            if (!hasInlineProcessing(now)) {
+            if (!processingVisible(now)) {
               try {
                 now = this.browser.snapshotFull();
               } catch {
@@ -365,12 +787,16 @@ export class Explorer {
             }
             // empty snapshot = capture/daemon error, NOT "processing finished" —
             // stop waiting and let the normal loop re-snapshot and decide
-            if (!now.trim() || !hasInlineProcessing(now)) break;
+            if (!now.trim() || !processingVisible(now)) break;
             if (polls === PROCESSING_VISION_POLL_THRESHOLD) {
               const assessment = await this.affirmProcessingState(goal, url, truncateSnapshot(now, 5000));
               if (assessment) {
                 stepsTaken.push(`vision processing affirmation: ${assessment.status} — ${assessment.summary}`);
-                if (assessment.status === 'complete' || assessment.status === 'blocked') {
+                if (assessment.status === 'complete' && hasPendingArtifactBadge(now)) {
+                  stepsTaken.push(
+                    'vision completion withheld: the persisted artifact still has a pending/processing badge or disabled regenerate control',
+                  );
+                } else if (assessment.status === 'complete' || assessment.status === 'blocked') {
                   visualRelease = assessment;
                   suppressProcessingUntilAction = true;
                   processingVisuallyComplete = assessment.status === 'complete';
@@ -388,12 +814,42 @@ export class Explorer {
         const waitedS = Math.round((Date.now() - t0) / 1000);
         const waitBudgetExhausted = Date.now() - t0 >= remainingWaitBudget;
         let stillProcessingSnapshot = snapshot;
-        if (!hasInlineProcessing(stillProcessingSnapshot)) {
+        if (!processingVisible(stillProcessingSnapshot)) {
           try {
             stillProcessingSnapshot = this.browser.snapshotFull();
           } catch {
             // keep interactive snapshot
           }
+        }
+        const deterministicWaitMs = Date.now() - t0;
+        if (
+          (visualRelease?.status === 'complete' || !processingVisible(stillProcessingSnapshot))
+        ) {
+          // A spinner can disappear one render before the completed controls
+          // mount (live Koyal: avatar spinner cleared, then Review/Finalize
+          // appeared after the agent had already clicked Add Character).
+          // Hold one short render turn before giving mutation control back to
+          // the LLM, then use the settled state for the next decision.
+          this.browser.wait(Math.max(config.actionDelayMs, 2000));
+          snapshot = this.browser.snapshotInteractive();
+          url = this.browser.getUrl();
+          stillProcessingSnapshot = snapshot;
+          if (!processingVisible(stillProcessingSnapshot)) {
+            try {
+              stillProcessingSnapshot = this.browser.snapshotFull();
+            } catch {
+              // keep the settled interactive snapshot
+            }
+          }
+          stepsTaken.push('post-processing render stabilization completed before the next action');
+        }
+        if (!waitBudgetExhausted || visualRelease) {
+          actions.push({
+            action: 'wait',
+            waitForProcessing: true,
+            waitedMs: deterministicWaitMs,
+            reason: 'deterministic processing barrier learned for replay',
+          });
         }
         if (visualRelease) {
           stepsTaken.push(
@@ -401,7 +857,7 @@ export class Explorer {
               ? 'vision confirmed the asynchronous operation finished; returning control to the normal goal loop'
               : 'vision found a visible blocker; returning control to the normal goal loop for recovery',
           );
-        } else if (hasInlineProcessing(stillProcessingSnapshot) && waitBudgetExhausted) {
+        } else if (processingVisible(stillProcessingSnapshot) && waitBudgetExhausted) {
           const error =
             `Processing exceeded the configured wait ceiling (${waitedS}s) and is still visibly active. ` +
             'Classify this as a processing-timeout bug; do not click unrelated controls or restart the same state.';
@@ -416,7 +872,7 @@ export class Explorer {
             error,
             processingTimedOut: true,
           };
-        } else if (hasInlineProcessing(stillProcessingSnapshot)) {
+        } else if (processingVisible(stillProcessingSnapshot)) {
           stepsTaken.push(
             `processing wait ended early after ${waitedS}s while the busy state remained visible; return control for a fresh deterministic assessment`,
           );
@@ -425,22 +881,418 @@ export class Explorer {
             `waited ${waitedS}s for in-page processing to finish (deterministic, no steps consumed)`,
           );
         }
+
+        // The action that triggered processing may also have navigated. The
+        // ordinary one-screen boundary check runs immediately after actions,
+        // but processing is handled at the next loop iteration before another
+        // decision. Re-check the boundary here or the LLM can act once inside
+        // the next wizard step (live Koyal upload: it selected Character Driven
+        // before returning, then the next milestone selected Concept Driven).
+        if (options?.returnOnUrlChange) {
+          const afterProcessingUrl = this.browser.getUrl();
+          if (
+            afterProcessingUrl &&
+            !afterProcessingUrl.startsWith('about:') &&
+            goalStartUrl &&
+            !goalStartUrl.startsWith('about:') &&
+            afterProcessingUrl !== goalStartUrl
+          ) {
+            let finalSnapshot = stillProcessingSnapshot;
+            try {
+              finalSnapshot = this.browser.snapshotInteractive();
+            } catch {
+              // Retain the settled snapshot captured by the processing barrier.
+            }
+            stepsTaken.push(
+              `one-screen goal advanced after processing: ${goalStartUrl} → ${afterProcessingUrl}; returning control before acting in the next state`,
+            );
+            return {
+              goal,
+              success: true,
+              actions,
+              stepsTaken,
+              finalUrl: afterProcessingUrl,
+              finalSnapshot,
+            };
+          }
+        }
+
+        const priorSubmittedMutation = [...actions]
+          .reverse()
+          .find(
+            (action) =>
+              action.action === 'click' &&
+              !action.executionFailed &&
+              isLikelyMutationLabel(action.resolvedLabel ?? ''),
+          );
+        const completion = priorSubmittedMutation
+          ? uniquePostProcessingCompletionControl(stillProcessingSnapshot)
+          : null;
+        const completionBlocked = completion
+          ? options?.blockedClickLabels?.some(
+              (label) => label.trim().toLowerCase() === completion.label.toLowerCase(),
+            )
+          : false;
+        if (
+          completion &&
+          !completionBlocked &&
+          mutationControlKey(completion.label) !==
+            mutationControlKey(priorSubmittedMutation?.resolvedLabel ?? '')
+        ) {
+          const completionAction: ExplorerAction = {
+            action: 'click',
+            ref: completion.ref,
+            resolvedLabel: completion.label,
+            resolvedRole: 'button',
+            reason:
+              'unique enabled finalization control appeared after processing; complete the submitted artifact before starting another item',
+          };
+          try {
+            await this.executeAction(completionAction, stepsTaken);
+            actions.push(completionAction);
+            stepsTaken.push(
+              `post-processing continuation: clicked the unique enabled completion control (button "${completion.label}") before permitting Add/New/Create recovery`,
+            );
+            suppressProcessingUntilAction = false;
+            processingVisuallyComplete = false;
+            resolveBlockingDialog(this.browser);
+            this.browser.wait(config.actionDelayMs);
+            snapshot = this.browser.snapshotInteractive();
+            url = this.browser.getUrl();
+            const reviewFinalizer = uniquePostProcessingCompletionControl(snapshot);
+            if (
+              /\breview(?:\s+and)?\s+finalize\b/i.test(completion.label) ||
+              (reviewFinalizer && /\bfinalize\b/i.test(reviewFinalizer.label))
+            ) {
+              for (const refill of identityReassertionsForReview(goal, actions, snapshot)) {
+                try {
+                  this.browser.fillVisible(refill.ref, refill.value);
+                  actions.push({
+                    action: 'fill',
+                    ref: refill.ref,
+                    value: refill.value,
+                    resolvedLabel: refill.label,
+                    reason:
+                      're-assert identity after the generated review form remounted so the enabled finalizer receives current form state',
+                  });
+                  stepsTaken.push(
+                    `post-processing review remounted; re-asserted identity field "${refill.label}" before finalization`,
+                  );
+                } catch (error) {
+                  stepsTaken.push(
+                    `review-form identity re-assertion unavailable for "${refill.label}": ${error instanceof Error ? error.message : error}`,
+                  );
+                }
+              }
+              if (reviewFinalizer) {
+                this.browser.wait(config.actionDelayMs);
+                snapshot = this.browser.snapshotInteractive();
+              }
+            }
+            if (processingVisible(snapshot)) {
+              // This deterministic continuation is not an LLM decision and
+              // must not consume one of the goal's step slots. Re-enter the
+              // processing loop on the same logical step.
+              step--;
+              continue;
+            }
+          } catch (error) {
+            completionAction.executionFailed = true;
+            actions.push(completionAction);
+            stepsTaken.push(
+              `post-processing completion control "${completion.label}" could not be activated: ${error instanceof Error ? error.message : error}`,
+            );
+          }
+        }
+      }
+
+      // Exact-action repetition is not enough: an explorer can alternate
+      // several controls while cycling through the same two or three rendered
+      // states (live Koyal case: scene A → scene B → Report Bug modal → close,
+      // for 40 steps, followed by another 40-step Explorer). Count normalized
+      // full-page state visits across ALL actions. On the fourth recurrence,
+      // allow one screenshot/full-page arbitration for a hidden success or
+      // concrete blocker, but never execute yet another speculative action.
+      let cycleSnapshot = snapshot;
+      try {
+        cycleSnapshot = this.browser.snapshotFull();
+      } catch {
+        // Interactive state is still sufficient for a conservative fallback.
+      }
+      if (!processingVisible(cycleSnapshot)) {
+        const stateSignature = explorerStateSignature(url, cycleSnapshot);
+        const visits = (stateVisitCounts.get(stateSignature) ?? 0) + 1;
+        stateVisitCounts.set(stateSignature, visits);
+        if (visits >= EXPLORER_STATE_VISIT_LIMIT) {
+          console.warn(
+            `  [explorer] recurring page state observed ${visits} times — running one visual/full-page arbitration before aborting`,
+          );
+          let recheckReason = '';
+          const deterministicForward =
+            uniqueSafeStateCycleRecoveryControl(cycleSnapshot);
+          try {
+            const recheck = await this.decideNextAction(
+              goal,
+              url,
+              cycleSnapshot,
+              [
+                ...stepsTaken,
+                `The same normalized page state has recurred ${visits} times after varied actions. ` +
+                  'Do not repeat any prior action and do not choose fills, uploads, mutations, modal experiments, wizard sidebars, breadcrumbs, or arbitrary controls. ' +
+                  (deterministicForward
+                    ? `The goal is not yet complete and exactly one enabled safe forward control exists: ${deterministicForward.role} "${deterministicForward.label}" (${deterministicForward.ref}). Choose that click now. `
+                    : 'No unique enabled safe Next/Continue/Proceed control was found. ') +
+                  'Use done only if the goal is visibly complete. Use wait only for a visibly active asynchronous operation; otherwise use fail and quote the visible blocker or no-progress condition.',
+              ],
+              this.captureVisionImage(),
+            );
+            recheckReason = recheck.reason ?? '';
+            if (recheck.action === 'done') {
+              if (
+                doneHasObservableProgress(
+                  goal,
+                  goalStartUrl,
+                  goalStartStateSignature,
+                  url,
+                  cycleSnapshot,
+                  recheck.reason,
+                )
+              ) {
+                stepsTaken.push(
+                  `state-cycle full-page recheck confirmed the goal was already satisfied — ${recheckReason}`.trim(),
+                );
+                return {
+                  goal,
+                  success: true,
+                  actions,
+                  stepsTaken,
+                  finalUrl: url,
+                  finalSnapshot: cycleSnapshot,
+                };
+              }
+              recheckReason =
+                `done rejected: the goal requires a visible transition, but the URL and semantic page state never changed` +
+                (recheck.reason ? ` — ${recheck.reason}` : '');
+            }
+            if (
+              !stateCycleRecoveryUsed &&
+              recheck.action === 'click' &&
+              recheck.ref
+            ) {
+              const resolved = resolveRefLabel(cycleSnapshot, recheck.ref);
+              if (resolved.label && isSafeStateCycleRecoveryLabel(resolved.label)) {
+                recheck.resolvedLabel = resolved.label;
+                recheck.resolvedRole = resolved.role;
+                await this.executeAction(recheck, stepsTaken);
+                actions.push(recheck);
+                stepsTaken.push(
+                  `state-cycle visual recovery executed one bounded safe advance click (${resolved.role ?? ''} "${resolved.label}")`,
+                );
+                stateCycleRecoveryUsed = true;
+                stateVisitCounts.clear();
+                this.browser.wait(config.actionDelayMs);
+                const recoveredUrl = this.browser.getUrl();
+                if (
+                  options?.returnOnUrlChange &&
+                  recoveredUrl &&
+                  !recoveredUrl.startsWith('about:') &&
+                  goalStartUrl &&
+                  !goalStartUrl.startsWith('about:') &&
+                  recoveredUrl !== goalStartUrl
+                ) {
+                  const finalSnapshot = this.browser.snapshotInteractive();
+                  stepsTaken.push(
+                    `one-screen goal advanced by bounded state-cycle recovery: ${goalStartUrl} → ${recoveredUrl}`,
+                  );
+                  return {
+                    goal,
+                    success: true,
+                    actions,
+                    stepsTaken,
+                    finalUrl: recoveredUrl,
+                    finalSnapshot,
+                  };
+                }
+                continue;
+              }
+            }
+          } catch (error) {
+            recheckReason = `diagnostic unavailable: ${error instanceof Error ? error.message : error}`;
+          }
+          const error =
+            `Explorer state-cycle detected: the same page state recurred ${visits} times without progress` +
+            (recheckReason ? ` — ${recheckReason}` : '');
+          stepsTaken.push(error);
+          return {
+            goal,
+            success: false,
+            actions,
+            stepsTaken,
+            finalUrl: url,
+            finalSnapshot: cycleSnapshot,
+            error,
+          };
+        }
       }
 
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
       const llmStart = Date.now();
       let decisionSnapshot = snapshot;
       let decisionImage = options?.visionFirst && step === 0 ? this.captureVisionImage() : undefined;
-      if (!validationVisionUsed) {
+      {
         try {
           const fullSnapshot = this.browser.snapshotFull();
-          if (hasBlockingValidationState(fullSnapshot)) {
-            validationVisionUsed = true;
+          const validationState = explorerStateSignature(url, fullSnapshot);
+          const recoverableFieldValidation = hasRecoverableFieldValidation(fullSnapshot);
+
+          // Do not couple rejected-value recovery to the small vision budget.
+          // Long nested forms can legitimately show several ordinary "required"
+          // states before a generated preview reveals the actionable error
+          // ("name already in use", invalid value, etc.). The former used to
+          // consume all three slots, making the latter invisible forever.
+          if (
+            !rejectedFillRecoveryUsed &&
+            recoverableFieldValidation
+          ) {
+            const rejectedFill = [...actions]
+              .reverse()
+              .find(
+                (action) =>
+                  action.action === 'fill' &&
+                  !action.executionFailed &&
+                  action.value &&
+                  action.resolvedLabel &&
+                  !isSensitiveFieldLabel(action.resolvedLabel),
+              );
+            if (rejectedFill?.value && rejectedFill.resolvedLabel && this.hooks.onRejectedFill) {
+              const currentRef = refForFieldLabel(fullSnapshot, rejectedFill.resolvedLabel);
+              if (!currentRef) {
+                stepsTaken.push(
+                  `visible validation belongs to the current form, but the most recent filled field "${rejectedFill.resolvedLabel}" is no longer present; refusing to misattribute the rejection`,
+                );
+              } else if (validationTargetsDifferentField(fullSnapshot, rejectedFill.resolvedLabel)) {
+                stepsTaken.push(
+                  `visible validation is attached to a different unfilled field, not the recent "${rejectedFill.resolvedLabel}" field; refusing to overwrite the accepted value`,
+                );
+              } else {
+                rejectedFillRecoveryUsed = true;
+                try {
+                  const replacement = await this.hooks.onRejectedFill(
+                    rejectedFill.resolvedLabel,
+                    rejectedFill.value,
+                    rejectedFill.proposedValue,
+                  );
+                  if (replacement && replacement !== rejectedFill.value) {
+                    const recoveryFill: ExplorerAction = {
+                      action: 'fill',
+                      ref: currentRef,
+                      value: replacement,
+                      proposedValue: rejectedFill.proposedValue,
+                      resolvedLabel: rejectedFill.resolvedLabel,
+                      resolvedRole: rejectedFill.resolvedRole,
+                      reason: 'replace a value explicitly rejected by visible validation',
+                    };
+                    await this.executeAction(recoveryFill, stepsTaken);
+                    actions.push(recoveryFill);
+                    stepsTaken.push(
+                      `visible validation rejected "${rejectedFill.value}" for "${rejectedFill.resolvedLabel}"; ` +
+                        `the human supplied a different value and the live field was refilled once`,
+                    );
+                    this.browser.wait(config.actionDelayMs);
+                    continue;
+                  }
+                } catch (error) {
+                  stepsTaken.push(
+                    `rejected field-value recovery unavailable: ${error instanceof Error ? error.message : error}`,
+                  );
+                }
+              }
+            }
+          }
+
+          if (
+            validationVisionStates.size < 3 &&
+            hasBlockingValidationState(fullSnapshot) &&
+            !validationVisionStates.has(validationState)
+          ) {
+            validationVisionStates.add(validationState);
             decisionSnapshot = fullSnapshot;
             decisionImage = this.captureVisionImage();
             stepsTaken.push(
               'narrow vision trigger: a required completion control is disabled beside visible validation text; diagnose the blocker before retrying',
             );
+
+            // A saved human value can become invalid as site data changes
+            // (duplicate name is the common case). If the rendered page
+            // explicitly rejects a value, do not keep replaying it forever.
+            // Replace at most once per goal, only for a recent non-secret fill,
+            // and only through the normal human-value channel.
+            const rejectedFill = [...actions]
+              .reverse()
+              .find(
+                (action) =>
+                  action.action === 'fill' &&
+                  !action.executionFailed &&
+                  action.value &&
+                  action.resolvedLabel &&
+                  !isSensitiveFieldLabel(action.resolvedLabel),
+              );
+            if (
+              !rejectedFillRecoveryUsed &&
+              recoverableFieldValidation &&
+              rejectedFill?.value &&
+              rejectedFill.resolvedLabel &&
+              this.hooks.onRejectedFill
+            ) {
+              const currentRef = refForFieldLabel(fullSnapshot, rejectedFill.resolvedLabel);
+              if (!currentRef) {
+                stepsTaken.push(
+                  `visible validation belongs to the current form, but the most recent filled field "${rejectedFill.resolvedLabel}" is no longer present; refusing to misattribute the rejection`,
+                );
+              } else if (validationTargetsDifferentField(fullSnapshot, rejectedFill.resolvedLabel)) {
+                stepsTaken.push(
+                  `visible validation is attached to a different unfilled field, not the recent "${rejectedFill.resolvedLabel}" field; refusing to overwrite the accepted value`,
+                );
+              } else {
+              rejectedFillRecoveryUsed = true;
+              try {
+                const replacement = await this.hooks.onRejectedFill(
+                  rejectedFill.resolvedLabel,
+                  rejectedFill.value,
+                  rejectedFill.proposedValue,
+                );
+                if (replacement && replacement !== rejectedFill.value && currentRef) {
+                  const recoveryFill: ExplorerAction = {
+                    action: 'fill',
+                    ref: currentRef,
+                    value: replacement,
+                    proposedValue: rejectedFill.proposedValue,
+                    resolvedLabel: rejectedFill.resolvedLabel,
+                    resolvedRole: rejectedFill.resolvedRole,
+                    reason: 'replace a value explicitly rejected by visible validation',
+                  };
+                  await this.executeAction(recoveryFill, stepsTaken);
+                  actions.push(recoveryFill);
+                  stepsTaken.push(
+                    `visible validation rejected "${rejectedFill.value}" for "${rejectedFill.resolvedLabel}"; ` +
+                      `the human supplied a different value and the live field was refilled once`,
+                  );
+                  this.browser.wait(config.actionDelayMs);
+                  continue;
+                }
+                if (replacement && replacement !== rejectedFill.value) {
+                  stepsTaken.push(
+                    `visible validation rejected "${rejectedFill.value}" for "${rejectedFill.resolvedLabel}"; ` +
+                      `a different human value "${replacement}" is now authoritative—refill that field before retrying`,
+                  );
+                }
+              } catch (error) {
+                stepsTaken.push(
+                  `rejected field-value recovery unavailable: ${error instanceof Error ? error.message : error}`,
+                );
+              }
+              }
+            }
           }
         } catch {
           // best-effort diagnostic; retain the normal interactive decision path
@@ -461,19 +1313,182 @@ export class Explorer {
         const resolved = resolveRefLabel(decisionSnapshot, decision.ref);
         decision.resolvedLabel = resolved.label;
         decision.resolvedRole = resolved.role;
-        if (!decision.resolvedLabel && (decision.action === 'fill' || decision.action === 'select')) {
+        if (
+          !decision.resolvedLabel &&
+          (decision.action === 'click' || decision.action === 'fill' || decision.action === 'select')
+        ) {
+          // Nested controls can have a perfectly good DOM-accessible name even
+          // when the snapshot line itself is unnamed. A common shape is a radio
+          // nested inside a labelled plan/option card:
+          //
+          //   LabelText "Standard 536 seconds available" [ref=e18]
+          //     - radio [ref=e22]
+          //
+          // Treating e22 as an unlabelled icon defers the click forever during a
+          // one-screen walk. fieldLabelAtRef resolves aria/label/placeholder and
+          // remains empty for genuinely unlabelled icon buttons, so the existing
+          // screenshot-first safety rule still protects those.
           decision.resolvedLabel = this.browser.fieldLabelAtRef(decision.ref) || undefined;
         }
       }
 
+      if (
+        decision.action === 'click' &&
+        decision.ref &&
+        snapshotRefIsDisabled(decisionSnapshot, decision.ref)
+      ) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `deferred disabled control ${decision.ref}${
+            decision.resolvedLabel ? ` (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}")` : ''
+          }: wait for processing or satisfy the current screen; do not bypass it through wizard navigation`,
+        );
+        this.browser.wait(2000);
+        continue;
+      }
+
+      // An unlabeled icon can be Edit, Report a Bug, Delete, or navigation; its
+      // ref alone carries no semantics. During a one-screen deep walk, defer it
+      // until a screenshot-assisted decision has grounded its purpose.
+      if (
+        decision.action === 'click' &&
+        decision.ref &&
+        shouldDeferUnlabelledProgressClick(
+          options?.returnOnUrlChange,
+          decision.resolvedLabel,
+          Boolean(decisionImage),
+        )
+      ) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `deferred unlabeled progress click ${decision.ref}: use screenshot-assisted recovery to identify the icon before activating it`,
+        );
+        continue;
+      }
+
+      const normalizedDecisionLabel = decision.resolvedLabel?.trim().toLowerCase();
+      if (
+        decision.action === 'click' &&
+        normalizedDecisionLabel &&
+        deniedClickLabels.has(normalizedDecisionLabel)
+      ) {
+        decision.executionFailed = true;
+        decision.deniedByUser = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `suppressed retry of user-denied click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}")`,
+        );
+        continue;
+      }
+
+      const exactEntryTarget =
+        exactEntryTargetLabel(goal) ?? contextualMutationTargetLabel(goal);
+      const currentMutationKey =
+        decision.action === 'click' && decision.resolvedLabel
+          ? mutationControlKey(decision.resolvedLabel)
+          : undefined;
+      const reversedPriorSameClickIndex =
+        decision.action === 'click' && decision.resolvedLabel
+          ? [...actions].reverse().findIndex(
+              (action) =>
+                action.action === 'click' &&
+                !action.executionFailed &&
+                (
+                  action.resolvedLabel?.trim().toLowerCase() === decision.resolvedLabel!.trim().toLowerCase() ||
+                  (
+                    currentMutationKey &&
+                    mutationControlKey(action.resolvedLabel ?? '') === currentMutationKey
+                  )
+                ),
+            )
+          : -1;
+      const priorSameClickIndex =
+        reversedPriorSameClickIndex < 0
+          ? -1
+          : actions.length - 1 - reversedPriorSameClickIndex;
+      const meaningfulActionSincePriorMutation =
+        priorSameClickIndex >= 0 &&
+        actions
+          .slice(priorSameClickIndex + 1)
+          .some(
+            (action) =>
+              !action.executionFailed &&
+              !['wait', 'done', 'fail'].includes(action.action),
+          );
+      const priorClickCausedProcessing =
+        priorSameClickIndex >= 0 &&
+        actions
+          .slice(priorSameClickIndex + 1)
+          .some((action) => action.action === 'wait' && action.waitForProcessing);
+      const repeatedOwnMutation =
+        decision.action === 'click' &&
+        !!decision.resolvedLabel &&
+        priorSameClickIndex >= 0 &&
+        (
+          priorClickCausedProcessing ||
+          (isLikelyMutationLabel(decision.resolvedLabel) && !meaningfulActionSincePriorMutation)
+        );
+      if (repeatedOwnMutation) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `suppressed duplicate mutation click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}") — this control already executed successfully in the current goal`,
+        );
+        if (
+          exactEntryTarget &&
+          (
+            exactEntryTarget.toLowerCase() === decision.resolvedLabel!.trim().toLowerCase() ||
+            (
+              mutationControlKey(exactEntryTarget) &&
+              mutationControlKey(exactEntryTarget) === mutationControlKey(decision.resolvedLabel!)
+            )
+          )
+        ) {
+          const finalSnapshot = this.browser.snapshotFull();
+          stepsTaken.push(
+            `exact walk-entry mutation "${decision.resolvedLabel}" already fired once; treating the entry goal as complete instead of submitting it again`,
+          );
+          return {
+            goal,
+            success: true,
+            actions,
+            stepsTaken,
+            finalUrl: this.browser.getUrl(),
+            finalSnapshot,
+          };
+        }
+        continue;
+      }
+
+      if (
+        decision.action === 'click' &&
+        decision.resolvedLabel &&
+        options?.blockedClickLabels?.some(
+          (label) => label.trim().toLowerCase() === decision.resolvedLabel!.trim().toLowerCase(),
+        )
+      ) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `suppressed duplicate mutation click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel}") — this control already executed successfully in the current creation chain; poll or use a non-mutating next/recovery control instead`,
+        );
+        continue;
+      }
+
       if (decision.action === 'fill' && decision.value !== undefined && this.hooks.onFillRequested) {
         const proposedValue = decision.value;
+        decision.proposedValue = proposedValue;
         const label = decision.resolvedLabel ?? decision.ref ?? 'unlabelled field';
         const sensitive =
           isSensitiveFieldLabel(label) ||
           this.redactions.some((secret) => secret === proposedValue);
         try {
-          decision.value = await this.hooks.onFillRequested(label, decision.value, { sensitive });
+          decision.value = await this.hooks.onFillRequested(label, decision.value, {
+            sensitive,
+            requiresFreshValue: requiresFreshArtifactIdentity(goal, label, actions),
+          });
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           stepsTaken.push(`required human field input was unavailable: ${detail}`);
@@ -532,10 +1547,24 @@ export class Explorer {
             'note: the interactive view showed no change after repeating this action. Use the screenshot plus FULL page content to check for a non-interactive result, visible validation rule, modal, disabled GENERATING control, or other progress state before giving up.',
           ], this.captureVisionImage());
           if (recheck.action === 'done') {
+            if (
+              doneHasObservableProgress(
+                goal,
+                goalStartUrl,
+                goalStartStateSignature,
+                url,
+                fullSnapshot,
+                recheck.reason,
+              )
+            ) {
+              stepsTaken.push(
+                `note: full-snapshot recheck confirmed the goal was already satisfied (a non-interactive result was present) — ${recheck.reason ?? ''}`.trim(),
+              );
+              return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: fullSnapshot };
+            }
             stepsTaken.push(
-              `note: full-snapshot recheck confirmed the goal was already satisfied (a non-interactive result was present) — ${recheck.reason ?? ''}`.trim(),
+              'full-snapshot done rejected: the goal requires a visible transition, but the URL and semantic page state never changed',
             );
-            return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: fullSnapshot };
           }
           if (decision.action === 'wait' && recheck.action === 'wait') {
             decision = recheck;
@@ -586,7 +1615,7 @@ export class Explorer {
         // generation/processing is active (live beta.koyal.ai avatar case).
         const fullSnapshot = this.browser.snapshotFull();
         if (
-          hasInlineProcessing(fullSnapshot) &&
+          processingVisible(fullSnapshot) &&
           processingWaitedMs < config.deep.processingWaitMs &&
           !processingVisuallyComplete
         ) {
@@ -605,12 +1634,16 @@ export class Explorer {
               this.browser.clearSignals();
             }
             const now = this.browser.snapshotFull();
-            if (!now.trim() || !hasInlineProcessing(now)) break;
+            if (!now.trim() || !processingVisible(now)) break;
             if (polls === PROCESSING_VISION_POLL_THRESHOLD) {
               const assessment = await this.affirmProcessingState(goal, url, truncateSnapshot(now, 5000));
               if (assessment) {
                 stepsTaken.push(`vision processing affirmation: ${assessment.status} — ${assessment.summary}`);
-                if (assessment.status === 'complete' || assessment.status === 'blocked') {
+                if (assessment.status === 'complete' && hasPendingArtifactBadge(now)) {
+                  stepsTaken.push(
+                    'vision completion withheld: the persisted artifact still has a pending/processing badge or disabled regenerate control',
+                  );
+                } else if (assessment.status === 'complete' || assessment.status === 'blocked') {
                   visualRelease = assessment;
                   break;
                 }
@@ -618,6 +1651,12 @@ export class Explorer {
             }
           }
           processingWaitedMs += Date.now() - t0;
+          actions.push({
+            action: 'wait',
+            waitForProcessing: true,
+            waitedMs: Date.now() - t0,
+            reason: 'deterministic processing barrier learned after done was suppressed',
+          });
           if (visualRelease?.status === 'complete') {
             const finalSnapshot = this.browser.snapshotFull();
             stepsTaken.push('vision confirmed processing finished after the LLM had already satisfied the goal');
@@ -628,7 +1667,24 @@ export class Explorer {
           }
           continue;
         }
-        return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: snapshot };
+        const doneSnapshot = fullSnapshot;
+        if (
+          !processingVisuallyComplete &&
+          !doneHasObservableProgress(
+            goal,
+            goalStartUrl,
+            goalStartStateSignature,
+            url,
+            doneSnapshot,
+            decision.reason,
+          )
+        ) {
+          stepsTaken.push(
+            'done rejected: the goal requires a visible transition, but the URL and semantic page state never changed',
+          );
+          continue;
+        }
+        return { goal, success: true, actions, stepsTaken, finalUrl: url, finalSnapshot: doneSnapshot };
       }
 
       if (decision.action === 'fail') {
@@ -645,6 +1701,9 @@ export class Explorer {
 
       try {
         await this.executeAction(decision, stepsTaken);
+        if (decision.deniedByUser && decision.resolvedLabel) {
+          deniedClickLabels.add(decision.resolvedLabel.trim().toLowerCase());
+        }
         if (decision.action !== 'wait') {
           suppressProcessingUntilAction = false;
           processingVisuallyComplete = false;
@@ -667,6 +1726,55 @@ export class Explorer {
         // a dialog may have appeared between the check above and this wait
         // (rare timing edge) — resolve once more and move on regardless.
         resolveBlockingDialog(this.browser);
+      }
+
+      // A wait can be the final action on a screen: the preceding Save/Continue
+      // may complete asynchronously and navigate while we are polling. Treat
+      // that transition exactly like click-driven navigation or this one-screen
+      // goal will leak an edit/click into the next wizard milestone.
+      if (options?.returnOnUrlChange) {
+        let navigatedUrl = this.browser.getUrl();
+        if (
+          navigatedUrl === goalStartUrl &&
+          decision.action === 'click' &&
+          !decision.executionFailed &&
+          isForwardBoundaryLabel(decision.resolvedLabel)
+        ) {
+          // A framework may accept the click, disable Next, save remotely, and
+          // only commit the route several seconds later. Do not hand that
+          // transient state back to the LLM, which may otherwise "solve" it by
+          // clicking a wizard breadcrumb and leaving the workflow.
+          const settleStartedAt = Date.now();
+          while (Date.now() - settleStartedAt < 15_000) {
+            this.browser.wait(2000);
+            navigatedUrl = this.browser.getUrl();
+            if (
+              navigatedUrl &&
+              !navigatedUrl.startsWith('about:') &&
+              navigatedUrl !== goalStartUrl
+            ) {
+              break;
+            }
+          }
+          if (navigatedUrl === goalStartUrl) {
+            stepsTaken.push(
+              `forward control "${decision.resolvedLabel}" landed but produced no URL transition during a 15s settle window; re-check the current screen without using wizard navigation`,
+            );
+          }
+        }
+        if (
+          navigatedUrl &&
+          !navigatedUrl.startsWith('about:') &&
+          goalStartUrl &&
+          !goalStartUrl.startsWith('about:') &&
+          navigatedUrl !== goalStartUrl
+        ) {
+          const finalSnapshot = this.browser.snapshotInteractive();
+          stepsTaken.push(
+            `one-screen goal advanced by URL transition: ${goalStartUrl} → ${navigatedUrl}; returning control to the deep walker for state classification`,
+          );
+          return { goal, success: true, actions, stepsTaken, finalUrl: navigatedUrl, finalSnapshot };
+        }
       }
 
       // authWatch (login goals only): after a submit-shaped action, WAIT for the
@@ -828,6 +1936,8 @@ export class Explorer {
             decision.ref,
           );
           if (!allowed) {
+            decision.executionFailed = true;
+            decision.deniedByUser = true;
             stepsTaken.push(
               `action denied by user: click "${decision.resolvedLabel ?? decision.ref}" — choose another path`,
             );

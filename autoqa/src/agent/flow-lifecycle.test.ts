@@ -117,6 +117,39 @@ test('an LLM fallback during replay validation refreshes but does not promote', 
   assert.equal(candidate.qualification?.phase, 'replay-validation');
 });
 
+test('vision-only terminal uncertainty keeps successful recipes in replay validation', () => {
+  const candidate = flow();
+  candidate.qualification = { phase: 'replay-validation', learnedAt: 'earlier' };
+  const message = qualifyFlowAfterRun(candidate, {
+    mode: 'replay-validation',
+    executions: [
+      { milestoneId: 'm1', verdict: 'pass', execution: 'replay' },
+      { milestoneId: 'm2', verdict: 'pass', execution: 'replay' },
+    ],
+    terminalArtifactVerified: false,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.status, 'exploratory');
+  assert.equal(candidate.qualification?.phase, 'replay-validation');
+  assert.match(message, /terminal artifact evidence was not verified/);
+});
+
+test('needs-review terminal evidence does not erase mechanically successful replay state', () => {
+  const candidate = flow();
+  candidate.qualification = { phase: 'replay-validation', learnedAt: 'earlier' };
+  qualifyFlowAfterRun(candidate, {
+    mode: 'replay-validation',
+    executions: [
+      { milestoneId: 'm1', verdict: 'pass', execution: 'replay' },
+      { milestoneId: 'm2', verdict: 'needs-review', execution: 'replay' },
+    ],
+    terminalArtifactVerified: false,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.status, 'exploratory');
+  assert.equal(candidate.qualification?.phase, 'replay-validation');
+});
+
 test('video terminal proof accepts visible playable/downloadable artifact controls', () => {
   const candidate = flow();
   assert.equal(
@@ -124,6 +157,20 @@ test('video terminal proof accepts visible playable/downloadable artifact contro
     true,
   );
   assert.equal(hasVerifiedTerminalArtifact(candidate, [step('m1'), step('m2', 'Edit scenes\nCreate Video')]), false);
+});
+
+test('dedicated artifact-persistence vision qualifies a creation flow without magic DOM words', () => {
+  const candidate = flow();
+  // Live TestStep ids are flow-qualified, unlike the compact ids used by the
+  // older unit fixtures.
+  const final = step('create-video:m2', 'Celestial Telescope\n3m ago\nREGENERATE');
+  final.result.artifactPersistenceVerified = true;
+  final.result.visualAssessment = {
+    status: 'clear',
+    summary: 'The created telescope is visibly saved in the library.',
+    concerns: [],
+  };
+  assert.equal(hasVerifiedTerminalArtifact(candidate, [step('create-video:m1'), final]), true);
 });
 
 test('every milestone must have a recipe', () => {

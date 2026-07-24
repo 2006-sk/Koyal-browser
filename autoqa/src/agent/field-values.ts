@@ -48,6 +48,15 @@ export function fieldValueKey(pageId: string, label: string, proposed?: string):
 
 /** Suggestion text only. It is never submitted unless the human explicitly enters it. */
 export function suggestionForField(label: string, proposed?: string): string {
+  if (/\b(?:asset|object|prop|car|vehicle|furniture|product)\b/i.test(label)) {
+    return 'A red vintage roadster with chrome trim, cream leather seats, and soft studio lighting.';
+  }
+  if (/\b(?:outfit|clothing|wardrobe|suit|jacket|dress)\b/i.test(label)) {
+    return 'A tailored navy linen suit with a pale blue shirt and polished brown shoes.';
+  }
+  if (/\b(?:location|place|room|setting|scene)\b/i.test(label)) {
+    return 'A quiet coastal café with warm pendant lights, wooden counters, and large sunlit windows.';
+  }
   if (/description|appearance|bio|examples?:.*(?:man|woman|face|hair)/i.test(label)) {
     return 'A friendly young pilot with short brown hair, a navy flight jacket, and a calm, confident expression.';
   }
@@ -85,4 +94,99 @@ export async function resolveHumanFieldValue(
     return value;
   }
   throw new Error(`No value provided for required field "${label}"`);
+}
+
+/**
+ * Creation replays must not blindly reuse an identity that the preceding
+ * learning run just consumed. Ask for a fresh value while retaining the old
+ * value as a suggestion, and reject an unchanged answer. Descriptions/prompts
+ * continue using the normal ask-once path; this is intentionally limited to
+ * identity-shaped fields selected by the caller.
+ */
+export async function resolveFreshHumanFieldValue(
+  state: SiteState,
+  interact: Interact,
+  pageId: string,
+  label: string,
+  previousValue: string,
+  proposed?: string,
+): Promise<string> {
+  const previous = normalize(previousValue);
+  const suggestion = suggestionForField(label, proposed ?? previousValue);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const answer = await interact.ask(
+      `A new artifact is being created, so field "${label}" on "${pageId}" needs a fresh value.\n` +
+        `Previous value (do not reuse): ${previousValue}\n` +
+        `Suggestion (copy or edit it if it is different): ${suggestion}\n` +
+        'Enter a different realistic value. Your answer will be used by this deterministic replay',
+    );
+    const value = answer.trim();
+    if (!value || normalize(value) === previous) continue;
+    state.fieldValues[fieldValueKey(pageId, label, proposed)] = {
+      pageId,
+      label,
+      value,
+      updatedAt: new Date().toISOString(),
+    };
+    state.saveFieldValues();
+    return value;
+  }
+  throw new Error(`No fresh value provided for creation identity field "${label}"`);
+}
+
+/** Conservative identity-field detector used only for creation replay. */
+export function isLikelyUniqueCreationIdentityField(label: string): boolean {
+  if (/\b(description|appearance|bio|prompt|search|dialogue|transcript|theme|style|url|email)\b/i.test(label)) {
+    return false;
+  }
+  return (
+    /\b(name|title|slug|identifier)\b/i.test(label) ||
+    /only letters(?: and spaces)?(?: between words)? are allowed/i.test(label)
+  );
+}
+
+/**
+ * Forget one visibly rejected non-secret answer and ask for a genuinely
+ * different replacement. The replacement is stored under the original intent
+ * key so future exploration and recipe replay converge on the corrected value.
+ */
+export async function replaceRejectedHumanFieldValue(
+  state: SiteState,
+  interact: Interact,
+  pageId: string,
+  label: string,
+  rejectedValue: string,
+  proposed?: string,
+): Promise<string> {
+  const rejected = normalize(rejectedValue);
+  let removed = false;
+  for (const [key, saved] of Object.entries(state.fieldValues)) {
+    if (
+      normalize(saved.pageId) === normalize(pageId) &&
+      normalize(saved.label) === normalize(label) &&
+      normalize(saved.value) === rejected
+    ) {
+      delete state.fieldValues[key];
+      removed = true;
+    }
+  }
+  if (removed) state.saveFieldValues();
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const answer = await interact.ask(
+      `The site rejected "${rejectedValue}" for field "${label}" on "${pageId}".\n` +
+        'Enter a different realistic value. It will replace the rejected saved answer for future runs',
+    );
+    const value = answer.trim();
+    if (!value || normalize(value) === rejected) continue;
+    state.fieldValues[fieldValueKey(pageId, label, proposed)] = {
+      pageId,
+      label,
+      value,
+      updatedAt: new Date().toISOString(),
+    };
+    state.saveFieldValues();
+    return value;
+  }
+  throw new Error(`No different replacement provided for rejected field "${label}"`);
 }
