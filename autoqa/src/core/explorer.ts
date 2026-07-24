@@ -94,12 +94,13 @@ export function hasInlineProcessing(snapshot: string): boolean {
 }
 
 const MUTATION_CONTROL_RE =
-  /\b(new|add|create|generate|regenerate|finalize|save|submit|finish|complete|download|place order|reserve|book|upload|render|export)\b/i;
+  /\b(new|add|create|generate|regenerate|finalize|save|submit|finish|complete|download|place order|reserve|book|upload|render|export|try outfit)\b/i;
 
 function mutationControlKey(label: string): string | undefined {
-  return label
+  const key = label
     .toLowerCase()
-    .match(/\b(regenerate|generate|finalize|create|save|submit|finish|complete|render|export|upload|add|new)\b/)?.[1];
+    .match(/\b(regenerate|generate|finalize|create|save|submit|finish|complete|render|export|upload|add|new|try outfit)\b/)?.[1];
+  return key === 'try outfit' ? 'generate' : key;
 }
 
 export function isLikelyMutationLabel(label: string): boolean {

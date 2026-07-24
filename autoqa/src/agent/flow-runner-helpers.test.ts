@@ -3,17 +3,23 @@ import { test } from 'node:test';
 import {
   artifactIdentityForMilestone,
   boundaryConstrainedGoal,
+  exploratoryDirectedGoal,
   flowHasCompletionAction,
   isAlreadySatisfiedNavigationMilestone,
   isCredentialPreparationGoal,
   isSelectionShapedGoal,
   laterMilestoneStartingOnPage,
+  mergeExplorerResults,
   milestoneReturnsOnUrlChange,
   orderRunnableFlows,
   requiresPersistedCreation,
+  shouldContinueAfterVerification,
+  successfulMutationLabels,
 } from './flow-runner.js';
 import type { Flow } from './sitemap.js';
 import type { SiteState } from './site-state.js';
+import type { ExplorerResult } from '../core/explorer.js';
+import type { TestStep } from '../core/types.js';
 
 function flow(id: string, status: Flow['status'], phase?: 'learning' | 'replay-validation'): Flow {
   return {
@@ -77,6 +83,155 @@ test('single-screen click milestones cannot consume the next form', () => {
     boundaryConstrainedGoal('Fill the outfit description, then advance one screen.'),
     'Fill the outfit description, then advance one screen.',
   );
+});
+
+test('exploratory milestone receives the whole directed flow mission and remaining checkpoints', () => {
+  const candidate: Flow = {
+    id: 'audio-video',
+    title: 'Audio upload to final video',
+    description: 'Create a playable rendered video from an uploaded audio file.',
+    status: 'exploratory',
+    entry: { pageId: 'upload' },
+    milestones: [
+      { id: 'm1', goal: 'Upload an audio file', kind: 'upload' },
+      { id: 'm2', goal: 'Select Character Driven and click Next', kind: 'create' },
+      { id: 'm3', goal: 'Verify the playable final video', kind: 'verify' },
+    ],
+  };
+  const directed = exploratoryDirectedGoal(candidate, candidate.milestones[1], 1);
+  assert.match(directed, /milestone wording as the next checkpoint and a guide, not a brittle literal script/i);
+  assert.match(directed, /Complete any visible, safe prerequisite required to move forward/i);
+  assert.match(directed, /Verify the playable final video/i);
+  assert.match(directed, /Remaining directed checkpoints:\n3\. Verify the playable final video/i);
+  assert.match(directed, /remaining checkpoints are orientation only/i);
+  assert.match(directed, /do not execute a later checkpoint in this call/i);
+
+  const verifyDirected = exploratoryDirectedGoal(candidate, candidate.milestones[2], 2);
+  assert.match(verifyDirected, /This is a verification checkpoint/i);
+  assert.match(verifyDirected, /do not start, create, regenerate, save, finalize, upload, or submit/i);
+});
+
+test('post-verification recovery is requested for unfinished automation but not concrete product errors', () => {
+  const makeStep = (
+    verdict: TestStep['result']['verdict'],
+    snapshot = '',
+    consoleErrors: Array<{ text: string; type: string }> = [],
+  ): TestStep => ({
+    workflow: 'flow:m1',
+    action: 'advance',
+    expected: 'next state',
+    result: {
+      verdict,
+      severity: 'medium',
+      expected: 'next state',
+      actual: snapshot,
+      signals: {
+        url: 'https://example.test/wizard',
+        title: 'Wizard',
+        snapshot: { raw: snapshot, interactive: snapshot },
+        pageErrors: [],
+        consoleMessages: [],
+        consoleErrors,
+        networkRequests: [],
+      },
+      reasons: verdict === 'pass' ? [] : ['Expected snapshot to include one of: Next state'],
+      retried: false,
+    },
+    stepsToReproduce: [],
+  });
+  const unfinishedExplorer: ExplorerResult = {
+    goal: 'advance',
+    success: false,
+    actions: [],
+    stepsTaken: ['state cycle'],
+    finalUrl: 'https://example.test/wizard',
+    finalSnapshot: 'Next',
+    error: 'state cycle',
+  };
+
+  assert.equal(
+    shouldContinueAfterVerification(makeStep('needs-review'), unfinishedExplorer, {
+      loginShaped: false,
+      creationMustPersist: false,
+      completionActionSeen: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldContinueAfterVerification(
+      makeStep('fail', 'Failed to generate image', [
+        { text: 'Error: generation request failed', type: 'error' },
+      ]),
+      unfinishedExplorer,
+      {
+        loginShaped: false,
+        creationMustPersist: true,
+        completionActionSeen: true,
+      },
+    ),
+    false,
+  );
+
+  const disappearedForm = makeStep('needs-review');
+  disappearedForm.result.reasons = [
+    'Visual review found a concrete concern: the creation input is no longer visible on the healthy gallery page',
+  ];
+  disappearedForm.result.visualAssessment = {
+    status: 'concern',
+    summary: 'The creation textarea is absent after the successful transition to the gallery.',
+    concerns: ['No textarea is visible.'],
+  };
+  assert.equal(
+    shouldContinueAfterVerification(disappearedForm, null, {
+      loginShaped: false,
+      creationMustPersist: false,
+      completionActionSeen: true,
+    }),
+    false,
+  );
+});
+
+test('explorer continuation preserves successful actions and final result for recipe learning', () => {
+  const first: ExplorerResult = {
+    goal: 'create video',
+    success: false,
+    actions: [{ action: 'click', ref: 'e1', resolvedLabel: 'Next' }],
+    stepsTaken: ['clicked Next'],
+    finalUrl: 'https://example.test/theme',
+    finalSnapshot: 'Theme',
+    error: 'checkpoint not verified',
+  };
+  const second: ExplorerResult = {
+    goal: 'continue',
+    success: true,
+    actions: [{ action: 'click', ref: 'e2', resolvedLabel: 'Create Video' }],
+    stepsTaken: ['clicked Create Video', 'final artifact visible'],
+    finalUrl: 'https://example.test/final',
+    finalSnapshot: 'Download video',
+  };
+  const merged = mergeExplorerResults(first, second);
+  assert.equal(merged.success, true);
+  assert.deepEqual(merged.actions.map((action) => action.resolvedLabel), ['Next', 'Create Video']);
+  assert.equal(merged.finalUrl, second.finalUrl);
+  assert.equal(merged.error, undefined);
+  assert.match(merged.stepsTaken.join('\n'), /post-verification exploratory continuation/);
+});
+
+test('post-verification continuation inherits only successful mutation labels', () => {
+  const result: ExplorerResult = {
+    goal: 'create outfit',
+    success: false,
+    actions: [
+      { action: 'click', ref: 'e1', resolvedLabel: 'TRY OUTFIT' },
+      { action: 'click', ref: 'e2', resolvedLabel: 'Next' },
+      { action: 'click', ref: 'e3', resolvedLabel: 'Finalize Asset', executionFailed: true },
+      { action: 'fill', ref: 'e4', value: 'A navy suit' },
+    ],
+    stepsTaken: [],
+    finalUrl: 'https://example.test/outfits',
+    finalSnapshot: 'Processing',
+  };
+  assert.deepEqual(successfulMutationLabels(result), ['TRY OUTFIT']);
 });
 
 test('flow-runner self-healing uses the same URL boundary for click and fill milestones', () => {

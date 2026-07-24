@@ -3,7 +3,12 @@ import path from 'node:path';
 import { config } from '../config.js';
 import type { AgentBrowser } from '../core/agent-browser.js';
 import { randomEditMarker } from '../core/edits.js';
-import type { Explorer, ExplorerAction, ExplorerResult } from '../core/explorer.js';
+import {
+  isLikelyMutationLabel,
+  type Explorer,
+  type ExplorerAction,
+  type ExplorerResult,
+} from '../core/explorer.js';
 import { patchStepSummaryVerdict, writeJson } from '../core/evidence.js';
 import { scenarioEvidenceDir } from '../core/report.js';
 import { recordVerifiedStep, type StepContext } from '../core/scenario-runner.js';
@@ -691,8 +696,87 @@ export function boundaryConstrainedGoal(goal: string): string {
   );
 }
 
+/**
+ * Exploratory execution needs the local milestone as a checkpoint, not as an
+ * artificial scope wall. Give the LLM the whole directed mission and the
+ * remaining checkpoints so it can satisfy an omitted prerequisite (for
+ * example, choosing/creating a required character before Story Type can
+ * advance) without wandering into unrelated product areas.
+ */
+export function exploratoryDirectedGoal(
+  flow: Flow,
+  milestone: FlowMilestone,
+  milestoneIndex: number,
+  options?: { continuation?: boolean },
+): string {
+  const remaining = flow.milestones
+    .slice(milestoneIndex + 1)
+    .map((item, index) => `${milestoneIndex + index + 2}. ${item.goal}`)
+    .join('\n');
+  const finalMilestone = flow.milestones.at(-1);
+  const mission = [flow.title, flow.description].filter(Boolean).join(' — ');
+  const continuation = options?.continuation
+    ? 'The previous automation attempt ended, but verification did not prove this checkpoint complete. Continue from the exact current state; do not restart or repeat successful mutations.'
+    : 'Treat the milestone wording as the next checkpoint and a guide, not a brittle literal script. It is also the recipe boundary for this call.';
+  const boundary =
+    milestone.kind === 'verify'
+      ? 'This is a verification checkpoint. Inspect, poll, play, or reveal non-mutating evidence as needed, but do not start, create, regenerate, save, finalize, upload, or submit a new artifact.'
+      : options?.continuation
+        ? 'Stop at the first visibly verified current or later checkpoint. Cross a stale boundary only as far as needed to obtain that proof.'
+        : 'Use done as soon as the current checkpoint is visibly satisfied. The remaining checkpoints are orientation only: do not execute a later checkpoint in this call unless it is a necessary prerequisite for proving the current one.';
+
+  return [
+    milestone.goal,
+    '',
+    `Exploratory flow mission: ${mission}`,
+    continuation,
+    'Complete any visible, safe prerequisite required to move forward, even when the milestone proposal omitted it. Prefer enabled forward controls and remain inside this flow.',
+    'Do not stop merely because the proposed wording is stale, slightly incomplete, or the expected control was renamed. Use the current UI, page state, and visible validation to make forward progress.',
+    'Do not repeat an already-successful Create/Generate/Finalize/Save action. Do not bypass guards, perform destructive actions, or leave for an unrelated feature.',
+    boundary,
+    finalMilestone
+      ? `The flow is ultimately complete only when its final checkpoint is verified: ${finalMilestone.goal}`
+      : 'The flow is complete only when its directed purpose is visibly verified.',
+    remaining ? `Remaining directed checkpoints:\n${remaining}` : '',
+    'Use done once the current checkpoint is visibly satisfied, or once a later checkpoint/terminal state proves the stale checkpoint was already passed. If the checkpoint is still unfinished and safe progress toward it is available, take that progress instead of failing for wording mismatch.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 export function milestoneReturnsOnUrlChange(goal: string): boolean {
   return /\badvance (?:exactly )?one screen\b/i.test(goal);
+}
+
+export function mergeExplorerResults(
+  first: ExplorerResult | null,
+  continuation: ExplorerResult,
+): ExplorerResult {
+  if (!first) return continuation;
+  return {
+    goal: first.goal,
+    success: continuation.success,
+    actions: [...first.actions, ...continuation.actions],
+    stepsTaken: [...first.stepsTaken, 'post-verification exploratory continuation', ...continuation.stepsTaken],
+    finalUrl: continuation.finalUrl,
+    finalSnapshot: continuation.finalSnapshot,
+    error: continuation.success ? undefined : continuation.error,
+  };
+}
+
+export function successfulMutationLabels(result: ExplorerResult | null): string[] {
+  return (
+    result?.actions
+      .filter(
+        (action) =>
+          action.action === 'click' &&
+          !action.executionFailed &&
+          action.resolvedLabel &&
+          isLikelyMutationLabel(action.resolvedLabel),
+      )
+      .map((action) => action.resolvedLabel!)
+    ?? []
+  );
 }
 
 /**
@@ -882,8 +966,69 @@ function hasConcreteProductFailureEvidence(step: TestStep): boolean {
   }
   return step.result.reasons.some(
     (reason) =>
-      /page error|console error|unexpected.*5\d\d|blank (?:page|screen)|should not include|persist|visible error/i.test(reason) &&
+      /page error|console error|unexpected.*5\d\d|blank (?:page|screen)|should not include|visible error/i.test(reason) &&
       !reason.startsWith('Expected snapshot to include'),
+  );
+}
+
+function hasBlockingProductFailureEvidence(step: TestStep): boolean {
+  const signals = step.result.signals;
+  const visible = `${signals.snapshot.raw}\n${signals.snapshot.interactive}`;
+  if (signals.networkRequests.some((request) => Number(request.status ?? 0) >= 500)) return true;
+  if (
+    /\b(something went wrong|internal server error|failed to (?:generate|save|create|upload|render)|unexpected error|try again later|no image available)\b/i.test(
+      visible,
+    )
+  ) {
+    return true;
+  }
+  return step.result.reasons.some(
+    (reason) =>
+      /processing timeout|blank (?:page|screen)|visible (?:product )?error|failed to (?:generate|save|create|upload|render)/i.test(
+        reason,
+      ),
+  );
+}
+
+/**
+ * Execution success only proves that browser actions were dispatched. A later
+ * deterministic/visual verification can still show that the checkpoint never
+ * completed. In that case the normal replay → explore self-healing contract
+ * must continue from the current state instead of finalizing an unfinished
+ * milestone. Concrete product failures remain failures; exploration must not
+ * force its way through them.
+ */
+export function shouldContinueAfterVerification(
+  step: TestStep,
+  explored: ExplorerResult | null,
+  options: {
+    loginShaped: boolean;
+    creationMustPersist: boolean;
+    completionActionSeen: boolean;
+  },
+): boolean {
+  if (options.loginShaped || hasBlockingProductFailureEvidence(step)) return false;
+  if (explored && !explored.success) return true;
+  if (
+    options.creationMustPersist &&
+    (!options.completionActionSeen || step.result.artifactPersistenceVerified !== true)
+  ) {
+    return true;
+  }
+  if (step.result.verdict === 'pass') return false;
+
+  // Generic screenshot uncertainty is not enough to invalidate a mechanically
+  // successful replay (live Asset replay: the creation form had correctly
+  // disappeared, and vision called that absence a concern). Continue only
+  // when verification carries objective evidence that the checkpoint itself
+  // remains unfinished.
+  const unfinished = [
+    ...step.result.reasons,
+    step.result.visualAssessment?.summary ?? '',
+    ...(step.result.visualAssessment?.concerns ?? []),
+  ].join('\n');
+  return /Expected snapshot to include|not visually proven|did not prove|still (?:open|disabled|processing|unchanged)|required|already in use|not allowed|validation|original .*(?:remain|unchanged)|no (?:new |expected )?(?:artifact|item|character|asset|outfit|video) (?:appears|is visible|was found)/i.test(
+    unfinished,
   );
 }
 
@@ -962,7 +1107,10 @@ async function runMilestone(
   const selectionShaped = isSelectionShapedGoal(milestone.goal);
   const literalValueShaped = isLiteralValueShapedGoal(milestone.goal);
   const creationMustPersist = requiresPersistedCreation(flow, milestone);
-  let goal = boundaryConstrainedGoal(milestone.goal);
+  let goal =
+    runMode === 'learning'
+      ? exploratoryDirectedGoal(flow, milestone, milestoneIndex)
+      : boundaryConstrainedGoal(milestone.goal);
   let marker: string | undefined;
   if (milestone.kind === 'edit' && !authRelated && !searchShaped && !selectionShaped && !literalValueShaped) {
     // If a recipe already exists for this milestone (walked-flow recipes are
@@ -1159,7 +1307,10 @@ async function runMilestone(
   if (!replayOk && !loginShaped) {
     execution = 'explore';
     explored = await deps.explorer.achieveGoal(goal, {
-      returnOnUrlChange: milestoneReturnsOnUrlChange(goal),
+      // Preserve deliberately small one-screen recipes during the first
+      // attempt. If that boundary leaves the checkpoint unverified, the
+      // post-verification continuation below is allowed to cross it.
+      returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
     });
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
@@ -1184,7 +1335,7 @@ async function runMilestone(
       await ensureAuthenticated(authCtx);
       await navigateToEntry(deps, flow);
       explored = await deps.explorer.achieveGoal(goal, {
-        returnOnUrlChange: milestoneReturnsOnUrlChange(goal),
+        returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
       });
     }
   }
@@ -1252,7 +1403,7 @@ async function runMilestone(
   }
   const expectation = statements.augmentExpectation(base, pageId);
 
-  const step = await recordVerifiedStep(ctx, {
+  let step = await recordVerifiedStep(ctx, {
     workflow: `${flow.id}:${milestone.id}`,
     action: milestone.goal,
     expected: milestone.successHint ?? milestone.goal,
@@ -1269,6 +1420,57 @@ async function runMilestone(
       : undefined,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
+
+  const completionActionSeen = flowHasCompletionAction(flow, state, explored);
+  if (
+    shouldContinueAfterVerification(step, explored, {
+      loginShaped,
+      creationMustPersist,
+      completionActionSeen,
+    })
+  ) {
+    console.log(
+      `[flow] verification did not prove "${milestone.id}" complete — continuing with directed LLM exploration from the current state`,
+    );
+    const continuationGoal = exploratoryDirectedGoal(flow, milestone, milestoneIndex, {
+      continuation: true,
+    });
+    const priorSuccessfulMutations = successfulMutationLabels(explored);
+    const continuation = await deps.explorer.achieveGoal(continuationGoal, {
+      // This is specifically the recovery for a checkpoint that looked
+      // executed but was not actually complete. Let the explorer cross the
+      // stale boundary and reach a verifiable checkpoint/terminal state.
+      returnOnUrlChange: false,
+      // A new Explorer instance has an empty local action history. Carry the
+      // first attempt's successful mutations into its hard denylist so a
+      // verification retry cannot resubmit Generate/Try/Finalize/Save.
+      blockedClickLabels: priorSuccessfulMutations,
+    });
+    explored = mergeExplorerResults(explored, continuation);
+    execution = 'explore';
+
+    // Re-run the complete deterministic + screenshot verification after the
+    // continuation. Evidence uses the same milestone directory intentionally:
+    // the final state is authoritative, while explorerSteps retains both
+    // attempts so the learned recipe contains the whole successful sequence.
+    step = await recordVerifiedStep(ctx, {
+      workflow: `${flow.id}:${milestone.id}`,
+      action: milestone.goal,
+      expected: milestone.successHint ?? milestone.goal,
+      expectation,
+      waitOptions: {
+        maxWaitMs: milestone.maxWaitMs ?? MILESTONE_WAIT_MS[milestone.kind],
+        pollMs: milestone.maxWaitMs && milestone.maxWaitMs > 60000 ? 5000 : 2000,
+      },
+      explorerSteps: explored.stepsTaken,
+      visualVerification: true,
+      artifactPersistenceVerification: creationMustPersist,
+      artifactPersistenceIdentity: creationMustPersist
+        ? artifactIdentityForMilestone(milestone, marker)
+        : undefined,
+    });
+    step.explorerSteps = explored.stepsTaken;
+  }
 
   // recordVerifiedStep() already wrote step-summary.md to disk with THIS verdict
   // and printed it — but everything below (explorer-failure downgrade, KB
