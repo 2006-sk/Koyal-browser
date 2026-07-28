@@ -7,7 +7,8 @@ reference.
 AutoQA can authenticate, crawl an application, enter real creation/upload
 workflows, propose end-to-end flows, replay learned semantic recipes, recover
 with an LLM when the UI changes, verify outcomes, and produce evidence-rich
-reports.
+reports. It also supports sitemap-grounded `--manual` requests for focused
+natural-language tests after the initial mapping.
 
 ## Start here
 
@@ -28,7 +29,9 @@ npm run qa -- run --url https://your-app.example
 See the complete [AutoQA developer guide](autoqa/README.md) for:
 
 - all commands and flags;
+- focused natural-language tests with `--manual`;
 - cached, fresh, wipeout, and exhaustive runs;
+- authentication-aware sitemap refresh and duplicate-walk consolidation;
 - running all flows or selected flow IDs;
 - LLM provider and environment configuration;
 - headless and detached operation;

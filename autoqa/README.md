@@ -174,12 +174,59 @@ page/flow IDs, and then runs only that target. It may use a mapped direct URL
 for intentional entry into the requested feature, but the browser agent remains
 inside the requested scope.
 
+Manual requests preserve named entities, exact controls, ordering constraints,
+field values, and expected outcomes. Detailed values do not dilute a clear
+end-to-end flow match. For example, a request can select a mapped Audio-to-video
+flow while also specifying a sample name and exact trim timestamps:
+
+```bash
+npm run qa -- run \
+  --url https://your-app.example \
+  --manual "Create a final video through Audio, select Sample A, trim 15s to 25s, and verify the playable 10-second result"
+```
+
+Read-only wording such as `only verify` or `without making changes` prevents
+create/edit/upload/save actions. Typo-tolerant matching handles small spelling
+mistakes, but AutoQA refuses vague or unmapped targets instead of silently
+testing an unrelated page. Requests that name an owner or searchable entity
+must select and visibly confirm that entity before a mutation, then verify the
+result persisted under the same active context.
+
 The first successful manual run records a recipe. The next identical request
 replays that recipe for validation; after a complete successful replay it can
 become deterministic like any other flow. Normal login, upload, realistic
 field-value, guard, processing-wait, screenshot, and outcome-verification
 behavior still applies. `--manual` cannot be combined with `--wipeout`; map the
 site first.
+
+## How sitemap coverage stays current
+
+AutoQA treats authentication as a change in the visible application surface,
+not merely a login prerequisite. When a run changes from anonymous to
+authenticated, it revisits the landing page and persistent navigation pages
+once, merges newly visible links and controls into the existing sitemap, and
+records whether controls were observed while anonymous, authenticated, or
+both. Each authentication state is refreshed at most once per exploration, so
+this expands coverage without creating an endless recrawl.
+
+Deep walking enters creation and upload workflows after navigation crawling.
+Persistent wizard controls remain available as sitemap controls and edges, but
+the same progress-bar or sidebar control repeated across several wizard states
+does not launch a separate expensive walk from every page. Equivalent terminal
+walk proposals are consolidated while the underlying pages, edges, choices,
+and walk evidence remain preserved.
+
+For broad Koyal-family exhaustive runs, use an explicit cap of ten deep walks:
+
+```bash
+AUTOQA_EXHAUSTIVE=true npm run qa -- run \
+  --url https://your-app.example \
+  --wipeout \
+  --deep-flows 10 \
+  --budget 800 \
+  --max-pages 50 \
+  --max-steps 40
+```
 
 ### Force a fresh exploration while keeping saved knowledge
 
