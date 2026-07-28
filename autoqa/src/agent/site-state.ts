@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
-import type { SiteMap } from './sitemap.js';
+import { dedupeEquivalentWalkFlows, type SiteMap } from './sitemap.js';
 import type { StatementEntry } from './statements.js';
 import type { Recipe } from './recipes.js';
 import { sanitizeProposedFlowText, type SavedFieldValue } from './field-values.js';
@@ -198,6 +198,10 @@ export class SiteState {
       }
     }
     if (lifecycleMigrated) this.saveSitemap();
+    const consolidatedWalkFlows = dedupeEquivalentWalkFlows(this.sitemap);
+    if (consolidatedWalkFlows.removedFlowIds.length > 0) {
+      this.saveSitemap();
+    }
     this.allowlist = readJson<Allowlist>(this.allowlistPath, {});
     this.secrets = readJson<Secrets>(this.secretsPath, {});
     this.fieldValues = readJson<Record<string, SavedFieldValue>>(this.fieldValuesPath, {});

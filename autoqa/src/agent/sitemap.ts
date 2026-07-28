@@ -28,10 +28,15 @@ export type InteractiveCategory =
   | 'destructive'
   | 'unknown';
 
+export type AuthVisibility = 'anonymous' | 'authenticated' | 'both';
+export type ObservedAuthState = Exclude<AuthVisibility, 'both'>;
+
 export interface PageInteractive {
   label: string;
   role: string;
   category: InteractiveCategory;
+  /** Authentication context(s) in which this control was actually observed. */
+  authVisibility?: AuthVisibility;
   targetPageId?: string;
   probed?: boolean;
 }
@@ -52,6 +57,8 @@ export interface PageNode {
   kind?: PageKind;
   optionGroups?: OptionGroup[];
   interactives: PageInteractive[];
+  /** Authentication contexts in which this URL/state has been reclassified. */
+  observedAuthStates?: ObservedAuthState[];
   screenshot?: string;
   firstSeenAt: string;
   lastSeenAt: string;
@@ -205,6 +212,153 @@ export interface SiteMap {
    * learnedLogoutControl). Replaces the old per-flow Flow.entry.freshEntryHint.
    */
   learnedFreshStart?: string;
+}
+
+function canonicalWalkText(value: string | undefined): string {
+  return (value ?? '')
+    .toLowerCase()
+    .replace(/["'`]/g, '')
+    .replace(/\d+/g, ':n')
+    .replace(/[^a-z0-9:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function canonicalWalkRoute(trail: WalkTrail): string[] {
+  const route: string[] = [];
+  for (const step of trail.steps) {
+    if (route.at(-1) !== step.pageId) route.push(step.pageId);
+  }
+  return route;
+}
+
+function primaryWalkChoices(trail: WalkTrail, sitemap: SiteMap): string[] {
+  const choices = new Set<string>();
+  for (const step of trail.steps) {
+    const page = sitemap.pages[step.pageId];
+    const primaryGroups = page?.optionGroups?.filter((group) => group.primary) ?? [];
+    if (primaryGroups.length === 0) continue;
+    const actions = step.actions?.length ? step.actions : step.action ? [step.action] : [];
+    for (const action of actions) {
+      if (action.type !== 'click' && action.type !== 'select') continue;
+      const actionText = canonicalWalkText(`${action.label ?? ''} ${action.value ?? ''}`);
+      if (!actionText) continue;
+      for (const group of primaryGroups) {
+        const selected = group.memberLabels.find((member) => {
+          const memberText = canonicalWalkText(member);
+          return memberText && (actionText === memberText || actionText.includes(memberText));
+        });
+        if (selected) {
+          // A primary choice that IS the walk's entry action describes how the
+          // route was entered, not an additional branch inside that route. Drop
+          // it from the choice signature so a canonical "Start with Audio"
+          // entry and later persistent "Upload file / Go back to audio" aliases
+          // fingerprint together. Choices made after entry remain significant,
+          // preserving genuinely different modes that share the same page route.
+          const entryText = canonicalWalkText(trail.entry.actionLabel);
+          const selectedText = canonicalWalkText(selected);
+          if (
+            step.pageId === trail.entry.pageId &&
+            entryText &&
+            (entryText === selectedText || entryText.includes(selectedText))
+          ) {
+            continue;
+          }
+          choices.add(`${step.pageId}:${group.id}:${selectedText}`);
+        }
+      }
+    }
+  }
+  return [...choices].sort();
+}
+
+/**
+ * Stable behavioral identity for a completed deep walk. Page routes are the
+ * primary signal; primary workflow choices keep genuinely different modes that
+ * share URLs separate. Same-page mutations also include their entry action so
+ * "Add Asset" and "Regenerate" do not collapse into one flow.
+ */
+export function canonicalTerminalWalkFingerprint(
+  trail: WalkTrail,
+  sitemap: SiteMap,
+): string | null {
+  if (trail.outcome !== 'terminal') return null;
+  const route = canonicalWalkRoute(trail);
+  if (route.length === 0) return null;
+  const samePageAction =
+    route.length === 1 ? `|entry:${canonicalWalkText(trail.entry.actionLabel)}` : '';
+  const choices = primaryWalkChoices(trail, sitemap);
+  return `route:${route.join('>')}|choices:${choices.join(',')}${samePageAction}`;
+}
+
+function isAlternativeNavigationEntry(label: string): boolean {
+  return /^(?:go\s+back(?:\s+to)?|back(?:\s+to)?|return(?:\s+to)?|upload(?:\s+file)?|resume)\b/i.test(
+    label.trim(),
+  );
+}
+
+function canonicalWalkScore(trail: WalkTrail, route: string[]): number {
+  let score = 0;
+  if (trail.entry.pageId === route[0]) score += 4;
+  if (!isAlternativeNavigationEntry(trail.entry.actionLabel)) score += 3;
+  if (/\b(start with|new|add|create|generate|regenerate|render)\b/i.test(trail.entry.actionLabel)) {
+    score += 2;
+  }
+  return score;
+}
+
+/**
+ * Consolidate terminal flows reached through persistent/back-navigation aliases
+ * while retaining every walk and sitemap edge as evidence. This is deliberately
+ * conservative: only alias-labelled duplicate proposals are removed. Distinct
+ * primary workflow choices and same-page mutations remain separate.
+ */
+export function dedupeEquivalentWalkFlows(sitemap: SiteMap): {
+  removedFlowIds: string[];
+  canonicalByDuplicate: Record<string, string>;
+} {
+  const groups = new Map<string, WalkTrail[]>();
+  for (const trail of Object.values(sitemap.walks ?? {})) {
+    const fingerprint = canonicalTerminalWalkFingerprint(trail, sitemap);
+    if (!fingerprint || !trail.generatedFlowId) continue;
+    const grouped = groups.get(fingerprint) ?? [];
+    grouped.push(trail);
+    groups.set(fingerprint, grouped);
+  }
+
+  const removed = new Set<string>();
+  const canonicalByDuplicate: Record<string, string> = {};
+  for (const trails of groups.values()) {
+    if (trails.length < 2) continue;
+    const route = canonicalWalkRoute(trails[0]);
+    const ranked = [...trails].sort(
+      (a, b) => canonicalWalkScore(b, route) - canonicalWalkScore(a, route),
+    );
+    const canonical = ranked[0];
+    const canonicalFlowId = canonical.generatedFlowId;
+    if (!canonicalFlowId) continue;
+
+    for (const duplicate of ranked.slice(1)) {
+      const duplicateFlowId = duplicate.generatedFlowId;
+      if (!duplicateFlowId || duplicateFlowId === canonicalFlowId) continue;
+      if (!isAlternativeNavigationEntry(duplicate.entry.actionLabel)) continue;
+      const duplicateFlow = sitemap.flows.find((flow) => flow.id === duplicateFlowId);
+      // Never silently discard a flow that a human already selected or that has
+      // replay evidence. The exploration-time bug produces proposed flows, which
+      // are safe to consolidate before approval.
+      if (duplicateFlow && duplicateFlow.status !== 'proposed' && duplicateFlow.status !== 'skipped') {
+        continue;
+      }
+      removed.add(duplicateFlowId);
+      canonicalByDuplicate[duplicateFlowId] = canonicalFlowId;
+      duplicate.generatedFlowId = canonicalFlowId;
+    }
+  }
+
+  if (removed.size > 0) {
+    sitemap.flows = sitemap.flows.filter((flow) => !removed.has(flow.id));
+  }
+  return { removedFlowIds: [...removed], canonicalByDuplicate };
 }
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
@@ -437,9 +591,19 @@ export function mergePage(sitemap: SiteMap, incoming: PageNode): PageNode {
     }
   }
   for (const el of incoming.interactives) {
-    if (!existing.interactives.some((e) => e.label === el.label && e.role === el.role)) {
+    const prior = existing.interactives.find((e) => e.label === el.label && e.role === el.role);
+    if (!prior) {
       existing.interactives.push(el);
+    } else if (el.authVisibility && prior.authVisibility !== el.authVisibility) {
+      prior.authVisibility =
+        prior.authVisibility === undefined || prior.authVisibility === 'both'
+          ? prior.authVisibility ?? el.authVisibility
+          : 'both';
     }
+  }
+  for (const authState of incoming.observedAuthStates ?? []) {
+    existing.observedAuthStates = existing.observedAuthStates ?? [];
+    if (!existing.observedAuthStates.includes(authState)) existing.observedAuthStates.push(authState);
   }
   for (const group of incoming.optionGroups ?? []) {
     existing.optionGroups = existing.optionGroups ?? [];
@@ -457,7 +621,7 @@ export function summarizeSitemap(sitemap: SiteMap): string {
   for (const page of Object.values(sitemap.pages)) {
     const actions = page.interactives
       .slice(0, 12)
-      .map((i) => `${i.label}(${i.category})`)
+      .map((i) => `${i.label}(${i.category}${i.authVisibility ? `; ${i.authVisibility}` : ''})`)
       .join(', ');
     lines.push(`- ${page.id} [${page.urlPatterns.join(', ')}] — ${page.description}. Interactives: ${actions}`);
   }

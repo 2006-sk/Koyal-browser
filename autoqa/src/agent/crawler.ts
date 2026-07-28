@@ -10,11 +10,14 @@ import { LOGOUT_RE } from './guard.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
 import {
+  dedupeEquivalentWalkFlows,
   matchPage,
   mergePage,
   normalizePath,
   summarizeSitemap,
   type Flow,
+  type ObservedAuthState,
+  type PageInteractive,
   type PageNode,
   type SiteMap,
 } from './sitemap.js';
@@ -25,6 +28,15 @@ const DESTRUCTIVE_TEXT_RE = /\b(delete|remove|destroy|clear all|pay|checkout|buy
 interface QueueItem {
   url: string;
   depth: number;
+}
+
+function markAuthObservation(page: PageNode, authState: ObservedAuthState): PageNode {
+  page.observedAuthStates = page.observedAuthStates ?? [];
+  if (!page.observedAuthStates.includes(authState)) page.observedAuthStates.push(authState);
+  for (const interactive of page.interactives) {
+    interactive.authVisibility = authState;
+  }
+  return page;
 }
 
 interface Inventory {
@@ -126,6 +138,44 @@ export function resolveDeepWalkCap(
   return exhaustive ? Number.POSITIVE_INFINITY : configured;
 }
 
+function normalizedEntryLabel(label: string): string {
+  return label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Wizard progress bars and persistent navigation often repeat one control on
+ * several states (live Koyal example: "Upload file" on Story Type, Theme, and
+ * Edit Scenes). They remain valuable sitemap controls/edges, but they are not
+ * independent creation entry points and must not each launch the same expensive
+ * end-to-end deep walk.
+ */
+export function isPersistentWizardNavigationEntry(
+  sitemap: SiteMap,
+  page: PageNode,
+  interactive: PageInteractive,
+): boolean {
+  if ((page.kind ?? 'page') !== 'wizard-step') return false;
+  if (interactive.category === 'nav' && /\b(?:go\s+back|back\s+to|return\s+to)\b/i.test(interactive.label)) {
+    return true;
+  }
+
+  const label = normalizedEntryLabel(interactive.label);
+  if (!label) return false;
+  const occurrences = Object.values(sitemap.pages)
+    .filter((candidate) => (candidate.kind ?? 'page') === 'wizard-step')
+    .flatMap((candidate) =>
+      candidate.interactives
+        .filter((item) => normalizedEntryLabel(item.label) === label)
+        .map((item) => ({ pageId: candidate.id, category: item.category })),
+    );
+  const distinctPages = new Set(occurrences.map((item) => item.pageId));
+  return distinctPages.size >= 2 && occurrences.some((item) => item.category === 'nav');
+}
+
 export async function explore(
   browser: AgentBrowser,
   state: SiteState,
@@ -194,7 +244,15 @@ export async function explore(
     }
   }
 
+  // The same URL can expose a different navigation surface after login. Keep
+  // visits distinct by authentication context so a confirmed transition can
+  // safely revisit the shell once without creating a crawl loop.
   const visitedThisRun = new Set<string>();
+  const visitedPathsThisRun = new Set<string>();
+  const observedCrawlAuthStates = new Set<ObservedAuthState>();
+  const authRefreshesThisRun = new Set<ObservedAuthState>();
+  const currentAuthState = (): ObservedAuthState =>
+    state.authenticatedThisRun ? 'authenticated' : 'anonymous';
   const seenPageIds = new Set<string>(); // sitemap pages re-confirmed live this run (for removed-feature detection)
   let pagesVisited = 0;
   let soft404Skipped = 0;
@@ -206,13 +264,22 @@ export async function explore(
   const identifyCurrentPage = async (): Promise<PageNode> => {
     const url = browser.getUrl();
     const snapshot = browser.snapshotInteractive();
+    const authState = currentAuthState();
     // detached/blank target — never classify emptiness into the sitemap
     if (url.startsWith('about:') || !snapshot.trim()) {
       console.log(`[crawl] page read as blank (${url}) — skipping classification`);
       return transientErrorPage(url || 'about:blank');
     }
-    const known = matchPage(state.sitemap, url, snapshot);
+    let known = matchPage(state.sitemap, url, snapshot);
     if (known) {
+      // A URL matched in a new authentication context still needs one fresh
+      // classification. Otherwise controls that only appear after login (or
+      // only while logged out) are invisible forever because URL identity
+      // short-circuits classification.
+      if (!known.observedAuthStates?.includes(authState)) {
+        const refreshed = markAuthObservation(await classifyPage(llm, url, snapshot), authState);
+        known = mergePage(state.sitemap, refreshed);
+      }
       known.lastSeenAt = new Date().toISOString();
       // matchPage identifies plain pages by URL PATTERN only, never content (by
       // design — one shared chrome landmark must not decide identity). That means
@@ -249,7 +316,7 @@ export async function explore(
     if (signature) contentSignatures.set(signature, url);
 
     console.log(`[crawl] classifying new page at ${url}`);
-    const classified = await classifyPage(llm, url, snapshot);
+    const classified = markAuthObservation(await classifyPage(llm, url, snapshot), authState);
     // Per-item detail pages (a specific room/product — urlPattern like
     // "/reservation/:id") have no stable direct URL; remember the exact concrete
     // URL that actually rendered this page so callers needing one (the deep-walk
@@ -268,11 +335,16 @@ export async function explore(
     return merged;
   };
 
+  const drainQueue = async (): Promise<void> => {
   while (queue.length > 0 && pagesVisited < maxPages) {
     const item = queue.shift()!;
     const norm = normalizePath(item.url);
-    if (visitedThisRun.has(norm) || item.depth > maxDepth) continue;
-    visitedThisRun.add(norm);
+    const authState = currentAuthState();
+    const visitKey = `${authState}:${norm}`;
+    if (visitedThisRun.has(visitKey) || item.depth > maxDepth) continue;
+    visitedThisRun.add(visitKey);
+    visitedPathsThisRun.add(norm);
+    observedCrawlAuthStates.add(authState);
 
     console.log(`[crawl] (${pagesVisited + 1}/${maxPages}) visiting ${item.url}`);
     try {
@@ -302,7 +374,9 @@ export async function explore(
       // free edges from live-DOM hrefs
       for (const href of extractSameOriginLinks(browser, origin)) {
         const hrefNorm = normalizePath(href);
-        if (!visitedThisRun.has(hrefNorm)) queue.push({ url: href, depth: item.depth + 1 });
+        if (!visitedThisRun.has(`${currentAuthState()}:${hrefNorm}`)) {
+          queue.push({ url: href, depth: item.depth + 1 });
+        }
       }
 
       // click probes for SPA nav (buttons/links without hrefs): nav-tagged first,
@@ -480,6 +554,8 @@ export async function explore(
       }
     }
   }
+  };
+  await drainQueue();
 
   console.log(
     `[crawl] done: ${Object.keys(state.sitemap.pages).length} pages, ${state.sitemap.edges.length} edges`,
@@ -498,7 +574,7 @@ export async function explore(
     if (seenPageIds.has(page.id)) continue; // re-confirmed live
     const directPattern = page.urlPatterns.find((u) => !u.includes(':id'));
     if (!directPattern) continue; // couldn't have re-visited it deterministically
-    if (visitedThisRun.has(normalizePath(`${origin}${directPattern}`))) {
+    if (visitedPathsThisRun.has(normalizePath(`${origin}${directPattern}`))) {
       removedOrChanged.push(`${page.id} (${directPattern})`);
     }
   }
@@ -515,6 +591,25 @@ export async function explore(
       console.log(`  ↳ flow "${f.id}" references a removed/changed page — needs re-verification`);
     }
   }
+
+  const refreshNavigationForAuthState = async (authState: ObservedAuthState): Promise<void> => {
+    if (authRefreshesThisRun.has(authState) || observedCrawlAuthStates.has(authState)) return;
+    authRefreshesThisRun.add(authState);
+    console.log(
+      `[crawl] authentication state changed to ${authState} — revisiting landing and persistent navigation pages once`,
+    );
+
+    queue.push({ url: origin, depth: 0 });
+    for (const page of Object.values(state.sitemap.pages)) {
+      if ((page.kind ?? 'page') !== 'page') continue;
+      if (!page.interactives.some((interactive) => interactive.category === 'nav')) continue;
+      const pattern = page.urlPatterns.find((candidate) => !candidate.includes(':id'));
+      const url = page.exampleUrl ?? (pattern ? `${origin}${pattern}` : undefined);
+      if (url) queue.push({ url, depth: 1 });
+    }
+    await drainQueue();
+    state.saveSitemap();
+  };
 
   // ---- Deep-walk phase: actually enter create/upload flows ----
   const walkFlowIds: string[] = [];
@@ -587,6 +682,7 @@ export async function explore(
             el.label,
           ) && !/\bdelete|remove|cancel\b/i.test(el.label);
         if (el.category !== 'create' && el.category !== 'upload' && !checkoutish && !explicitCreationLabel) continue;
+        if (isPersistentWizardNavigationEntry(state.sitemap, page, el)) continue;
         // wizard states resumed by direct URL need the fresh entry chain that
         // originally discovered them (e.g. projects → "Create …" → fork)
         let via: DeepWalkEntry['via'];
@@ -659,7 +755,27 @@ export async function explore(
       } catch (error) {
         console.warn(`[crawl] deep walk failed: ${error instanceof Error ? error.message : error}`);
       }
+      // Authentication can succeed before a later walk action fails. Refresh
+      // outside the walk's success-only path so that transition still expands
+      // coverage instead of being lost with the failed entry attempt.
+      if (state.authenticatedThisRun) {
+        try {
+          await refreshNavigationForAuthState('authenticated');
+        } catch (error) {
+          console.warn(
+            `[crawl] authenticated navigation refresh failed: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      }
     }
+  }
+
+  const consolidated = dedupeEquivalentWalkFlows(state.sitemap);
+  if (consolidated.removedFlowIds.length > 0) {
+    console.log(
+      `[crawl] consolidated ${consolidated.removedFlowIds.length} equivalent walked flow(s): ${consolidated.removedFlowIds.join(', ')}`,
+    );
+    state.saveSitemap();
   }
 
   // ---- New-path detection ----

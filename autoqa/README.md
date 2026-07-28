@@ -160,6 +160,27 @@ The flow keeps its saved lifecycle state:
 - `exploratory`: use any available recipe, then let the LLM recover and learn
   when necessary.
 
+### Run a focused test from a natural-language request
+
+```bash
+npm run qa -- run \
+  --url https://your-app.example \
+  --manual "Test the Locations area: create or edit one location and verify it persists"
+```
+
+`--manual` requires an existing sitemap. AutoQA asks the LLM to select the
+narrowest mapped page or an exactly matching existing flow, rejects invented
+page/flow IDs, and then runs only that target. It may use a mapped direct URL
+for intentional entry into the requested feature, but the browser agent remains
+inside the requested scope.
+
+The first successful manual run records a recipe. The next identical request
+replays that recipe for validation; after a complete successful replay it can
+become deterministic like any other flow. Normal login, upload, realistic
+field-value, guard, processing-wait, screenshot, and outcome-verification
+behavior still applies. `--manual` cannot be combined with `--wipeout`; map the
+site first.
+
 ### Force a fresh exploration while keeping saved knowledge
 
 ```bash
@@ -285,6 +306,7 @@ inspect or delete stale walk/recipe data, and manage remembered guard choices.
 |---|---|---|
 | `--url <URL>` | all | Target application. Overrides `AUTOQA_URL`. |
 | `--flow <id[,id]>` | `run`, `test` | Run only the listed flow IDs. |
+| `--manual "<request>"` | `run` | Use the saved sitemap to plan and run one focused, recipe-learning test. |
 | `--fresh` | `run` | Force exploration while preserving saved state. |
 | `--wipeout` | `run` | Delete all saved AutoQA state for the hostname, then explore and test from zero. |
 | `--reset-values` | `run`, `explore`, `test` | Forget saved non-secret field answers but keep sitemap, recipes, and authentication. |

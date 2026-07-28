@@ -2,6 +2,7 @@
 import { applyCliOverrides, requireBaseUrl } from './config.js';
 import { SiteState } from './agent/site-state.js';
 import { exploreCommand } from './commands/explore.js';
+import { manualCommand } from './commands/manual.js';
 import { reviewCommand } from './commands/review.js';
 import { runCommand } from './commands/run.js';
 import { teardownActiveSessions } from './commands/shared.js';
@@ -21,6 +22,7 @@ Commands:
 Flags:
   --url <URL>        target site (or AUTOQA_URL in .env)
   --flow id[,id]     only these flow ids (test/run)
+  --manual "<goal>"  use the saved sitemap to run one focused, recipe-learning test
   --fresh            re-explore even if a sitemap exists (run)
   --wipeout          delete all saved state for this site, then explore + test from zero (run)
   --reset-values     forget saved names/field values, then ask again during explore or replay
@@ -88,6 +90,9 @@ async function main(): Promise<number> {
 
   switch (command) {
     case 'run':
+      if (flagValue(argv, '--manual') && argv.includes('--wipeout')) {
+        throw new Error('--manual uses an existing sitemap and cannot be combined with --wipeout');
+      }
       if (argv.includes('--wipeout')) {
         const state = new SiteState(requireBaseUrl());
         const removed = state.reset({ all: true });
@@ -98,6 +103,10 @@ async function main(): Promise<number> {
         );
       }
       resetValuesBeforeCommand();
+      if (flagValue(argv, '--manual')) {
+        const { failed } = await manualCommand(flagValue(argv, '--manual')!);
+        return failed > 0 ? 1 : 0;
+      }
       return runCommand({ fresh: argv.includes('--fresh'), only });
     case 'explore':
       resetValuesBeforeCommand();
