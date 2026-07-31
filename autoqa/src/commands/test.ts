@@ -62,8 +62,9 @@ export async function testCommand(
       : 'none (unauthenticated)';
 
     // Post genuine product bugs (failed milestones with real site-emitted error
-    // evidence) to the Slack bugs channel — Bug/Inputs/Reproduction/Error-log
-    // only, nothing else, and nothing at all when there are zero product bugs.
+    // evidence) to the Slack bugs channel — platform/location/front-end error,
+    // matching backend log, and a three-line explanation. Post nothing when
+    // there are zero product bugs.
     // Never lets a notify failure affect teardown/exit.
     try {
       await notifyKoyalBugsToSlack({

@@ -24,11 +24,19 @@ import { VerificationLayer } from '../core/verification.js';
 import { ensureAuthenticated, type AuthContext } from './auth.js';
 import { extractCandidates, type Statements } from './statements.js';
 import { runProbesForMilestone, type ProbeContext } from './probes.js';
-import { recordFromExplorer, type RecipePlayer } from './recipes.js';
+import { recordFromExplorer, type RecipePlayer, type RecipeStep } from './recipes.js';
 import { Nav, parseContextualControlLabel } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
-import { matchPage, type Flow, type FlowMilestone } from './sitemap.js';
+import {
+  matchPage,
+  normalizePath,
+  type Flow,
+  type FlowMilestone,
+  type ManualAcceptanceTask,
+  type PageNode,
+  type SiteMap,
+} from './sitemap.js';
 import { looksLikeAuthGate, looksLikeSoft404 } from './page-classifier.js';
 import type { LlmClient } from '../core/llm/client.js';
 import {
@@ -110,11 +118,58 @@ function currentPageId(deps: FlowRunnerDeps): string {
   }
 }
 
+/**
+ * A task-graph journey can legitimately outlive the exact state that the
+ * sitemap observed on a route. The common case is a terminal route mapped
+ * while it said "Generating", then rendered in place until those processing
+ * landmarks disappeared. `matchPage` correctly refuses URL-only matching for
+ * stateful pages, but position recovery still needs to know that the browser is
+ * on the journey's one unambiguous route instead of restarting the whole flow.
+ *
+ * Keep this fallback manual-v2-only and require the normalized URL to identify
+ * exactly one primary-journey page. Shared wizard URLs therefore remain
+ * landmark-driven; only a unique route such as `/finalvideo` can qualify.
+ */
+export function manualJourneyPageIdForUrl(
+  flow: Flow,
+  sitemap: SiteMap,
+  url: string,
+): string | undefined {
+  const primaryIds = flow.manualExecution?.primaryJourneyPageIds;
+  if (!primaryIds?.length) return undefined;
+  const normalized = normalizePath(url);
+  const matches = [...new Set(primaryIds)].filter((id) => {
+    const page = sitemap.pages[id];
+    if (!page) return false;
+    const patterns = new Set([
+      ...page.urlPatterns,
+      ...(page.exampleUrl ? [normalizePath(page.exampleUrl)] : []),
+    ]);
+    return patterns.has(normalized);
+  });
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function currentFlowPageId(deps: FlowRunnerDeps, flow: Flow): string {
+  const matched = currentPageId(deps);
+  if (matched !== 'unknown' || !flow.manualExecution) return matched;
+  try {
+    return manualJourneyPageIdForUrl(flow, deps.state.sitemap, deps.browser.getUrl()) ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** Wait for an expected guard phase to appear before declaring the flow off-track. */
-function waitForGuardPhase(deps: FlowRunnerDeps, phases: string[], maxMs: number): string {
+function waitForGuardPhase(
+  deps: FlowRunnerDeps,
+  phases: string[],
+  maxMs: number,
+  flow?: Flow,
+): string {
   const deadline = Date.now() + maxMs;
   for (;;) {
-    const id = currentPageId(deps);
+    const id = flow ? currentFlowPageId(deps, flow) : currentPageId(deps);
     if (phases.includes(id)) return id;
     if (Date.now() >= deadline) return id;
     deps.browser.wait(3000);
@@ -137,13 +192,68 @@ function baseExpectationFor(milestone: FlowMilestone): VerificationExpectation {
   return expectation;
 }
 
+export function manualEntryNeedsContextRecovery(snapshot: string): boolean {
+  return [
+    /\b(?:project|workspace|record|document|item|case|order|account)\s*id\s+is\s+not\s+allowed\s+to\s+be\s+empty\b/i,
+    /\b(?:project|workspace|record|document|item|case|order|account)\s*id\s+(?:is\s+)?(?:required|missing|undefined|null)\b/i,
+    /\bno\s+(?:project|workspace|record|document|item|case|order|account)\s+(?:is\s+)?selected\b/i,
+    /\bselect\s+(?:a|an)\s+(?:project|workspace|record|document|item|case|order|account)\s+first\b/i,
+  ].some((pattern) => pattern.test(snapshot));
+}
+
+async function recoverManualEntryContext(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  entryPageTitle: string,
+  expectedControls: string[] = [],
+): Promise<void> {
+  console.log(
+    `[flow] manual target "${flow.entry.pageId}" is missing its active item context — re-entering through visible UI`,
+  );
+  await deps.explorer.achieveGoal(
+    `The mapped "${entryPageTitle}" page is visible, but the app says its active item context is missing. ` +
+      'Recover through the visible application UI only: navigate to the normal list/dashboard for existing items, ' +
+      'select an existing item that can reach this feature, and use its visible workflow controls to return to the ' +
+      `"${entryPageTitle}" page with real content loaded. Do not create, delete, regenerate, or mutate anything. ` +
+      'Do not use a direct URL. Use "done" only after the target feature page visibly contains its real item content ' +
+      'and no longer shows a missing-id, missing-context, or no-selection error. ' +
+      (expectedControls.length
+        ? `The recovered target must visibly expose its mapped feature controls, including at least one of: ${expectedControls.map((label) => `"${label}"`).join(', ')}. ` +
+          'A generic summary/player without those controls is the wrong item or surface; return to the list and try a different existing item, with at most three item candidates.'
+        : ''),
+    { maxSteps: 20 },
+  );
+}
+
+export function manualEntryExpectedControlLabels(page: PageNode | undefined): string[] {
+  if (!page) return [];
+  return [...new Set(
+    page.interactives
+      .filter((control) => ['edit', 'create', 'submit', 'upload'].includes(control.category))
+      .map((control) => control.label.trim())
+      .filter(Boolean),
+  )].slice(0, 6);
+}
+
 async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> {
   const { browser, state, player } = deps;
   const gotoRecipe = `goto:${flow.entry.pageId}`;
 
   if (player.has(gotoRecipe)) {
     const replay = await player.tryReplay(gotoRecipe, { pageId: flow.entry.pageId });
-    if (replay.ok) return;
+    if (replay.ok) {
+      const replaySnapshot = browser.snapshotInteractive();
+      if (flow.id.startsWith('manual-') && manualEntryNeedsContextRecovery(replaySnapshot)) {
+        const entryPage = state.sitemap.pages[flow.entry.pageId];
+        await recoverManualEntryContext(
+          deps,
+          flow,
+          entryPage?.title ?? flow.entry.pageId,
+          manualEntryExpectedControlLabels(entryPage),
+        );
+      }
+      return;
+    }
   }
   if (flow.entry.url) {
     browser.open(`${state.sitemap.origin}${flow.entry.url.replace(state.sitemap.origin, '')}`);
@@ -161,12 +271,37 @@ async function navigateToEntry(deps: FlowRunnerDeps, flow: Flow): Promise<void> 
     // still returned the real page's id from the normalized pattern alone; the
     // whole flow then ran every milestone against the 404 page instead of ever
     // reaching the exampleUrl fallback below).
-    if (currentPageId(deps) === flow.entry.pageId && !looksLikeSoft404(browser.snapshotInteractive())) return;
+    const entrySnapshot = browser.snapshotInteractive();
+    if (currentPageId(deps) === flow.entry.pageId && !looksLikeSoft404(entrySnapshot)) {
+      if (flow.id.startsWith('manual-') && manualEntryNeedsContextRecovery(entrySnapshot)) {
+        const entryPage = state.sitemap.pages[flow.entry.pageId];
+        await recoverManualEntryContext(
+          deps,
+          flow,
+          entryPage?.title ?? flow.entry.pageId,
+          manualEntryExpectedControlLabels(entryPage),
+        );
+      }
+      return;
+    }
     console.log(
       `[flow] pinned entry url for "${flow.entry.pageId}" looks stale — falling back to LLM navigation`,
     );
   }
   const entryPage = state.sitemap.pages[flow.entry.pageId];
+  if (
+    flow.manualExecution?.sourceFlowId.startsWith('focused:') &&
+    entryPage &&
+    !canDirectOpenManualTarget(flow, entryPage.id, new Set<string>(), entryPage.kind)
+  ) {
+    await recoverManualEntryContext(
+      deps,
+      flow,
+      entryPage.title,
+      manualEntryExpectedControlLabels(entryPage),
+    );
+    return;
+  }
   // Prefer the exact concrete URL that actually rendered this page over
   // reconstructing from the normalized urlPattern — normalizePath deliberately
   // strips trailing slashes (and masks ids) for PAGE-IDENTITY purposes, but some
@@ -478,7 +613,7 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
   // redirect past its real first screen; resetting there can make an otherwise
   // valid early recipe impossible to replay. Start at the latest prior
   // milestone whose guard explicitly matches the live page.
-  const livePageId = currentPageId(deps);
+  const livePageId = currentFlowPageId(deps, flow);
   let startIndex = -1;
   for (let j = milestoneIndex - 1; j >= 0; j--) {
     if (flow.milestones[j].guardPhases?.includes(livePageId)) {
@@ -592,13 +727,14 @@ async function tryRecoverAfterBreak(
   deps: FlowRunnerDeps,
   flow: Flow,
   nextIndex: number,
+  visitedPageIds: Set<string> = new Set(),
 ): Promise<boolean> {
   const next = flow.milestones[nextIndex];
-  const guards = next?.guardPhases;
+  const guards = recoveryGuardPageIds(next);
   // No guardPhases on the next milestone → we have no reliable way to confirm the
   // post-failure position is the one it expects, so we can't safely continue.
   if (!guards?.length) return false;
-  if (guards.includes(currentPageId(deps))) return true;
+  if (guards.includes(currentFlowPageId(deps, flow))) return true;
   // Rebuild position by replaying prior milestones' recipes — only meaningful when
   // at least one exists (else replayUpTo strands us at the flow entry, per
   // hasAnyPriorRecipe's doc comment).
@@ -608,9 +744,61 @@ async function tryRecoverAfterBreak(
     } catch {
       return false;
     }
-    if (guards.includes(currentPageId(deps))) return true;
+    if (guards.includes(currentFlowPageId(deps, flow))) return true;
+  }
+  // A manual task graph may overshoot a requested task while recovering from a
+  // prior verifier. When the current page is a LATER state in the exact same
+  // mapped primary journey, that later position proves the earlier target was
+  // traversed for this active project. Returning to it is intentional
+  // resume/recovery, not a stale direct-entry shortcut. This keeps one failed
+  // checkpoint from silently skipping the remaining acceptance work.
+  if (flow.manualExecution && next?.manualContractTargetPageId) {
+    const target = deps.state.sitemap.pages[next.manualContractTargetPageId];
+    const targetUrl = target
+      ? target.exampleUrl ??
+        (target.urlPatterns[0]
+          ? new URL(target.urlPatterns[0], deps.state.sitemap.origin).toString()
+          : undefined)
+      : undefined;
+    const here = currentFlowPageId(deps, flow);
+    if (
+      target &&
+      targetUrl &&
+      canDirectOpenManualTarget(
+        flow,
+        target.id,
+        visitedPageIds,
+        target.kind,
+        here,
+      )
+    ) {
+      deps.browser.open(targetUrl);
+      deps.browser.wait(1500);
+      const recovered = currentFlowPageId(deps, flow);
+      if (recovered !== 'unknown') visitedPageIds.add(recovered);
+      if (guards.includes(recovered)) return true;
+    }
   }
   return false;
+}
+
+/**
+ * Manual task-graph milestones are grounded by their mapped target page even
+ * when the original proposal did not also copy that page into guardPhases.
+ * This lets later independent audits continue after a real but non-blocking
+ * product error when the browser already reached their owning surface.
+ */
+export function recoveryGuardPageIds(
+  milestone: FlowMilestone | undefined,
+): string[] | undefined {
+  if (!milestone) return undefined;
+  const ids = [
+    ...(milestone.guardPhases ?? []),
+    ...(milestone.manualContractTargetPageId
+      ? [milestone.manualContractTargetPageId]
+      : []),
+  ];
+  return ids.length > 0 ? [...new Set(ids)] : undefined;
 }
 
 /**
@@ -711,10 +899,20 @@ export function exploratoryDirectedGoal(
 ): string {
   const remaining = flow.milestones
     .slice(milestoneIndex + 1)
-    .map((item, index) => `${milestoneIndex + index + 2}. ${item.goal}`)
+    .map((item, index) =>
+      flow.manualContract
+        ? `${milestoneIndex + index + 2}. ${
+          item.manualContractAudit
+            ? `audit acceptance item ${item.manualContractItem}`
+            : item.id
+        }`
+        : `${milestoneIndex + index + 2}. ${item.goal}`,
+    )
     .join('\n');
   const finalMilestone = flow.milestones.at(-1);
-  const mission = [flow.title, flow.description].filter(Boolean).join(' — ');
+  const mission = flow.manualContract
+    ? `${flow.title} — complete the active manual acceptance contract`
+    : [flow.title, flow.description].filter(Boolean).join(' — ');
   const continuation = options?.continuation
     ? 'The previous automation attempt ended, but verification did not prove this checkpoint complete. Continue from the exact current state; do not restart or repeat successful mutations.'
     : 'Treat the milestone wording as the next checkpoint and a guide, not a brittle literal script. It is also the recipe boundary for this call.';
@@ -735,7 +933,9 @@ export function exploratoryDirectedGoal(
     'Do not repeat an already-successful Create/Generate/Finalize/Save action. Do not bypass guards, perform destructive actions, or leave for an unrelated feature.',
     boundary,
     finalMilestone
-      ? `The flow is ultimately complete only when its final checkpoint is verified: ${finalMilestone.goal}`
+      ? `The flow is ultimately complete only when its final checkpoint is verified: ${
+        flow.manualContract ? finalMilestone.id : finalMilestone.goal
+      }`
       : 'The flow is complete only when its directed purpose is visibly verified.',
     remaining ? `Remaining directed checkpoints:\n${remaining}` : '',
     'Use done once the current checkpoint is visibly satisfied, or once a later checkpoint/terminal state proves the stale checkpoint was already passed. If the checkpoint is still unfinished and safe progress toward it is available, take that progress instead of failing for wording mismatch.',
@@ -848,6 +1048,21 @@ export function isAlreadySatisfiedNavigationMilestone(
   milestone: FlowMilestone,
   pageId: string,
 ): boolean {
+  // Manual-v2 converts a journey mutation already performed by an acceptance
+  // task into a destination-only verify milestone. If that task has already
+  // landed on the recorded destination, running its inherited "advance"
+  // wording through the LLM overshoots the page and strands the next local
+  // task. Record zero actions here; the normal verification layer below still
+  // proves the destination before the milestone can pass.
+  if (
+    milestone.kind === 'verify' &&
+    milestone.manualJourneyDestinationPageId === pageId &&
+    /active acceptance task already owns and performed this checkpoint/i.test(
+      milestone.goal,
+    )
+  ) {
+    return true;
+  }
   if (milestone.kind !== 'navigate') return false;
   if (/\b(click|choose|select|upload|fill|enter|edit|change|generate|create|save|submit|wait|verify)\b/i.test(milestone.goal)) {
     return false;
@@ -875,6 +1090,104 @@ export function laterMilestoneStartingOnPage(
     (milestone, index) =>
       index > currentIndex && milestone.guardPhases?.includes(pageId),
   );
+}
+
+/**
+ * A resumed-page shortcut may skip ordinary journey checkpoints, but never a
+ * pending manual task. Once all intervening tasks are complete, the shortcut
+ * remains useful (notably when Create Video lands directly on Final Video).
+ */
+export function manualSafeAheadIndex(
+  flow: Flow,
+  currentIndex: number,
+  candidateAheadIndex: number,
+): number {
+  if (!flow.manualExecution) return candidateAheadIndex;
+  return flow.milestones
+    .slice(currentIndex, candidateAheadIndex)
+    .some((candidate) => Boolean(candidate.manualTaskId))
+    ? currentIndex
+    : candidateAheadIndex;
+}
+
+export function isManualFinalProofMilestone(milestone: FlowMilestone): boolean {
+  return (
+    milestone.id === 'manual-contract-final-proof' ||
+    milestone.id === 'manual-task-final-proof'
+  );
+}
+
+export function isNonIdempotentManualMilestone(
+  flow: Flow,
+  milestone: FlowMilestone,
+): boolean {
+  if (!flow.manualContract) return false;
+  const taskRequirement =
+    milestone.manualTaskId && flow.manualExecution
+      ? flow.manualExecution.tasks.find((task) => task.id === milestone.manualTaskId)
+          ?.requirement
+      : milestone.manualContractItem
+        ? flow.manualContract.checklist[milestone.manualContractItem - 1]
+        : undefined;
+  const text = `${taskRequirement ?? ''} ${milestone.goal}`;
+  return /\b(?:delete|remove|destroy|pay|purchase|checkout|invite|revoke|deactivate)\b/i.test(
+    text,
+  );
+}
+
+function explorerInfrastructureBlocked(explored: ExplorerResult | null): boolean {
+  return Boolean(
+    explored &&
+      !explored.success &&
+      /^Infrastructure blocked:/i.test(explored.error ?? ''),
+  );
+}
+
+export function canDirectOpenManualTarget(
+  flow: Flow,
+  targetPageId: string,
+  visitedPageIds: ReadonlySet<string>,
+  targetKind?: string,
+  currentPageId?: string,
+): boolean {
+  // A focused invocation starts without the browser-local owner/project context
+  // that a stateful wizard/processing/terminal route needs. Once its explorer
+  // leaves that route to establish context through Dashboard/List → item, never
+  // snap it back with a direct URL. Full journey runs keep their same-run context
+  // and retain the existing visited-state recovery behavior.
+  if (
+    flow.manualExecution?.sourceFlowId.startsWith('focused:') &&
+    targetKind &&
+    targetKind !== 'page'
+  ) {
+    return false;
+  }
+  const primaryIds = flow.manualExecution?.primaryJourneyPageIds ?? [];
+  const targetIndex = primaryIds.indexOf(targetPageId);
+  const currentIndex = currentPageId ? primaryIds.indexOf(currentPageId) : -1;
+  const laterJourneyStateProvesTraversal =
+    targetIndex >= 0 && currentIndex >= targetIndex;
+  return (
+    !flow.manualExecution ||
+    !primaryIds.includes(targetPageId) ||
+    visitedPageIds.has(targetPageId) ||
+    laterJourneyStateProvesTraversal
+  );
+}
+
+export function manualJourneyDestinationIssue(
+  flow: Flow,
+  milestone: FlowMilestone,
+  pageId: string,
+): string | undefined {
+  if (
+    !flow.manualExecution ||
+    !milestone.manualJourneyDestinationPageId ||
+    pageId === milestone.manualJourneyDestinationPageId
+  ) {
+    return undefined;
+  }
+  return `Task-graph journey checkpoint did not reach required mapped state "${milestone.manualJourneyDestinationPageId}"`;
 }
 
 /**
@@ -1040,10 +1353,26 @@ async function runMilestone(
   ctx: StepContext,
   authCtx: AuthContext,
   runMode: FlowRunMode,
-): Promise<{ step: TestStep; marker?: string; execution: MilestoneExecution['execution'] }> {
+  manualEvidence: readonly string[] = [],
+  visitedPageIds: Set<string> = new Set(),
+): Promise<{
+  step: TestStep;
+  marker?: string;
+  execution: MilestoneExecution['execution'];
+  manualEvidence: string[];
+}> {
   const { browser, state, player, statements, interact } = deps;
   const decisionsBefore = interact.decisions.length;
-  let pageId = currentPageId(deps);
+  const activeManualRequirement =
+    milestone.manualTaskId && flow.manualExecution
+      ? flow.manualExecution.tasks.find((task) => task.id === milestone.manualTaskId)
+          ?.requirement
+      : undefined;
+  const priorEvidenceProvesActiveTask = activeManualRequirement
+    ? manualEvidenceSupportsItem(activeManualRequirement, manualEvidence)
+    : false;
+  let pageId = currentFlowPageId(deps, flow);
+  if (pageId !== 'unknown') visitedPageIds.add(pageId);
 
   // A genuinely dead/blank target (about:blank, empty snapshot — typically left
   // behind by a failed probe from the PREVIOUS milestone) always resolves pageId
@@ -1056,16 +1385,46 @@ async function runMilestone(
   if (pageId === 'unknown' && isBlankState(browser)) {
     console.log(`[flow] page is blank/dead entering "${milestone.id}" — replaying up to this milestone`);
     await replayUpTo(deps, flow, milestoneIndex);
-    pageId = currentPageId(deps);
+    pageId = currentFlowPageId(deps, flow);
   }
 
   // guard-phase check: poll first (processing lag ≠ off-track — restarting a wizard
   // from its entry mid-flow destroys the walk), then recover by REBUILDING position
   // (entry alone is not enough — probes/aborts can strand us anywhere)
   if (milestone.guardPhases?.length && !milestone.guardPhases.includes(pageId) && pageId !== 'unknown') {
-    pageId = waitForGuardPhase(deps, milestone.guardPhases, 30000);
+    pageId = waitForGuardPhase(
+      deps,
+      milestone.guardPhases,
+      flow.manualExecution ? 3000 : 30000,
+      flow,
+    );
     if (!milestone.guardPhases.includes(pageId)) {
-      if (hasAnyPriorRecipe(deps, flow, milestoneIndex)) {
+      if (flow.manualExecution) {
+        const target = milestone.guardPhases
+          .map((id) => state.sitemap.pages[id])
+          .find(Boolean);
+        const targetUrl = target
+          ? target.exampleUrl ??
+            (target.urlPatterns[0]
+              ? new URL(target.urlPatterns[0], state.sitemap.origin).toString()
+              : undefined)
+          : undefined;
+        if (target && targetUrl) {
+          if (!canDirectOpenManualTarget(flow, target.id, visitedPageIds, target.kind)) {
+            console.log(
+              `[flow:v2] refusing to direct-open unvisited primary state "${target.title}"; the current journey must reach it first`,
+            );
+          } else {
+            console.log(
+              `[flow:v2] restoring previously reached primary journey state "${target.title}" after a task/side quest`,
+            );
+            browser.open(targetUrl);
+            browser.wait(1500);
+            pageId = currentFlowPageId(deps, flow);
+            if (pageId !== 'unknown') visitedPageIds.add(pageId);
+          }
+        }
+      } else if (hasAnyPriorRecipe(deps, flow, milestoneIndex) && !flow.manualContract) {
         console.log(`[flow] off-track (on "${pageId}", expected ${milestone.guardPhases.join('/')}) — replaying up to this milestone`);
         await replayUpTo(deps, flow, milestoneIndex);
       } else {
@@ -1091,7 +1450,43 @@ async function runMilestone(
     await ensureAuthenticated(authCtx);
     await navigateToEntry(deps, flow);
     if (milestoneIndex > 0) await replayUpTo(deps, flow, milestoneIndex);
-    pageId = currentPageId(deps);
+    pageId = currentFlowPageId(deps, flow);
+  }
+
+  // Manual audits are independent feature checks. For mutation-heavy items,
+  // start on the sitemap-grounded feature page instead of asking the explorer
+  // to escape an unrelated wizard state by touching controls that belong to a
+  // different checklist item. Evidence-only setup audits (items 1–4) remain
+  // in place so they can prove the already-completed fresh-entry/upload work
+  // without destroying the active draft.
+  if (
+    milestone.manualContractAudit &&
+    (Boolean(flow.manualExecution) || (milestone.manualContractItem ?? 0) >= 5) &&
+    milestone.manualContractTargetPageId &&
+    pageId !== milestone.manualContractTargetPageId
+  ) {
+    const target = state.sitemap.pages[milestone.manualContractTargetPageId];
+    const targetUrl = target
+      ? target.exampleUrl ??
+        (target.urlPatterns[0]
+          ? new URL(target.urlPatterns[0], state.sitemap.origin).toString()
+          : undefined)
+      : undefined;
+    if (target && targetUrl) {
+      if (!canDirectOpenManualTarget(flow, target.id, visitedPageIds, target.kind)) {
+        console.log(
+          `[flow:v2] audit ${milestone.manualContractItem} targets unvisited primary state "${target.title}" — keeping the current state instead of resuming a stale draft`,
+        );
+      } else {
+        console.log(
+          `[flow] pre-positioning manual audit ${milestone.manualContractItem} on mapped feature "${target.title}"`,
+        );
+        deps.browser.open(targetUrl);
+        deps.browser.wait(1500);
+        pageId = currentFlowPageId(deps, flow);
+        if (pageId !== 'unknown') visitedPageIds.add(pageId);
+      }
+    }
   }
 
   browser.clearSignals();
@@ -1111,6 +1506,13 @@ async function runMilestone(
     runMode === 'learning'
       ? exploratoryDirectedGoal(flow, milestone, milestoneIndex)
       : boundaryConstrainedGoal(milestone.goal);
+  if (flow.manualContract) {
+    goal += manualContractRuntimeGuidance(
+      flow,
+      milestone,
+      manualEvidence,
+    );
+  }
   let marker: string | undefined;
   if (milestone.kind === 'edit' && !authRelated && !searchShaped && !selectionShaped && !literalValueShaped) {
     // If a recipe already exists for this milestone (walked-flow recipes are
@@ -1201,8 +1603,10 @@ async function runMilestone(
 
   let explored: ExplorerResult | null = null;
   let replayOk = false;
+  let replayCompletedSteps: RecipeStep[] = [];
   let execution: MilestoneExecution['execution'] = 'none';
-  const forceExplore = runMode === 'learning';
+  const nonIdempotentManual = isNonIdempotentManualMilestone(flow, milestone);
+  const forceExplore = runMode === 'learning' || nonIdempotentManual;
   const alreadySatisfiedNavigation = isAlreadySatisfiedNavigationMilestone(milestone, pageId);
   const replayFillHint =
     fillFieldHintFromGoal(milestone.goal) ??
@@ -1296,6 +1700,7 @@ async function runMilestone(
       fillOverrides:
         Object.keys(replayFillOverrides).length > 0 ? replayFillOverrides : undefined,
     });
+    replayCompletedSteps = replay.completedSteps ?? [];
     replayOk = replay.ok;
     if (replayOk) execution = 'replay';
   } else if (!forceExplore && player.has(recipeId) && creationMustPersist) {
@@ -1306,11 +1711,25 @@ async function runMilestone(
 
   if (!replayOk && !loginShaped) {
     execution = 'explore';
+    if (flow.manualContract && replayCompletedSteps.length > 0) {
+      const completedPrefixEvidence =
+        manualEvidenceFromRecipeSteps(replayCompletedSteps);
+      goal +=
+        '\n\nThe deterministic attempt completed this exact prefix in the current run before it needed help:\n- ' +
+        completedPrefixEvidence.join('\n- ') +
+        '\nContinue from the current state. Treat only this listed prefix as completed; do not repeat its successful ' +
+        'Create, Generate, Upload, Finalize, Save, or submission actions.';
+    }
     explored = await deps.explorer.achieveGoal(goal, {
       // Preserve deliberately small one-screen recipes during the first
       // attempt. If that boundary leaves the checkpoint unverified, the
       // post-verification continuation below is allowed to cross it.
       returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
+      manualMode: Boolean(flow.manualContract),
+      manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+      allowDoneWithoutProgress:
+        priorEvidenceProvesActiveTask ||
+        Boolean(flow.manualContract && milestone.kind === 'verify'),
     });
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
@@ -1336,6 +1755,11 @@ async function runMilestone(
       await navigateToEntry(deps, flow);
       explored = await deps.explorer.achieveGoal(goal, {
         returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
+        manualMode: Boolean(flow.manualContract),
+        manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+        allowDoneWithoutProgress:
+          priorEvidenceProvesActiveTask ||
+          Boolean(flow.manualContract && milestone.kind === 'verify'),
       });
     }
   }
@@ -1422,20 +1846,108 @@ async function runMilestone(
   if (explored) step.explorerSteps = explored.stepsTaken;
 
   const completionActionSeen = flowHasCompletionAction(flow, state, explored);
+  const currentRecipeEvidence = manualEvidenceFromRecipeSteps(replayCompletedSteps);
+  const firstAttemptManualAuditIssue = manualTaskGraphRepairIssue(
+    flow,
+    milestone,
+    [
+      ...manualEvidence,
+      ...currentRecipeEvidence,
+      ...(explored ? manualEvidenceFromActions(explored.actions) : []),
+    ],
+    step.result.signals.snapshot.raw,
+    manualVisualAssessmentFromActions(explored?.actions ?? []) ??
+      step.result.visualAssessment,
+  );
+  const firstAttemptJourneyDestinationIssue = manualJourneyDestinationIssue(
+    flow,
+    milestone,
+    currentFlowPageId(deps, flow),
+  );
   if (
-    shouldContinueAfterVerification(step, explored, {
-      loginShaped,
-      creationMustPersist,
-      completionActionSeen,
-    })
+    (
+      !explorerInfrastructureBlocked(explored) &&
+      (
+        Boolean(firstAttemptManualAuditIssue) ||
+        Boolean(firstAttemptJourneyDestinationIssue) ||
+        (
+          !(milestone.manualContractAudit && explored?.success) &&
+          shouldContinueAfterVerification(step, explored, {
+            loginShaped,
+            creationMustPersist,
+            completionActionSeen,
+          })
+        )
+      )
+    )
   ) {
     console.log(
-      `[flow] verification did not prove "${milestone.id}" complete — continuing with directed LLM exploration from the current state`,
+      firstAttemptManualAuditIssue
+        ? `[flow:v2] acceptance audit found missing evidence for "${milestone.id}" — one bounded repair from the current state`
+        : firstAttemptJourneyDestinationIssue
+          ? `[flow:v2] journey checkpoint "${milestone.id}" missed its mapped destination — one bounded forward recovery from the current state`
+        : `[flow] verification did not prove "${milestone.id}" complete — continuing with directed LLM exploration from the current state`,
     );
-    const continuationGoal = exploratoryDirectedGoal(flow, milestone, milestoneIndex, {
+    if (
+      milestone.manualContractAudit &&
+      milestone.manualContractTargetPageId &&
+      currentFlowPageId(deps, flow) !== milestone.manualContractTargetPageId
+    ) {
+      const target = state.sitemap.pages[milestone.manualContractTargetPageId];
+      const targetUrl = target
+        ? target.exampleUrl ??
+          (target.urlPatterns[0]
+            ? new URL(target.urlPatterns[0], state.sitemap.origin).toString()
+            : undefined)
+        : undefined;
+      if (target && targetUrl) {
+        if (!canDirectOpenManualTarget(flow, target.id, visitedPageIds, target.kind)) {
+          console.log(
+            `[flow:v2] refusing mapped recovery to unvisited primary state "${target.title}"`,
+          );
+        } else {
+          console.log(
+            `[flow] manual audit ${milestone.manualContractItem} could not reach its feature — one mapped-page recovery to "${target.title}"`,
+          );
+          deps.browser.open(targetUrl);
+          deps.browser.wait(1500);
+          const recoveredPageId = currentFlowPageId(deps, flow);
+          if (recoveredPageId !== 'unknown') visitedPageIds.add(recoveredPageId);
+        }
+      }
+    }
+    let continuationGoal = exploratoryDirectedGoal(flow, milestone, milestoneIndex, {
       continuation: true,
     });
-    const priorSuccessfulMutations = successfulMutationLabels(explored);
+    if (flow.manualContract) {
+      continuationGoal += manualContractRuntimeGuidance(
+        flow,
+        milestone,
+        [
+          ...manualEvidence,
+          ...currentRecipeEvidence,
+          ...(explored ? manualEvidenceFromActions(explored.actions) : []),
+        ],
+      );
+      if (firstAttemptManualAuditIssue) {
+        continuationGoal +=
+          `\n\nThe independent acceptance audit found this exact remaining gap: ${firstAttemptManualAuditIssue}. ` +
+          'Repair only that missing part of the active task. Preserve completed methods and do not repeat a ' +
+          'successful Create, Generate, Finalize, Save, or submission action. If the audit identifies an empty ' +
+          'slot or wrong owner/context, completing that exact empty slot in its own section is allowed and is not ' +
+          'a repetition of an earlier action performed elsewhere.';
+      }
+      if (firstAttemptJourneyDestinationIssue) {
+        continuationGoal +=
+          `\n\nThe journey invariant is still unmet: ${firstAttemptJourneyDestinationIssue}. ` +
+          'Move forward through the current wizard using a unique enabled Next, Continue, Proceed, or equivalent ' +
+          'control. Do not use a sidebar breadcrumb or direct URL, and do not repeat an earlier acceptance task.';
+      }
+    }
+    const priorSuccessfulMutations = [
+      ...successfulMutationLabelsFromRecipeSteps(replayCompletedSteps),
+      ...successfulMutationLabels(explored),
+    ];
     const continuation = await deps.explorer.achieveGoal(continuationGoal, {
       // This is specifically the recovery for a checkpoint that looked
       // executed but was not actually complete. Let the explorer cross the
@@ -1445,6 +1957,11 @@ async function runMilestone(
       // first attempt's successful mutations into its hard denylist so a
       // verification retry cannot resubmit Generate/Try/Finalize/Save.
       blockedClickLabels: priorSuccessfulMutations,
+      manualMode: Boolean(flow.manualContract),
+      manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+      allowDoneWithoutProgress:
+        priorEvidenceProvesActiveTask ||
+        Boolean(flow.manualContract && milestone.kind === 'verify'),
     });
     explored = mergeExplorerResults(explored, continuation);
     execution = 'explore';
@@ -1503,6 +2020,7 @@ async function runMilestone(
   const automationBlockedWithoutProductEvidence = Boolean(
     explored && !explored.success && !hasConcreteProductFailureEvidence(step),
   );
+  const infrastructureBlocked = explorerInfrastructureBlocked(explored);
   const visualConcernDowngrade = step.result.visualAssessment?.status === 'concern';
   const creationCompletionMissing =
     creationMustPersist && !flowHasCompletionAction(flow, state, explored);
@@ -1524,6 +2042,16 @@ async function runMilestone(
     step.result.verdict = 'needs-review';
     step.result.reasons.push(
       `Explorer did not confirm goal completion: ${explored.error ?? 'unknown reason'}`,
+    );
+  }
+  if (infrastructureBlocked) {
+    step.result.verdict = 'needs-review';
+    step.result.reasons = step.result.reasons.filter(
+      (reason) => !/product error|application failure/i.test(reason),
+    );
+    step.result.reasons.push(
+      explored?.error ??
+        'Infrastructure blocked: LLM provider was unavailable after retries.',
     );
   }
   if (automationBlockedWithoutProductEvidence && step.result.verdict === 'fail') {
@@ -1555,6 +2083,46 @@ async function runMilestone(
     step.result.reasons.push(
       'Login-shaped milestone did not confirm authentication this run (no successful login) — not a verified pass',
     );
+  }
+
+  const milestoneManualEvidence = [
+    ...currentRecipeEvidence,
+    ...(explored ? manualEvidenceFromActions(explored.actions) : []),
+  ];
+  const manualAuditIssue =
+    flow.manualContract && milestone.manualContractAudit && milestone.manualContractItem
+      ? manualAuditEvidenceIssue(
+          flow.manualContract.checklist[milestone.manualContractItem - 1] ?? milestone.goal,
+          [...manualEvidence, ...milestoneManualEvidence],
+          step.result.signals.snapshot.raw,
+          flow.manualExecution?.tasks.find(
+            (task) => task.id === milestone.manualTaskId,
+          ),
+          manualVisualAssessmentFromActions(explored?.actions ?? []) ??
+            step.result.visualAssessment,
+        )
+      : undefined;
+  const journeyDestinationIssue = manualJourneyDestinationIssue(
+    flow,
+    milestone,
+    currentFlowPageId(deps, flow),
+  );
+  if (manualAuditIssue && step.result.verdict === 'pass') {
+    step.result.verdict = 'needs-review';
+    step.result.reasons.push(manualAuditIssue);
+  } else if (manualAuditIssue && !step.result.reasons.includes(manualAuditIssue)) {
+    step.result.reasons.push(manualAuditIssue);
+  }
+  if (journeyDestinationIssue) {
+    // A journey checkpoint is structural positioning, not a subjective audit.
+    // After its bounded forward-recovery attempt, continuing from the wrong
+    // wizard state would make every later task untrustworthy. Fail here so the
+    // outer runner either proves a recipe-based recovery or skips downstream
+    // tasks honestly.
+    step.result.verdict = 'fail';
+    if (!step.result.reasons.includes(journeyDestinationIssue)) {
+      step.result.reasons.push(journeyDestinationIssue);
+    }
   }
 
   // Everything below is POST-verdict bookkeeping (KB triage, human escalation,
@@ -1612,8 +2180,8 @@ async function runMilestone(
       // a bare re-check with no new evidence must not.
       let flipped: Verdict | null = null;
       if (
-        (reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen) && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade) ||
-        (reVerdict !== 'fail' && successSeen && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade)
+        (reVerdict === 'pass' && !(explorerFailureDowngrade && !successSeen) && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade && !manualAuditIssue && !journeyDestinationIssue) ||
+        (reVerdict !== 'fail' && successSeen && !visualConcernDowngrade && !creationCompletionMissing && !creationVisuallyUnproven && !loginFailureDowngrade && !manualAuditIssue && !journeyDestinationIssue)
       ) {
         flipped = 'pass';
       } else if (
@@ -1632,7 +2200,12 @@ async function runMilestone(
     }
 
     // still ambiguous → the human is the escalation path
-    if (step.result.verdict === 'needs-review' && !automationBlockedWithoutProductEvidence) {
+    if (
+      step.result.verdict === 'needs-review' &&
+      !automationBlockedWithoutProductEvidence &&
+      !manualAuditIssue &&
+      !journeyDestinationIssue
+    ) {
       const hintWasOnlyConcern =
         Boolean(milestone.successHint) &&
         step.result.reasons.length > 0 &&
@@ -1659,7 +2232,11 @@ async function runMilestone(
     step.humanDecisions = interact.decisions.slice(decisionsBefore);
 
     // success + explored → cache the recipe for next time
-    if (step.result.verdict === 'pass' && explored?.success) {
+    if (
+      step.result.verdict === 'pass' &&
+      explored?.success &&
+      !nonIdempotentManual
+    ) {
       const existingRecipe = state.recipes[recipeId];
       const normalizedPrimaryHint = fieldHintForRecipe?.toLowerCase().replace(/\s+/g, ' ').trim();
       const existingHasPrimaryFill = Boolean(
@@ -1716,7 +2293,654 @@ async function runMilestone(
     patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
   }
 
-  return { step, marker, execution };
+  const endingPageId = currentFlowPageId(deps, flow);
+  if (endingPageId !== 'unknown') visitedPageIds.add(endingPageId);
+  return {
+    step,
+    marker,
+    execution,
+    manualEvidence: milestoneManualEvidence,
+  };
+}
+
+/** Successful action evidence retained even when the surrounding milestone is incomplete. */
+export function manualEvidenceFromActions(actions: ExplorerAction[]): string[] {
+  return actions.flatMap((action) => {
+    if (action.executionFailed || action.deniedByUser || action.action === 'fail') return [];
+    const label = action.resolvedLabel?.trim();
+    if (action.action === 'fill') {
+      return [`filled "${label || 'editable field'}" with "${action.value ?? ''}"`];
+    }
+    if (action.action === 'upload') {
+      return [`uploaded "${action.uploadedPath ?? action.selector ?? 'requested file'}"`];
+    }
+    if (action.action === 'select' || action.action === 'click' || action.action === 'press') {
+      if (!label) return [];
+      return [
+        `${action.action === 'click' ? 'clicked' : action.action === 'select' ? 'selected' : 'pressed'} ` +
+          `"${label}"`,
+      ];
+    }
+    return [];
+  });
+}
+
+/** Deterministic steps that completed before a replay fallback remain same-run evidence. */
+export function manualEvidenceFromRecipeSteps(steps: readonly RecipeStep[]): string[] {
+  return steps.flatMap((step) => {
+    if (step.kind === 'click') {
+      return step.label ? [`clicked "${step.label}"`] : [];
+    }
+    if (step.kind === 'fill') {
+      return step.secretRef
+        ? ['filled a secret field']
+        : [`filled "${step.hint}" with "${step.value}"`];
+    }
+    if (step.kind === 'select') return [`selected "${step.hint}" with "${step.value}"`];
+    if (step.kind === 'press') return [`pressed "${step.key}"`];
+    if (step.kind === 'upload') return [`uploaded "${step.assetPath}"`];
+    return [];
+  });
+}
+
+/** One-shot replay mutations already executed in this run must stay blocked in fallback. */
+export function successfulMutationLabelsFromRecipeSteps(
+  steps: readonly RecipeStep[],
+): string[] {
+  return steps.flatMap((step) =>
+    step.kind === 'click' &&
+    step.label &&
+    isLikelyMutationLabel(step.label)
+      ? [step.label]
+      : [],
+  );
+}
+
+export function manualEvidenceSupportsItem(
+  requirement: string,
+  evidence: readonly string[],
+): boolean {
+  const joined = evidence.join('\n');
+  if (/\b(?:new project|fresh journey)\b/i.test(requirement)) {
+    return /clicked "[^"]*new project[^"]*"/i.test(joined);
+  }
+  if (/\bupload\b.{0,60}\b(?:script|pdf)\b/i.test(requirement)) {
+    return /\buploaded "[^"]+\.(?:pdf|docx?)(?:\?[^"]*)?"/i.test(joined);
+  }
+  if (/\bupload\b.{0,60}\b(?:audio|recording|sound|file)\b/i.test(requirement)) {
+    return /\buploaded "[^"]+\.(?:mp3|wav|m4a|aac|ogg|flac)(?:\?[^"]*)?"/i.test(
+      joined,
+    );
+  }
+  return false;
+}
+
+type ManualVisualAssessment = NonNullable<TestStep['result']['visualAssessment']>;
+
+/** Prefer the visual proof captured on the owning surface before a forward click. */
+export function manualVisualAssessmentFromActions(
+  actions: readonly ExplorerAction[],
+): ManualVisualAssessment | undefined {
+  return [...actions]
+    .reverse()
+    .find((action) => action.visualAssessment)
+    ?.visualAssessment;
+}
+
+/**
+ * DOM/accessibility snapshots often expose stale wizard controls, hidden empty
+ * templates, or a disabled forward button while the rendered UI already shows
+ * the requested persisted result. In that narrow ambiguity, a clear visual
+ * assessment may settle the visible outcome. It never substitutes for action
+ * provenance (checked separately by each audit) and never overrides a visual
+ * concern, uncertainty, processing state, missing item, or product error.
+ */
+export function manualVisionAffirmsPersistedOutcome(
+  item: string,
+  visual: ManualVisualAssessment | undefined,
+): boolean {
+  if (!visual) return false;
+  const summary = visual.summary.toLowerCase();
+  const threeCharacterItem = /\bexactly three distinct characters\b/i.test(item);
+  const uploadedCharacterAssetGrouping =
+    threeCharacterItem &&
+    (
+      /\btwo (?:named |finalized )?characters?\b[\s\S]{0,180}\b(?:plus|and)\b[\s\S]{0,80}\b(?:named )?asset entry\b/.test(
+        summary,
+      ) ||
+      (
+        /\bnamed ai[- ]generated character\b/.test(summary) &&
+        /\blibrary character\b/.test(summary) &&
+        /\basset[- ]section image\b/.test(summary)
+      )
+    ) &&
+    !/\b(?:disabled|loading|processing|generating|no image available|failed)\b/.test(
+      summary,
+    ) &&
+    (
+      !/\b(?:missing|empty)\b/.test(summary) ||
+      /\bempty ['"]?add(?: another)?['"]? placeholder\b/.test(summary)
+    );
+  // Some applications persist an uploaded character in a dedicated
+  // character-assets group rather than rendering it as a normal avatar card.
+  // The action audit separately proves AI Finalize + image Upload/Save +
+  // existing-library Confirm. In that narrow, fully named 2-card + 1 asset
+  // grouping, vision is settling presentation ambiguity, not inventing a
+  // missing mutation. Never extend this exception to an empty/disabled/loading
+  // state or a generic asset unrelated to the uploaded-character provenance.
+  if (
+    uploadedCharacterAssetGrouping &&
+    visual.concerns.every((concern) =>
+      /\b(?:asset entry|character entit|method|section|upload|finalized as three|attribution|add placeholder)\b/i.test(
+        concern,
+      ),
+    )
+  ) {
+    return true;
+  }
+  if (visual.status === 'concern') return false;
+  if (
+    (threeCharacterItem
+      ? /\b(?:missing|empty|disabled|loading|processing|generating|not (?:visible|shown|persisted|complete)|no image available|error|failed)\b/
+      : /\b(?:missing|empty|disabled|loading|processing|generating|uncertain|cannot|not (?:visible|shown|persisted|complete)|no image available|error|failed)\b/
+    ).test(summary)
+  ) {
+    return false;
+  }
+  if (
+    !/\b(?:visibly confirmed|clearly shows?|visible|shown|persisted|finalized|completed|successfully|playable|downloadable)\b/.test(
+      summary,
+    )
+  ) {
+    return false;
+  }
+
+  if (threeCharacterItem) {
+    if (visual.status === 'uncertain') {
+      const concerns = visual.concerns.join('\n').toLowerCase();
+      // The final list cannot show how each item was created. Same-run action
+      // provenance already proves those methods before this helper is called,
+      // so method-label uncertainty (or inability to prove persistence beyond
+      // the visibly populated current list) must not trigger duplicate creation.
+      if (
+        visual.concerns.length === 0 ||
+        /\b(?:only (?:one|two|1|2)|missing|empty|disabled|loading|processing|no image|not three)\b/.test(
+          concerns,
+        ) ||
+        !visual.concerns.every((concern) =>
+          /\b(?:method|upload|ai[- ]generated|existing library|method labels?|separate|assets?(?: and animals)?(?: as character)? section|different sections|beyond the current view|after finalize|after next)\b/i.test(
+            concern,
+          ),
+        )
+      ) {
+        return false;
+      }
+    } else if (visual.concerns.length > 0) {
+      return false;
+    }
+    return (
+      /\b(?:three|3)\b[\s\S]{0,100}\bcharacters?\b|\bcharacters?\b[\s\S]{0,100}\b(?:three|3)\b/.test(
+        summary,
+      ) &&
+      /\b(?:character section|character[- ]assets? section|choose your characters|character slots?|finalized|persisted)\b/.test(
+        summary,
+      )
+    );
+  }
+  if (/\b(?:style|orientation)\b/i.test(item)) {
+    return /\b(?:style|animated|sketch|realistic)\b/.test(summary) &&
+      /\b(?:orientation|portrait|landscape|square)\b/.test(summary);
+  }
+  if (/\b(?:final[- ]video|rendered video|terminal artifact)\b/i.test(item)) {
+    return /\bvideo\b/.test(summary) && /\b(?:playable|downloadable|persisted|rendered)\b/.test(summary);
+  }
+  return false;
+}
+
+/**
+ * High-risk manual checks need stronger evidence than an LLM `done` action.
+ * An unresolved requirement stays needs-review and therefore cannot qualify
+ * the flow for replay.
+ */
+export function manualAuditEvidenceIssue(
+  item: string,
+  evidence: readonly string[],
+  snapshot: string,
+  task?: ManualAcceptanceTask,
+  visual?: ManualVisualAssessment,
+): string | undefined {
+  const joined = evidence.join('\n').toLowerCase();
+  const view = snapshot.toLowerCase();
+  const has = (pattern: RegExp) => pattern.test(joined);
+  const missing = (description: string) =>
+    `Manual audit lacks distinct persisted evidence for ${description}`;
+
+  if (
+    /\bupload\b.{0,80}\b(?:file (?:i|the user) provide|supplied (?:audio|script|file)|provided (?:audio|script|file))\b/i.test(
+      item,
+    )
+  ) {
+    const expectsAudio = /\b(audio|recording|sound)\b/i.test(item);
+    const expectsScript = /\b(script|pdf)\b/i.test(item);
+    const uploadedExpectedType = expectsAudio
+      ? has(/uploaded "[^"]+\.(?:mp3|wav|m4a|aac|ogg|flac)(?:\?[^"]*)?"/)
+      : expectsScript
+        ? has(/uploaded "[^"]+\.(?:pdf|docx?)(?:\?[^"]*)?"/)
+        : has(/uploaded "[^"]+"/);
+    if (!uploadedExpectedType) {
+      return missing(
+        'uploading the user-supplied file through a file input (choosing a built-in sample is not equivalent)',
+      );
+    }
+  }
+
+  if (/\bexactly three distinct characters\b/i.test(item)) {
+    if (!has(/clicked "[^"]*create ai avatar[^"]*"/)) {
+      return missing('the AI-avatar character method');
+    }
+    if (!has(/uploaded "[^"]+\.(?:png|jpe?g|webp|gif|heic|avif)(?:\?[^"]*)?"/)) {
+      return missing('an image upload for the uploaded-character method (a prior script/audio upload does not count)');
+    }
+    const existingSelectorIndex = evidence.findIndex((entry) =>
+      /clicked "[^"]*use existing[^"]*"/i.test(entry),
+    );
+    if (existingSelectorIndex < 0) {
+      return missing('the existing-library character method');
+    }
+    const existingCommitted = evidence
+      .slice(existingSelectorIndex + 1)
+      .some((entry) =>
+        /clicked "[^"]*(?:add(?: \(\d+\)| selected)?|use selected|confirm(?: selection)?|done)[^"]*"/i.test(
+          entry,
+        ),
+      );
+    if (!existingCommitted) {
+      return missing('committing the selected existing-library character');
+    }
+    if (manualVisionAffirmsPersistedOutcome(item, visual)) return undefined;
+    const onCharacterSurface =
+      /\b(?:choose your characters|create ai avatar|use your likeness)\b/i.test(snapshot);
+    if (!onCharacterSurface) {
+      return missing(
+        'returning to the character surface and visibly verifying all three persisted characters after closing any picker or naming dialog',
+      );
+    }
+    if (
+      onCharacterSurface &&
+      /\bcharacter \d+\b[\s\S]{0,500}\b(?:use your likeness|create ai avatar)\b/i.test(
+        snapshot,
+      )
+    ) {
+      return missing('all three character slots finalized with no empty character slot');
+    }
+    if (onCharacterSurface && /\bnext\b[^\n]*\bdisabled\b/.test(view)) {
+      return missing('three accepted characters with the forward control enabled');
+    }
+  }
+
+  if (/\b(character voice|emotion|dialogue|spoken text|script line)\b/i.test(item)) {
+    if (!has(/\bvoice\b/)) return missing('a character voice change');
+    if (!has(/\bemotion\b|\b(happy|sad|angry|fearful|excited|calm)\b/)) {
+      return missing('a dialogue emotion change');
+    }
+    if (!has(/filled "[^"]*(dialogue|script|spoken|text)[^"]*"/)) {
+      return missing('an edited spoken dialogue line');
+    }
+  }
+
+  if (/\b(reusable asset|asset library)\b/i.test(item)) {
+    if (!has(/clicked "(?:add(?: new)? asset|create asset|new asset)"/)) {
+      return missing('creating a reusable library asset (a character or direct scene upload is not equivalent)');
+    }
+    if (!has(/clicked "[^"]*(?:generate|finalize|save)[^"]*asset[^"]*"/)) {
+      return missing('finalizing the reusable asset in its library');
+    }
+    if (/\badd.+same asset.+scene\b/i.test(item) && !has(/clicked "[^"]*add assets?[^"]*"/)) {
+      return missing('adding that same reusable asset to a generated scene');
+    }
+  }
+
+  if (
+    task?.artifactRole === 'consumer' ||
+    /\b(?:same asset|that asset|asset created earlier|previously created asset|earlier asset)\b/i.test(
+      item,
+    )
+  ) {
+    const producerStart = evidence.findIndex((entry) =>
+      /clicked "(?:add(?: new)? asset|create asset|new asset)"/i.test(entry),
+    );
+    const producerEnd = evidence.findIndex(
+      (entry, index) =>
+        index > producerStart &&
+        /clicked "[^"]*(?:finalize|save)[^"]*asset[^"]*"/i.test(entry),
+    );
+    const consumerStart = evidence.findIndex(
+      (entry, index) =>
+        index > producerEnd && /clicked "[^"]*add assets?[^"]*"/i.test(entry),
+    );
+    const uploadsBetween = (start: number, end: number): string[] =>
+      evidence
+        .slice(Math.max(0, start), end < 0 ? undefined : end + 1)
+        .map((entry) => entry.match(/uploaded "([^"]+)"/i)?.[1])
+        .filter((assetPath): assetPath is string => Boolean(assetPath));
+    const producerPaths =
+      producerStart >= 0 && producerEnd > producerStart
+        ? uploadsBetween(producerStart, producerEnd)
+        : [];
+    const consumerPaths =
+      consumerStart > producerEnd ? uploadsBetween(consumerStart, -1) : [];
+    const reusedExactSource = producerPaths.some((assetPath) =>
+      consumerPaths.includes(assetPath),
+    );
+    const producedNames =
+      producerStart >= 0 && producerEnd > producerStart
+        ? evidence
+            .slice(producerStart, producerEnd + 1)
+            .map(
+              (entry) =>
+                entry.match(
+                  /filled "[^"]*(?:asset )?name[^"]*" with "([^"]+)"/i,
+                )?.[1],
+            )
+            .filter((name): name is string => Boolean(name))
+        : [];
+    const selectedByIdentity = producedNames.some((name) =>
+      evidence
+        .slice(Math.max(0, producerEnd + 1))
+        .some(
+          (entry) =>
+            /^clicked "/i.test(entry) &&
+            entry.toLowerCase().includes(name.toLowerCase()),
+        ),
+    );
+    if (!reusedExactSource && !selectedByIdentity) {
+      return missing(
+        'consuming the exact previously created asset by the same source file path or persisted library identity',
+      );
+    }
+  }
+
+  if (/\b(outfit|change look)\b/i.test(item)) {
+    let outfitFill = -1;
+    evidence.forEach((entry, index) => {
+      if (/\b(coat|shirt|dress|jacket|suit|trousers|pants|skirt|sweater|boots|outfit|wearing)\b/i.test(entry)) {
+        outfitFill = index;
+      }
+    });
+    const appliedAfterFill = evidence
+      .slice(Math.max(0, outfitFill + 1))
+      .some((entry) => /clicked "[^"]*(?:change look|generate outfit|save outfit)[^"]*"/i.test(entry));
+    if (outfitFill < 0 || !appliedAfterFill) {
+      return missing('applying the requested outfit after entering its new prompt');
+    }
+  }
+
+  if (/\b(location|locations)\b/i.test(item)) {
+    const locationCreateIndex = evidence.findIndex((entry) =>
+      /clicked "[^"]*(?:add new location|create location|new location)[^"]*"/i.test(
+        entry,
+      ),
+    );
+    const locationCreationCommittedIndex = evidence.findIndex(
+      (entry, index) =>
+        index > locationCreateIndex &&
+        /clicked "[^"]*(?:create|generate|finalize|save)[^"]*location[^"]*"/i.test(
+          entry,
+        ),
+    );
+    const persistedInlineLocationEdit = evidence
+      .slice(Math.max(0, locationCreationCommittedIndex + 1))
+      .some((entry) => {
+        const editedValue = entry.match(/filled "[^"]+" with "([^"]+)"/i)?.[1];
+        return Boolean(
+          editedValue &&
+            editedValue.trim().length >= 3 &&
+            view.includes(editedValue.trim().toLowerCase()),
+        );
+      });
+    if (
+      /\b(?:create|add|new|generate)\b/i.test(item) &&
+      locationCreateIndex < 0
+    ) {
+      return missing('creating the new test location');
+    }
+    if (
+      /\b(?:edit|change|regenerate|update)\b/i.test(item) &&
+      !has(/clicked "[^"]*(?:edit|regenerate|save)[^"]*location[^"]*"|clicked "edit"/) &&
+      !(locationCreationCommittedIndex >= 0 && persistedInlineLocationEdit)
+    ) {
+      return missing('editing and persisting the new test location');
+    }
+    if (/\bdelet/i.test(item) && !has(/clicked "[^"]*(?:delete|remove)[^"]*"/)) {
+      return missing('the explicitly approved deletion of only the new test location');
+    }
+  }
+
+  if (/\b(sketch style|orientation|art style)\b/i.test(item)) {
+    const requiredStyle = item.match(/\b(sketch|animated|realistic)\s+style\b/i)?.[1];
+    if (
+      requiredStyle &&
+      !evidence.some((entry) =>
+        new RegExp(`clicked "[^"]*${requiredStyle}[^"]*"`, 'i').test(entry),
+      )
+    ) {
+      return missing(`selecting ${requiredStyle} style`);
+    }
+    if (!has(/clicked "(?:portrait|landscape|square)"/)) {
+      return missing('selecting a required orientation');
+    }
+    if (manualVisionAffirmsPersistedOutcome(item, visual)) return undefined;
+    const onStyleSurface =
+      /\b(?:choose.{0,40}(?:art )?style|sketch|orientation)\b/i.test(snapshot);
+    if (onStyleSurface && /\bnext\b[^\n]*\bdisabled\b/.test(view)) {
+      return missing('a completed style configuration with the forward control enabled');
+    }
+  }
+
+  if (/\b(change scene|reshoot|camera angle|add assets?)\b/i.test(item)) {
+    const sceneOperations = [
+      {
+        requested: /\b(?:change scene function:\s*)?edit\b/i.test(item),
+        label: 'the Edit scene function',
+        evidence: /clicked "(?:edit|edit scene)"/,
+      },
+      {
+        requested: /\breshoot\b/i.test(item),
+        label: 'the Reshoot function',
+        evidence: /clicked "[^"]*reshoot[^"]*"/,
+      },
+      {
+        requested: /\bcamera angle\b/i.test(item),
+        label: 'the Change Camera Angle function',
+        evidence: /clicked "[^"]*camera angle[^"]*"/,
+      },
+      {
+        requested: /\badd assets?\b/i.test(item),
+        label: 'the Add Assets function',
+        evidence: /clicked "[^"]*add assets?[^"]*"/,
+      },
+    ];
+    for (const operation of sceneOperations) {
+      if (operation.requested && !has(operation.evidence)) {
+        return missing(operation.label);
+      }
+    }
+  }
+  if (/\badd .{0,30}asset.{0,30}(?:generated )?scene\b/i.test(item)) {
+    if (!has(/clicked "[^"]*add assets?[^"]*"/)) {
+      return missing('adding the previously created reusable asset to a generated scene');
+    }
+  }
+
+  if (/\b(final[- ]video|create video|rendered video|terminal artifact)\b/i.test(item)) {
+    if (/\bcreate video\b/i.test(item) && !has(/clicked "[^"]*create video[^"]*"/)) {
+      return missing('submitting Create Video');
+    }
+    if (manualVisionAffirmsPersistedOutcome(item, visual)) return undefined;
+    if (!/\b(download|play|video)\b/.test(view) || /\b(generating|rendering|processing)\b/.test(view)) {
+      return missing('a completed playable/downloadable terminal video');
+    }
+  }
+
+  const finalVideoOperations = [
+    {
+      requested: /\bedit video\b/i.test(item),
+      label: 'Edit Video',
+      evidence: /clicked "[^"]*(?:edit video|submit edit)[^"]*"/,
+    },
+    {
+      requested: /\bretake\b/i.test(item),
+      label: 'Retake',
+      evidence: /clicked "[^"]*retake[^"]*"/,
+    },
+    {
+      requested: /\badd reference\b/i.test(item),
+      label: 'Add Reference',
+      evidence: /clicked "[^"]*add reference[^"]*"/,
+    },
+    {
+      requested: /\breframe\b/i.test(item),
+      label: 'Reframe',
+      evidence: /clicked "[^"]*reframe[^"]*"/,
+    },
+  ];
+  for (const operation of finalVideoOperations) {
+    if (operation.requested && !has(operation.evidence)) {
+      return missing(`the final-video ${operation.label} operation`);
+    }
+  }
+
+  return undefined;
+}
+
+export function manualTaskGraphRepairIssue(
+  flow: Flow,
+  milestone: FlowMilestone,
+  evidence: readonly string[],
+  snapshot: string,
+  visual?: ManualVisualAssessment,
+): string | undefined {
+  if (
+    !flow.manualExecution ||
+    !flow.manualContract ||
+    !milestone.manualContractAudit ||
+    !milestone.manualContractItem
+  ) {
+    return undefined;
+  }
+  return manualAuditEvidenceIssue(
+    flow.manualContract.checklist[milestone.manualContractItem - 1] ?? milestone.goal,
+    evidence,
+    snapshot,
+    flow.manualExecution.tasks.find((task) => task.id === milestone.manualTaskId),
+    visual,
+  );
+}
+
+export function manualContractRuntimeGuidance(
+  flow: Flow,
+  milestone: FlowMilestone,
+  evidence: readonly string[],
+): string {
+  if (!flow.manualContract) return '';
+  const taskGraphTask = milestone.manualTaskId
+    ? flow.manualExecution?.tasks.find((task) => task.id === milestone.manualTaskId)
+    : undefined;
+  const verificationOnly =
+    milestone.id === 'manual-contract-final-proof' ||
+    milestone.id === 'manual-task-final-proof';
+  const contract = verificationOnly
+    ? flow.manualExecution
+      ? 'The runner has already adjudicated each acceptance task independently. Assess only the terminal artifact ' +
+        'and visible global constraints; do not demand that early-task UI or evidence remain visible here.'
+      : flow.manualContract.checklist
+          .map((item, index) => `${index + 1}. ${item}`)
+          .join('\n')
+    : taskGraphTask
+      ? `${milestone.manualContractItem ?? '?'}: ${taskGraphTask.requirement}`
+      : flow.manualExecution
+        ? 'No acceptance task is active in this call. Advance only the current mapped journey checkpoint.'
+        : milestone.manualContractAudit && milestone.manualContractItem
+      ? `${milestone.manualContractItem}. ${
+        flow.manualContract.checklist[milestone.manualContractItem - 1]
+      }`
+      : flow.manualContract.checklist
+        .map((item, index) => `${index + 1}. ${item}`)
+        .join('\n');
+  const uniqueEvidence = [...new Set(evidence)].slice(
+    flow.manualExecution ? -12 : -80,
+  );
+  const evidenceText = uniqueEvidence.length
+    ? `\n\nRecorded successful action evidence from this same run:\n- ${uniqueEvidence.join('\n- ')}`
+    : '\n\nThere is no successful action evidence from an earlier checkpoint yet.';
+  const threeCharacterMethodTask = /\bexactly three distinct characters\b/i.test(
+    taskGraphTask?.requirement ?? contract,
+  );
+  const artifactGroupingRule = threeCharacterMethodTask
+    ? 'For this exact three-character task, an application may intentionally display an uploaded character or ' +
+      'library-selected character in a dedicated character-assets/animals-as-character section. That dedicated ' +
+      'section counts when the screenshot visibly shows three finalized character entities and same-run actions ' +
+      'prove AI generation, image upload, and existing-library selection. Do not require method labels in the ' +
+      'final list. If uploading migrated an entry out of a newly added slot and left only an unused empty ' +
+      'placeholder that disables Next, remove that empty placeholder once; never remove a finalized entity. '
+    : 'Use screenshot grouping to ensure an upload/create/select control belongs to the requested artifact ' +
+      'section or empty slot. Never use a visually separate assets, attachments, animals, or media section as ' +
+      'proof of a character/person upload. ';
+  const operatingRule = verificationOnly
+    ? '\nThis checkpoint is strictly read-only. The contract and evidence are provided only for assessment. Do not ' +
+      'click Edit/Create/Save/Generate/Upload/Submit controls, fill fields, or retry a missing mutation.'
+      : milestone.manualContractAudit
+      ? `\nThis is a mutation-capable audit for acceptance item ${milestone.manualContractItem ?? 'assigned here'} only. ` +
+        'Do not work on a different checklist item in this call. Repair this item only when it has no matching ' +
+        'completion evidence, and never repeat a proven mutation. An attempted click, a submitted form with no ' +
+        'result, an ambiguous visual state, or a related-but-different action is not completion evidence. When this ' +
+        'item changes a value, enter every requested new value before activating Change/Generate/Save; never click ' +
+        'the mutation control once with the old value and then treat a later fill as completion. ' +
+        'item asks for persistence, require a saved value, completed processing state, or final library/artifact ' +
+        'state before calling done. A screenshot is attached on every manual decision: use its visual grouping to ' +
+        artifactGroupingRule +
+        'After a modal selection, return to the owning surface and visibly verify the persisted item before done. ' +
+        'If this item says the user supplies a file, only an actual upload action with that file type is completion; ' +
+        'a built-in sample, preset, or previously attached unrelated file is not the supplied file. ' +
+        (taskGraphTask?.artifactRole === 'producer'
+          ? 'This task produces an artifact consumed later: preserve a stable, unique library identity. Prefer a ' +
+            'finalized named library item that the later surface can select. Use an upload-backed path only when ' +
+            'the active requirement or a visible consumer explicitly requires a file; do not infer that from a ' +
+            'generic upload option. '
+          : taskGraphTask?.artifactRole === 'consumer'
+            ? 'Use the exact dependency artifact by its persisted name or the identical source path; never substitute ' +
+              'a different upload and call it the same artifact. '
+            : '') +
+        'When it cannot be completed after one bounded attempt, ' +
+        'record it as an incomplete sub-check so the next independent audit milestone can still run.'
+      : '\nWork only on contract operations that are directly supported by the current screen/current mapped ' +
+        'checkpoint. Never restart an obligation that already has matching evidence. A successful Fill/Select ' +
+        'followed by Save/Apply is action evidence: do not reopen and repeat it merely because a collapsed summary ' +
+        'shows stale text. Record that visual mismatch for verification, then use the safe forward control so later ' +
+        'Screenshot grouping is authoritative when identical controls appear in different sections: use only the ' +
+        'control inside the requested artifact section or empty slot, then verify the result on that owning surface. ' +
+        'independent features are still tested. If one sub-check cannot complete after one bounded attempt, leave it ' +
+        'incomplete and continue forward; do not trap the entire journey retrying it.';
+  const constraints =
+    flow.manualExecution?.constraints.length
+      ? `\nGlobal run constraints (apply silently; do not turn them into extra tasks):\n- ${flow.manualExecution.constraints.join('\n- ')}`
+      : '';
+  return (
+    `\n\nManual acceptance contract:\n${contract}${constraints}${evidenceText}\n` +
+    'Do not infer completion merely from reaching a later page. Use the evidence to avoid duplicate work and to ' +
+    `distinguish an attempted-but-visually-ambiguous check from an omitted check.${operatingRule}`
+  );
+}
+
+/**
+ * A manual acceptance contract already names the exact checks the user wants.
+ * Generic probes can mutate or navigate away from the one fresh artifact the
+ * contract is building, without satisfying any contract item. Keep the normal
+ * probe suite unchanged for every ordinary flow, but make contract execution
+ * exclusively follow its explicit checklist.
+ */
+export function shouldRunMilestoneProbes(flow: Flow, quick = false): boolean {
+  return !quick && !flow.manualContract;
 }
 
 export async function runFlows(
@@ -1768,6 +2992,9 @@ export async function runFlows(
     // silently dropping them (the-internet.herokuapp.com report-loss variant).
     let lastAttemptedIndex = -1;
     const milestoneExecutions: MilestoneExecution[] = [];
+    const manualEvidence: string[] = [];
+    const manualAuditFailures: string[] = [];
+    const visitedPageIds = new Set<string>();
 
     try {
       // Nothing has navigated anywhere for THIS flow yet at this point — the
@@ -1820,19 +3047,25 @@ export async function runFlows(
         // after fresh entry navigation, nothing has run yet — this matched and
         // skipped straight to m4, silently false-PASSing the entire
         // username/password/login-click sequence.
-        const hereId = currentPageId(deps);
+        const hereId = currentFlowPageId(deps, flow);
         // Only guard the exact scenario above: the FIRST check (mi===0), right after
         // fresh entry navigation, before anything has run. For any LATER check
         // (mi>0), landing back on entry.pageId can legitimately BE a resumed later
         // milestone's position (not just the unstarted flow start) — unconditionally
         // disabling fast-forward for every iteration would block that legitimate case.
         const isEntryPage = mi === 0 && hereId !== 'unknown' && hereId === flow.entry.pageId;
-        const aheadIdx = laterMilestoneStartingOnPage(
+        // Task-graph manual runs always start through their explicit fresh
+        // entry contract. Page-based fast-forward is unsafe for them because a
+        // later journey guard can appear beyond an unguarded acceptance task,
+        // silently skipping that task. Resume is handled by each task's mapped
+        // positioning and never by jumping over graph nodes.
+        const candidateAheadIdx = laterMilestoneStartingOnPage(
           flow,
           mi,
           hereId,
           isEntryPage,
         );
+        const aheadIdx = manualSafeAheadIndex(flow, mi, candidateAheadIdx);
         if (aheadIdx > mi && hereId !== 'unknown' && !milestone.guardPhases?.includes(hereId)) {
           console.log(
             `[flow] resumed mid-wizard on "${hereId}" — fast-forwarding ${aheadIdx - mi} milestone(s)`,
@@ -1843,8 +3076,51 @@ export async function runFlows(
 
         ctx.stepsToReproduce.push(milestone.goal);
         lastAttemptedIndex = mi;
-        const { step, marker, execution } = await runMilestone(deps, flow, milestone, mi, ctx, authCtx, runMode);
+        const {
+          step,
+          marker,
+          execution,
+          manualEvidence: newManualEvidence,
+        } = await runMilestone(
+          deps,
+          flow,
+          milestone,
+          mi,
+          ctx,
+          authCtx,
+          runMode,
+          manualEvidence,
+          visitedPageIds,
+        );
+        if (milestone.manualContractAudit && step.result.verdict === 'fail') {
+          step.result.verdict = 'needs-review';
+          step.result.reasons.push(
+            'This manual audit is independent; keeping it unresolved so later checklist items are still tested',
+          );
+          if (step.artifactDir) {
+            patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
+          }
+        }
         scenario.steps.push(step);
+        manualEvidence.push(...newManualEvidence);
+        if (milestone.manualContractAudit && step.result.verdict !== 'pass') {
+          manualAuditFailures.push(
+            `item ${milestone.manualContractItem ?? milestone.id}: ${step.result.verdict}`,
+          );
+        }
+        if (
+          flow.manualContract &&
+          isManualFinalProofMilestone(milestone) &&
+          manualAuditFailures.length > 0
+        ) {
+          step.result.verdict = 'fail';
+          step.result.reasons.push(
+            `Manual contract is incomplete because audit checks remain unresolved: ${manualAuditFailures.join(', ')}`,
+          );
+          if (step.artifactDir) {
+            patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
+          }
+        }
         milestoneExecutions.push({ milestoneId: milestone.id, verdict: step.result.verdict, execution });
         if (step.result.verdict === 'fail') {
           const remaining = flow.milestones.length - (mi + 1);
@@ -1859,7 +3135,12 @@ export async function runFlows(
           // explicitly skipped (untested due to the upstream break) rather than
           // silently dropping them (old `break` behavior) or running them from a
           // corrupted position and minting an untrustworthy verdict.
-          const recovered = await tryRecoverAfterBreak(deps, flow, mi + 1);
+          const recovered = await tryRecoverAfterBreak(
+            deps,
+            flow,
+            mi + 1,
+            visitedPageIds,
+          );
           if (recovered) {
             console.log(
               `[flow] milestone ${milestone.id} failed — recovered position; continuing to test remaining ${remaining} milestone(s)`,
@@ -1877,7 +3158,7 @@ export async function runFlows(
         }
 
         // QA probes: back/forward, matrices, edit sweeps — probe failures never abort the flow
-        if (!opts.quick) {
+        if (shouldRunMilestoneProbes(flow, opts.quick)) {
           const pageIdBeforeProbes = currentPageId(deps);
           const page = deps.state.sitemap.pages[pageIdBeforeProbes];
           const probes = await runProbesForMilestone(probeCtx, flow, milestone, page, {
@@ -2021,7 +3302,7 @@ export async function runFlows(
       terminalArtifactVerified,
       allRecipesPresent: hasEveryMilestoneRecipe(state, flow),
     });
-    console.log(`[flow] lifecycle: ${flow.status} — ${lifecycleMessage}`);
+    console.log(`[flow] lifecycle: ${flowRunMode(flow)} — ${lifecycleMessage}`);
 
     // Navigation/state-loss breakage (back/forward, abandon/resume) is a REAL,
     // first-class product bug — the user explicitly wants it reported, not buried

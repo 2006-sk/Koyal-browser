@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autoqa — production architecture decision</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ─── tokens: validated dark-surface steps ─────────────────────────── */
+:root{
+  --surface-0:#111110;
+  --surface-1:#1a1a19;
+  --surface-2:#222220;
+  --surface-3:#2b2b28;
+  --hairline:#383835;
+  --ink:#ffffff;
+  --ink-2:#c3c2b7;
+  --ink-3:#8a897f;
+
+  /* status palette — fixed, never themed. always paired with icon + label */
+  --good:#0ca30c;
+  --warning:#fab219;
+  --serious:#ec835a;
+  --critical:#d03b3b;
+
+  /* categorical, dark steps */
+  --blue:#3987e5;
+  --orange:#d95926;
+  --aqua:#199e70;
+  --yellow:#c98500;
+  --violet:#9085e9;
+
+  --r:14px;
+  --mono:"JetBrains Mono",ui-monospace,monospace;
+  --display:"Syne","JetBrains Mono",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  background:var(--surface-0);color:var(--ink);
+  font-family:var(--mono);font-size:14px;line-height:1.8;
+  -webkit-font-smoothing:antialiased;
+  overflow-x:hidden;
+}
+/* grain overlay — texture, not decoration for its own sake */
+body::after{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:9999;
+  opacity:.035;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.wrap{max-width:1280px;margin:0 auto;padding:0 28px 160px}
+
+/* ─── chips & labels ───────────────────────────────────────────────── */
+.chip{
+  display:inline-flex;align-items:center;gap:7px;
+  font-family:var(--mono);font-size:10.5px;font-weight:700;
+  letter-spacing:.16em;text-transform:uppercase;
+  padding:6px 12px;border-radius:999px;
+  border:1px solid var(--hairline);color:var(--ink-2);
+  background:var(--surface-2);white-space:nowrap;
+}
+.chip.hot{border-color:color-mix(in oklab,var(--warning) 45%,transparent);color:var(--warning);background:color-mix(in oklab,var(--warning) 9%,var(--surface-1))}
+.chip.cool{border-color:color-mix(in oklab,var(--aqua) 45%,transparent);color:var(--aqua);background:color-mix(in oklab,var(--aqua) 9%,var(--surface-1))}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+
+/* ─── hero ─────────────────────────────────────────────────────────── */
+header.hero{
+  position:relative;padding:106px 0 80px;
+  border-bottom:1px solid var(--hairline);margin-bottom:80px;
+}
+header.hero::before{
+  content:"";position:absolute;inset:-40% -20% auto -20%;height:520px;z-index:-1;
+  background:
+    radial-gradient(46% 60% at 18% 0%, color-mix(in oklab,var(--warning) 16%,transparent), transparent 70%),
+    radial-gradient(40% 55% at 82% 12%, color-mix(in oklab,var(--aqua) 15%,transparent), transparent 72%);
+  filter:blur(14px);
+}
+.eyebrow{display:flex;gap:11px;flex-wrap:wrap;margin-bottom:34px}
+h1{
+  font-family:var(--display);font-weight:800;
+  font-size:clamp(38px,6.4vw,78px);line-height:.98;letter-spacing:-.03em;
+  margin-bottom:28px;
+}
+h1 em{font-style:normal;color:var(--warning)}
+h1 .slash{color:var(--ink-3);font-weight:600}
+.lede{max-width:74ch;color:var(--ink-2);font-size:15.5px;line-height:1.98}
+.lede strong{color:var(--ink);font-weight:700}
+
+/* ─── stat tiles (hero numbers — no plot, so no hover layer) ───────── */
+.tiles{
+  display:grid;gap:18px;margin:60px 0 0;
+  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+}
+.tile{
+  background:var(--surface-1);border:1px solid var(--hairline);
+  border-radius:var(--r);padding:27px 24px 25px;position:relative;overflow:hidden;
+  transition:transform .18s ease,border-color .18s ease;
+}
+.tile:hover{transform:translateY(-3px);border-color:var(--ink-3)}
+.tile .rail{position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--blue)}
+.tile.w .rail{background:var(--warning)} .tile.c .rail{background:var(--critical)}
+.tile.a .rail{background:var(--aqua)}    .tile.o .rail{background:var(--orange)}
+.tile .n{
+  font-family:var(--display);font-weight:800;letter-spacing:-.035em;
+  font-size:clamp(30px,3.4vw,42px);line-height:1;font-variant-numeric:tabular-nums;
+  display:block;margin-bottom:13px;
+}
+.tile .n small{font-size:.48em;font-weight:700;color:var(--ink-3);letter-spacing:0}
+.tile .k{font-size:10.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);display:block;margin-bottom:10px}
+.tile .s{font-size:12.5px;color:var(--ink-2);line-height:1.74}
+
+/* ─── sections ─────────────────────────────────────────────────────── */
+section{margin-top:136px;scroll-margin-top:24px}
+.shead{display:flex;align-items:flex-start;gap:22px;margin-bottom:18px;flex-wrap:wrap}
+.snum{
+  font-family:var(--display);font-weight:800;font-size:clamp(46px,6vw,74px);
+  line-height:.82;letter-spacing:-.05em;
+  -webkit-text-stroke:1.5px var(--ink-3);color:transparent;flex:none;
+}
+h2{font-family:var(--display);font-weight:800;font-size:clamp(25px,3.4vw,38px);letter-spacing:-.025em;line-height:1.08}
+h2 span{color:var(--ink-3);font-weight:600}
+.sdek{max-width:80ch;color:var(--ink-2);font-size:14px;margin:20px 0 46px;line-height:1.98}
+.sdek strong{color:var(--ink)}
+h3{
+  font-family:var(--display);font-weight:700;font-size:17px;letter-spacing:-.01em;
+  margin:66px 0 26px;display:flex;align-items:center;gap:11px;
+}
+h3::before{content:"";width:20px;height:2px;background:var(--ink-3);flex:none}
+
+/* ─── tables ───────────────────────────────────────────────────────── */
+.tscroll{
+  overflow-x:auto;border:1px solid var(--hairline);border-radius:var(--r);
+  background:var(--surface-1);
+}
+table{width:100%;border-collapse:collapse;min-width:940px}
+thead th{
+  position:sticky;top:0;z-index:2;
+  background:var(--surface-3);color:var(--ink-3);
+  font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  text-align:left;padding:17px 16px;border-bottom:1px solid var(--hairline);white-space:nowrap;
+}
+tbody td{padding:20px 16px;border-bottom:1px solid color-mix(in oklab,var(--hairline) 60%,transparent);vertical-align:top;font-size:12.5px;color:var(--ink-2)}
+tbody tr{transition:background .14s ease}
+tbody tr:hover{background:var(--surface-2)}
+tbody tr:last-child td{border-bottom:none}
+td.rk{font-family:var(--display);font-weight:800;font-size:17px;color:var(--ink-3);width:44px;font-variant-numeric:tabular-nums}
+tr.win td.rk{color:var(--good)}
+td.opt{color:var(--ink);font-weight:700;font-size:13px;white-space:nowrap}
+td.opt small{display:block;font-weight:400;font-size:11px;color:var(--ink-3);margin-top:5px;white-space:normal;max-width:26ch}
+tr.win{background:color-mix(in oklab,var(--good) 7%,transparent)}
+tr.win:hover{background:color-mix(in oklab,var(--good) 11%,transparent)}
+tr.win td{border-bottom-color:color-mix(in oklab,var(--good) 22%,transparent)}
+tr.win td.rk{position:relative}
+tr.win td.rk::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--good)}
+tr.dead td.opt{color:var(--ink-2)}
+.no{color:var(--ink-3)}
+.hard{color:var(--critical);font-weight:700}
+
+/* verdict = icon + label + color (never colour alone) */
+.v{display:inline-flex;align-items:center;gap:7px;font-size:10.5px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}
+.v i{font-style:normal;width:15px;height:15px;border-radius:4px;display:grid;place-items:center;font-size:10px;flex:none;line-height:1}
+.v.best   {color:var(--good)}     .v.best i   {background:var(--good);color:#03210b}
+.v.strong {color:var(--good)}     .v.strong i {background:color-mix(in oklab,var(--good) 26%,var(--surface-2));color:var(--good)}
+.v.warn   {color:var(--warning)}  .v.warn i   {background:var(--warning);color:#251803}
+.v.bad    {color:var(--serious)}  .v.bad i    {background:color-mix(in oklab,var(--serious) 26%,var(--surface-2));color:var(--serious)}
+.v.dq     {color:var(--critical)} .v.dq i     {background:var(--critical);color:#fff}
+
+/* ─── cards ────────────────────────────────────────────────────────── */
+.grid{display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(310px,1fr))}
+.grid.two{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.card{
+  background:var(--surface-1);border:1px solid var(--hairline);
+  border-radius:var(--r);padding:29px;position:relative;
+  transition:transform .18s ease,border-color .18s ease;
+}
+.card:hover{transform:translateY(-3px);border-color:var(--ink-3)}
+.card h4{
+  font-family:var(--display);font-weight:700;font-size:15.5px;letter-spacing:-.01em;
+  color:var(--ink);margin-bottom:7px;display:flex;align-items:center;gap:9px;
+}
+.card .why{font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);margin-bottom:18px}
+.card p{font-size:12.5px;color:var(--ink-2);line-height:1.88}
+.card p+p,.card ul+p{margin-top:15px}
+.card p b{color:var(--ink)}
+.card ul{list-style:none;margin-top:18px;display:grid;gap:14px}
+.card li{font-size:12.5px;color:var(--ink-2);padding-left:19px;position:relative;line-height:1.82}
+.card li::before{content:"";position:absolute;left:0;top:8px;width:7px;height:7px;border-radius:2px;background:var(--ink-3)}
+.card li.y::before{background:var(--good)} .card li.n::before{background:var(--critical)}
+.card.hero-card{
+  border-color:color-mix(in oklab,var(--good) 42%,transparent);
+  background:linear-gradient(180deg,color-mix(in oklab,var(--good) 9%,var(--surface-1)),var(--surface-1));
+}
+.card.hero-card::before{
+  content:"";position:absolute;inset:-1px;border-radius:var(--r);z-index:-1;
+  background:linear-gradient(130deg,var(--good),transparent 42%,transparent 60%,var(--aqua));
+  opacity:.5;
+}
+.card.reject{border-left:3px solid var(--critical)}
+.card.caution{border-left:3px solid var(--warning)}
+.card.pick{border-left:3px solid var(--good)}
+.rank-badge{
+  font-family:var(--display);font-weight:800;font-size:11px;letter-spacing:.06em;
+  padding:3px 8px;border-radius:6px;background:var(--good);color:#03210b;flex:none;
+}
+
+/* ─── inversion table ──────────────────────────────────────────────── */
+.inv td:first-child{color:var(--ink);font-weight:500;width:31%}
+.inv .h{color:var(--critical)} .inv .g{color:var(--good)}
+
+/* ─── flow diagram ─────────────────────────────────────────────────── */
+.flow{display:grid;gap:22px;grid-template-columns:1fr auto 1fr;align-items:stretch;margin-top:8px}
+@media(max-width:860px){.flow{grid-template-columns:1fr}}
+.stage{
+  background:var(--surface-1);border:1px solid var(--hairline);border-radius:var(--r);
+  padding:29px;position:relative;overflow:hidden;
+}
+.stage.s1{border-top:3px solid var(--aqua)}
+.stage.s2{border-top:3px solid var(--warning)}
+.stage .st{font-size:10px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);margin-bottom:13px}
+.stage h4{font-family:var(--display);font-weight:800;font-size:19px;margin-bottom:17px;letter-spacing:-.02em}
+.stage ol{list-style:none;display:grid;gap:14px;counter-reset:s}
+.stage li{font-size:12.5px;color:var(--ink-2);padding-left:26px;position:relative;line-height:1.8}
+.stage li::before{
+  counter-increment:s;content:counter(s);position:absolute;left:0;top:1px;
+  width:17px;height:17px;border-radius:5px;background:var(--surface-3);color:var(--ink-3);
+  font-size:9.5px;font-weight:700;display:grid;place-items:center;
+}
+.arrow{display:grid;place-items:center;gap:6px;align-content:center;padding:0 10px;color:var(--ink-3)}
+.arrow .g{
+  font-family:var(--display);font-weight:800;font-size:30px;line-height:1;
+  color:var(--warning);
+}
+.arrow .l{font-size:9.5px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;text-align:center;line-height:1.4}
+@media(max-width:860px){.arrow .g{transform:rotate(90deg)}}
+
+/* ─── callout ──────────────────────────────────────────────────────── */
+.callout{
+  border-radius:var(--r);padding:29px 30px;margin-top:22px;
+  background:color-mix(in oklab,var(--critical) 11%,var(--surface-1));
+  border:1px solid color-mix(in oklab,var(--critical) 34%,transparent);
+}
+.callout.amber{background:color-mix(in oklab,var(--warning) 10%,var(--surface-1));border-color:color-mix(in oklab,var(--warning) 32%,transparent)}
+.callout .ct{font-family:var(--display);font-weight:800;font-size:14px;letter-spacing:.01em;display:flex;align-items:center;gap:9px;margin-bottom:15px}
+.callout p{font-size:12.5px;color:var(--ink-2);line-height:1.9}
+.callout p+p{margin-top:14px}
+.callout b{color:var(--ink)}
+code{
+  font-family:var(--mono);font-size:.9em;padding:1.5px 5px;border-radius:4px;
+  background:var(--surface-3);color:var(--warning);border:1px solid var(--hairline);
+}
+footer{margin-top:136px;padding-top:34px;border-top:1px solid var(--hairline);color:var(--ink-3);font-size:11.5px;line-height:1.8}
+footer a{color:var(--ink-2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ══════════════════ HERO ══════════════════ -->
+<header class="hero">
+  <div class="eyebrow">
+    <span class="chip hot"><span class="dot" style="background:var(--warning)"></span>Architecture decision</span>
+    <span class="chip">beta · xp · filmarena — koyal ai</span>
+    <span class="chip cool">measured 2026-07-29</span>
+  </div>
+  <h1>Two stacked agents<span class="slash">.</span><br>One <em>finds</em><span class="slash">,</span> one <em>fixes</em><span class="slash">.</span></h1>
+  <p class="lede">
+    Ranking ten hosting options twice — because the two stages are opposite workloads.
+    <strong>Stage 1 (autoqa)</strong> is scheduled, stateful and hours-long. <strong>Stage 2 (the fix agent)</strong>
+    is short, stateless and task-triggered. The same table ranked for both produces
+    <strong>almost inverted orders</strong>, which is the whole point of doing it twice.
+    Every number below was measured from this repo, not estimated.
+  </p>
+
+  <div class="tiles">
+    <div class="tile a"><span class="rail"></span>
+      <span class="k">Runs measured</span>
+      <span class="n">157</span>
+      <span class="s">Real product-site runs in <code>reports/</code></span>
+    </div>
+    <div class="tile"><span class="rail"></span>
+      <span class="k">Median run</span>
+      <span class="n">6.7<small> min</small></span>
+      <span class="s">Mean 16.6 · longest <b>133 min</b></span>
+    </div>
+    <div class="tile c"><span class="rail"></span>
+      <span class="k">Over Lambda's cap</span>
+      <span class="n">33<small>%</small></span>
+      <span class="s">51 of 157 exceed 15 min — the cap is a maximum, not a knob</span>
+    </div>
+    <div class="tile o"><span class="rail"></span>
+      <span class="k">Artifacts on disk</span>
+      <span class="n">4.1<small> GB</small></span>
+      <span class="s">From <em>intermittent local</em> runs alone</span>
+    </div>
+    <div class="tile w"><span class="rail"></span>
+      <span class="k">Learned state</span>
+      <span class="n">128<small> MB</small></span>
+      <span class="s">Human-taught statements — not a cache</span>
+    </div>
+  </div>
+</header>
+
+<!-- ══════════════════ STAGE 1 ══════════════════ -->
+<section id="stage1">
+  <div class="shead"><span class="snum">01</span>
+    <div>
+      <h2>Hosting autoqa <span>— the agent that finds bugs</span></h2>
+      <div class="eyebrow" style="margin:14px 0 0">
+        <span class="chip cool">scheduled · ~2 runs/day</span><span class="chip">stateful</span>
+        <span class="chip">real chromium</span><span class="chip">hours-long</span><span class="chip">zero GPU</span>
+      </div>
+    </div>
+  </div>
+  <p class="sdek">
+    Requirements straight out of the code: drives a real Chromium via <code>agent-browser</code>;
+    a third of runs exceed 15 minutes and deep runs take 33–60; <strong>128 MB of learned state must survive
+    restarts</strong>; 4.1 GB of artifacts need offloading; wedges need a supervisor that restarts them;
+    and it needs <strong>no GPU at all</strong> — the intelligence is a remote API call.
+    At the real cadence — <strong>~2 runs/day, 30–60 min each</strong> — the box is busy 1–2 h and
+    <strong>idle 22–23 h</strong>, which is what decides the ranking below.
+  </p>
+
+  <div class="tscroll">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Option</th><th>Max run</th><th>Real Chromium</th><th>Persistent state</th>
+        <th>GPU</th><th>Cost / mo</th><th>Ops</th><th>Verdict</th>
+      </tr></thead>
+      <tbody>
+        <tr class="win">
+          <td class="rk">1</td>
+          <td class="opt">Scheduled container job<small>ECS Fargate · Azure Container Apps Jobs</small></td>
+          <td><b style="color:var(--good)">Unlimited</b></td><td>Container</td><td>EFS / Azure Files</td>
+          <td class="no">None</td><td><b style="color:var(--good)">~$6–9</b></td><td>Low–med</td>
+          <td><span class="v best"><i>★</i>Best</span></td>
+        </tr>
+        <tr>
+          <td class="rk">2</td>
+          <td class="opt">EC2 always-on<small>m5.large or t3.medium + systemd</small></td>
+          <td>Unlimited</td><td>Native</td><td>EBS, included</td>
+          <td class="no">None</td><td>$30–90</td><td>Low</td>
+          <td><span class="v strong"><i>✓</i>Runner-up</span></td>
+        </tr>
+        <tr>
+          <td class="rk">3</td>
+          <td class="opt">Fly.io Machine<small>auto-stop when idle</small></td>
+          <td>Unlimited</td><td>Container</td><td>Volumes</td>
+          <td class="no">None</td><td>~$5–15</td><td>Low</td>
+          <td><span class="v strong"><i>✓</i>Strong</span></td>
+        </tr>
+        <tr>
+          <td class="rk">4</td>
+          <td class="opt">Hetzner / DO VPS<small>cheapest flat rate, outside AWS</small></td>
+          <td>Unlimited</td><td>Native</td><td>Included</td>
+          <td class="no">None</td><td>$15–25</td><td>Low</td>
+          <td><span class="v strong"><i>✓</i>Strong</span></td>
+        </tr>
+        <tr>
+          <td class="rk">5</td>
+          <td class="opt">GitHub Actions cron</td>
+          <td>6 h / job</td><td>Yes</td><td><span class="no">Cache — best-effort</span></td>
+          <td class="no">None</td><td>~2.7k min</td><td>Very low</td>
+          <td><span class="v warn"><i>!</i>Prototype</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">6</td>
+          <td class="opt">AWS Lambda</td>
+          <td class="hard">15 min hard cap</td><td>Painful layer</td><td><span class="no">None</span></td>
+          <td class="no">None</td><td>Cheap but moot</td><td>Medium</td>
+          <td><span class="v dq"><i>✕</i>Disqualified</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">7</td>
+          <td class="opt">RunPod</td>
+          <td>Unlimited</td><td>Container</td><td>Volumes</td>
+          <td class="hard">None needed</td><td>GPU rates</td><td>Medium</td>
+          <td><span class="v bad"><i>✕</i>Wrong HW</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">8</td>
+          <td class="opt">Replicas<small>tryreplicas.com</small></td>
+          <td>In-session only</td><td>Real VM + Docker</td><td class="hard">Deleted after 7 d idle</td>
+          <td class="no">None</td><td>Per-minute</td><td>Low</td>
+          <td><span class="v bad"><i>✕</i>No scheduler</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">9</td>
+          <td class="opt">Cognition · Devin</td>
+          <td class="no">—</td><td class="no">—</td><td class="no">—</td>
+          <td class="no">—</td><td>Agent-tier</td><td class="no">—</td>
+          <td><span class="v bad"><i>✕</i>Wrong category</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">10</td>
+          <td class="opt">VeilStream</td>
+          <td class="no">—</td><td class="no">No</td><td class="no">—</td>
+          <td class="no">—</td><td class="no">—</td><td class="no">—</td>
+          <td><span class="v bad"><i>✕</i>Not compute</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Why a scheduled container wins</h3>
+  <div class="grid">
+    <div class="card hero-card">
+      <h4><span class="rank-badge">WINNER</span>Scheduled container job</h4>
+      <div class="why">A fresh container per run deletes a whole class of failure</div>
+      <ul>
+        <li class="y"><b>No time cap.</b> Unlike Lambda, a Fargate task or Container Apps Job runs as long as it needs — a 133-minute run is fine.</li>
+        <li class="y"><b>Kills the process-leak class outright.</b> This repo documents orphaned daemons piling up on a long-lived machine — 13 at <code>PPID=1</code> after one run, 19 agent-browser + 15 Chrome overnight, 8.4 M swapouts degrading CDP. <b>A container that exits takes all of it with it.</b> Every run starts genuinely clean.</li>
+        <li class="y"><b>Makes the <code>recycle()</code> collateral-damage bug impossible.</b> That broad-kill fallback has fired for real 4+ times, killing other sessions' browsers. One session per container means there is nothing else to kill.</li>
+        <li class="y"><b>You pay for ~60 hours, not 730.</b> 2 vCPU / 8 GB at ~2 runs/day ≈ <b>$6–9/mo</b> against $30–90 for a box idle 95% of the time.</li>
+        <li class="y"><b>Nothing to patch.</b> No OS upkeep, no drifting host.</li>
+      </ul>
+      <p><b>Azure equivalent:</b> Container Apps Jobs, which takes both cron and event triggers — so it also covers stage 2 if you build that yourself.</p>
+    </div>
+    <div class="card pick">
+      <h4><span class="v strong"><i>✓</i></span>EC2 — the honest runner-up</h4>
+      <div class="why">Simpler state, easier debugging, more money</div>
+      <p>Two real advantages: <b>EBS is simpler than an EFS mount</b> for the 128 MB of learned state, and you can
+      <b>SSH in while a daemon is wedged</b> — which matters on a project whose hardest bugs were found by live
+      instrumentation rather than log-reading.</p>
+      <p>The cost gap is ~$25–80/mo, small in absolute terms. Pick this if operational familiarity is worth more
+      to you than the clean-slate guarantee.</p>
+      <p><b>Burstable is fine here now.</b> The earlier warning about T3 credit drain assumed back-to-back cycling.
+      At ~2 runs/day with 22 idle hours, credits replenish faster than they drain — <code>t3.medium</code> at
+      ~$30/mo is legitimate.</p>
+    </div>
+    <div class="card pick">
+      <h4><span class="v strong"><i>✓</i></span>Run <code>test --flow</code>, never <code>run</code></h4>
+      <div class="why">The command matters as much as the host</div>
+      <p>The requirement is <b>certain selected flows</b>, and <code>test --flow &lt;id&gt;</code> is the only command
+      that expresses it. <code>run</code> tests <em>every</em> approved flow.</p>
+      <p>Worse: CLAUDE.md warns <code>run</code> skips exploration <em>only</em> if the sitemap has pages
+      <b>and</b> approved flows. On a fresh container with a failed EFS mount it silently triggers a
+      <b>full exploration</b> — the expensive cold-start path, re-proposing flows nobody approved.
+      <b><code>explore</code> must be human-gated and unreachable by the schedule.</b></p>
+    </div>
+  </div>
+
+  <h3>Why not the others</h3>
+  <div class="grid">
+    <div class="card reject">
+      <h4><span class="v dq"><i>✕</i></span>AWS Lambda</h4>
+      <div class="why">Disqualified on one measured fact</div>
+      <p><b>The 15-minute ceiling is a maximum, not a tunable.</b> 51 of 157 measured runs exceed it, and
+      <em>every</em> deep run does — they'd be killed mid-flow with no verdict recorded.</p>
+      <p>Secondary: no persistent disk (state would need EFS bolted on), a 10 GB <code>/tmp</code> ceiling for
+      screenshots, and packaging Chromium into a layer is fiddly. <b>Still useful as a trigger</b> —
+      EventBridge → tiny Lambda → start the real job.</p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v bad"><i>✕</i></span>RunPod</h4>
+      <div class="why">Paying for silicon you never touch</div>
+      <p>A GPU cloud — A100s and H100s by the hour, built for training and serving models where the GPU
+      <em>is</em> the point. <b>autoqa needs zero GPU:</b> the intelligence is a remote Anthropic API call,
+      not a local model.</p>
+      <p>On the CPU-pod side it's a bare container host with thin cron, secrets, IAM and monitoring
+      tooling — strictly worse than options 1–4 at a higher price.</p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v bad"><i>✕</i></span>Replicas <span class="chip" style="font-size:9px">re-check</span></h4>
+      <div class="why">Right VM, wrong trigger model — and it wins stage 2</div>
+      <p>It <em>is</em> a real VM with Docker, so autoqa could technically execute there — the closest of the
+      four non-compute options. But the model is <b>task-in → PR-out</b>, not cron-in → report-out.</p>
+      <ul>
+        <li class="n"><b>No scheduler.</b> Nothing fires work every N hours; a ticket or message does.</li>
+        <li class="n"><b>Sleeps idle, deleted after 7 days.</b> Precisely the wrong durability guarantee for state you must never lose.</li>
+        <li class="n"><b>Per runtime-minute billing.</b> 24/7 almost certainly exceeds a $70 dedicated VM.</li>
+      </ul>
+      <p>Every one of those flips to an advantage in stage 2. <b>Keep it — just for the other half.</b></p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v bad"><i>✕</i></span>Cognition · Devin</h4>
+      <div class="why">Wrong category, not wrong quality</div>
+      <p>Devin is an AI software engineer that works in its own cloud sandbox: you hand it a ticket, it
+      writes code and opens PRs. Priced in agent-style compute units.</p>
+      <p><b>Cognition doesn't sell scheduled compute.</b> You already <em>have</em> an autonomous agent —
+      autoqa — and you need somewhere to host it. Paying agent-grade rates to babysit an
+      <code>npm run qa</code> loop is expensive and architecturally backwards. It belongs in stage 2.</p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v bad"><i>✕</i></span>VeilStream</h4>
+      <div class="why">Not a compute platform at all</div>
+      <p>A lightweight <b>proxy in front of a PostgreSQL database</b> that masks or hides sensitive fields
+      per-user, so teams work against production-<em>like</em> data without touching real PII. It also spins
+      ephemeral PR-preview environments from a <code>docker-compose.yml</code>.</p>
+      <p>It cannot host a scheduled job. <b>But it is adjacent to a real problem you have</b> — see the
+      closing note on those 4.1 GB of screenshots.</p>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>GitHub Actions</h4>
+      <div class="why">Fine to prototype, too weak to live on</div>
+      <p>The 6-hour job cap is ample and the ergonomics are excellent. The problem is <b>state</b>:
+      128 MB of learned statements would live in cache/artifacts, which is a best-effort store, not a
+      durable one — and losing it means re-teaching the agent.</p>
+      <p>Running back-to-back 45-minute jobs also burns Actions minutes at a rate that stops being cheap.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════ STAGE 2 ══════════════════ -->
+<section id="stage2">
+  <div class="shead"><span class="snum">02</span>
+    <div>
+      <h2>Hosting the fix agent <span>— the Claude that closes the ticket</span></h2>
+      <div class="eyebrow" style="margin:14px 0 0">
+        <span class="chip hot">task-triggered</span><span class="chip">stateless</span>
+        <span class="chip">ephemeral</span><span class="chip">one repo checkout</span><span class="chip">minutes, not hours</span>
+      </div>
+    </div>
+  </div>
+  <p class="sdek">
+    The workload is the <strong>opposite</strong> of stage 1, so the ranking flips. Right now autoqa finds a bug,
+    posts four fields to Slack and stops — a human picks it up. That is exactly a coding agent's input.
+  </p>
+
+  <div class="tscroll">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Option</th><th>Trigger model</th><th>Isolation</th><th>Opens PRs</th>
+        <th>Runs Claude</th><th>Cost shape</th><th>Verdict</th>
+      </tr></thead>
+      <tbody>
+        <tr class="win">
+          <td class="rk">1</td>
+          <td class="opt">Replicas<small>tryreplicas.com</small></td>
+          <td><b style="color:var(--good)">Task / ticket</b></td><td>VM per task</td><td>Native</td>
+          <td><b style="color:var(--good)">Claude Code</b></td><td>Per runtime-minute</td>
+          <td><span class="v best"><i>★</i>Best</span></td>
+        </tr>
+        <tr>
+          <td class="rk">2</td>
+          <td class="opt">Cognition · Devin</td>
+          <td>Task / ticket</td><td>Own sandbox</td><td>Native</td>
+          <td><span class="no">Proprietary agent</span></td><td>Agent-tier units</td>
+          <td><span class="v strong"><i>✓</i>Strong</span></td>
+        </tr>
+        <tr>
+          <td class="rk">3</td>
+          <td class="opt">GitHub Actions<small>+ Claude Agent SDK</small></td>
+          <td>Issue label / webhook</td><td>Runner per job</td><td>Native</td>
+          <td>You wire it</td><td>Actions minutes</td>
+          <td><span class="v strong"><i>✓</i>Strong</span></td>
+        </tr>
+        <tr>
+          <td class="rk">4</td>
+          <td class="opt">Azure Container Apps Jobs<small>or ECS Fargate · the Azure answer</small></td>
+          <td>Cron + event</td><td>Container per task</td><td>You wire it</td>
+          <td>Agent SDK</td><td>Per task-second</td>
+          <td><span class="v strong"><i>✓</i>Best DIY</span></td>
+        </tr>
+        <tr>
+          <td class="rk">5</td>
+          <td class="opt">Fly.io Machines</td>
+          <td>API-created per job</td><td>Machine per job</td><td>You wire it</td>
+          <td>Agent SDK</td><td>Per second</td>
+          <td><span class="v strong"><i>✓</i>Good DIY</span></td>
+        </tr>
+        <tr>
+          <td class="rk">6</td>
+          <td class="opt">EC2 / VPS</td>
+          <td><span class="no">You build the queue</span></td><td><span class="no">Manual</span></td><td>You wire it</td>
+          <td>Agent SDK</td><td>Always-on</td>
+          <td><span class="v warn"><i>!</i>Wrong shape</span></td>
+        </tr>
+        <tr>
+          <td class="rk">7</td>
+          <td class="opt">AWS Lambda</td>
+          <td>Event</td><td>Invocation</td><td>You wire it</td>
+          <td>Agent SDK</td><td>Per ms</td>
+          <td><span class="v warn"><i>!</i>Cap risk</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">8</td>
+          <td class="opt">RunPod</td>
+          <td>Pod lifecycle</td><td>Container</td><td>You wire it</td>
+          <td>Agent SDK</td><td>GPU rates</td>
+          <td><span class="v bad"><i>✕</i>Zero GPU needed</span></td>
+        </tr>
+        <tr class="dead">
+          <td class="rk">9</td>
+          <td class="opt">VeilStream</td>
+          <td class="no">—</td><td class="no">—</td><td class="no">No</td>
+          <td class="no">No</td><td class="no">—</td>
+          <td><span class="v bad"><i>✕</i>Not compute</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Why Replicas wins here after losing badly for stage 1</h3>
+  <p class="sdek" style="margin-bottom:18px">Every trait that disqualified it as autoqa's host is either irrelevant or an outright advantage for a fix agent. That is the clearest signal that these are genuinely two different problems.</p>
+  <div class="tscroll">
+    <table class="inv" style="min-width:760px">
+      <thead><tr><th>Trait</th><th>As autoqa's host (stage 1)</th><th>As the fix agent (stage 2)</th></tr></thead>
+      <tbody>
+        <tr><td>No scheduler — task-triggered</td><td class="h">✕ &nbsp;You need cron</td><td class="g">✓ &nbsp;A fix <em>is</em> triggered by a ticket</td></tr>
+        <tr><td>Built around a repo checkout</td><td class="h">✕ &nbsp;autoqa tests a <em>deployed site</em>, not a repo</td><td class="g">✓ &nbsp;A fix <em>is</em> repo work</td></tr>
+        <tr><td>Deleted after 7 days idle</td><td class="h">✕ &nbsp;128 MB of learned state must never vanish</td><td class="g">✓ &nbsp;Stateless — you <em>want</em> the cleanup</td></tr>
+        <tr><td>Per-runtime-minute billing</td><td class="h">✕ &nbsp;&gt;$70/mo running always</td><td class="g">✓ &nbsp;Cheap for ~20-minute bursts</td></tr>
+        <tr><td>Spawns Claude Code specifically</td><td>— &nbsp;Irrelevant</td><td class="g">✓ &nbsp;Exactly the "Claude fix" in the design</td></tr>
+        <tr><td>Isolated VM with full dev env</td><td>— &nbsp;Nice, not needed</td><td class="g">✓ &nbsp;Parallel fixes never fight over git state</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="grid two" style="margin-top:26px">
+    <div class="card hero-card">
+      <h4><span class="rank-badge">WINNER</span>Replicas</h4>
+      <div class="why">It is, almost literally, this product</div>
+      <p>A YC-backed cloud coding-agent platform. You assign a task from GitHub, Slack, Linear or a
+      dashboard; it spawns <b>Claude Code</b> (or Codex / Cursor / Opencode) in an isolated VM holding your
+      repo and a real dev environment — Docker, npm, databases.</p>
+      <p>The agent <b>verifies its own work locally</b>, opens a PR, then reads CI failures and code-review
+      comments and iterates. That is stage 2, described by its own marketing.</p>
+      <ul>
+        <li class="y">Feedback loop is built in — it fixes its own CI failures rather than handing you a red PR.</li>
+        <li class="y">Preview URLs from configured environments, so a reviewer can see the fix running.</li>
+        <li class="y">No code stored in their databases; it stays in your connected repo and isn't used for training.</li>
+      </ul>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>Two things to check before committing</h4>
+      <div class="why">Both are dealbreakers if they apply to you</div>
+      <p><b>1. Jira is not a listed integration.</b> Documented triggers are GitHub, Slack, Linear and a
+      dashboard. If Jira is fixed for you, either bridge Jira → GitHub issue, drive it via its API, or drop
+      to option 4 and build stage 2 yourself.</p>
+      <p><b>2. It runs on its own cloud, not Azure.</b> If Claude <em>and</em> the compute must both sit inside
+      Azure for policy reasons, Replicas is out and it's <b>Azure Container Apps Jobs + Claude Agent SDK</b>.</p>
+      <p>That second point is the real fork in the design — see the constraint card below.</p>
+    </div>
+  </div>
+
+  <h3>Why not the others</h3>
+  <div class="grid">
+    <div class="card pick">
+      <h4><span class="v strong"><i>✓</i></span>Cognition · Devin — #2</h4>
+      <div class="why">Same category, less flexibility</div>
+      <p>Genuinely purpose-built for this and more mature on the enterprise side. Two reasons it lands
+      second: it's <b>one proprietary agent</b> where Replicas lets you pick Claude Code, Codex, Cursor or
+      Opencode; and agent-tier pricing is higher than per-runtime-minute for the same work.</p>
+      <p>If you specifically want <em>a Claude fix</em>, Replicas naming Claude Code as a first-class option
+      is a direct match rather than an approximation.</p>
+    </div>
+    <div class="card pick">
+      <h4><span class="v strong"><i>✓</i></span>GitHub Actions — #3, and the best pilot</h4>
+      <div class="why">Near-zero new infrastructure</div>
+      <p>Loses stage 1 on state, wins here because <b>stage 2 has no state</b>. It's already attached to the
+      repo with secrets configured and native PR creation, and the 6-hour cap is far beyond what a fix needs.</p>
+      <p><b>Start here.</b> A workflow triggered by an issue label, running the Claude Agent SDK, on one narrow
+      bug class — that's a low-risk way to prove the loop before paying for a platform.</p>
+    </div>
+    <div class="card pick">
+      <h4><span class="v strong"><i>✓</i></span>Container Apps Jobs / Fargate — #4</h4>
+      <div class="why">The answer if Azure is mandatory</div>
+      <p>Purpose-built for per-task ephemeral containers with <b>both cron and event triggers</b> — exactly the
+      shape of "a ticket arrived, go fix it." You supply the container; the platform supplies the isolation,
+      queueing and cleanup.</p>
+      <p>Pair it with the <b>Claude Agent SDK</b> (Claude Code as a library: built-in read/write/edit/bash/grep
+      plus the agent loop) and the <code>AnthropicFoundry</code> client if billing must route through Azure.</p>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>EC2 / VPS — #6</h4>
+      <div class="why">It works; you just build what others give free</div>
+      <p>Nothing stops you running the fix agent on the same box as autoqa. But you'd hand-build the job
+      queue, per-ticket isolation, concurrency limits and workspace cleanup that options 1–5 include.</p>
+      <p>Worse, co-locating means a runaway fix agent can starve the finder — and a wedged Chromium can
+      take the fixer down with it. <b>Keep the two stages on separate compute.</b></p>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>AWS Lambda — #7</h4>
+      <div class="why">Much better here than stage 1, still poor</div>
+      <p>Stage 2 is short, so the 15-minute cap is no longer automatically fatal — but a coding agent that
+      clones a repo, reproduces a bug, fixes it and runs the test suite can <b>plausibly exceed it</b>, and you'd
+      lose the work with no partial result.</p>
+      <p>Running the product's own test suite inside a Lambda sandbox is also awkward. Options 3–5 cost the
+      same order of money with none of the ceiling.</p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v bad"><i>✕</i></span>RunPod &amp; VeilStream</h4>
+      <div class="why">Unchanged from stage 1</div>
+      <p><b>RunPod:</b> still zero GPU needed. A coding agent is I/O and API-bound; renting an H100 to run
+      <code>git clone</code> and <code>npm test</code> is pure waste.</p>
+      <p><b>VeilStream:</b> still a Postgres PII-masking proxy. It doesn't execute your code and can't open a
+      pull request.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════ THE STACK ══════════════════ -->
+<section id="stack">
+  <div class="shead"><span class="snum">03</span>
+    <div><h2>The stack, assembled <span>— find → ticket → fix → re-test</span></h2></div>
+  </div>
+  <p class="sdek">Two independently-deployed stages with a ticket queue between them. The loop closes because
+  stage 1's <strong>next cycle is the independent verification</strong> of stage 2's PR — which only means something
+  if a human merged it first.</p>
+
+  <div class="flow">
+    <div class="stage s1">
+      <div class="st">Stage 01 · scheduled</div>
+      <h4>autoqa on Fargate</h4>
+      <ol>
+        <li>EventBridge fires the task ~2×/day</li>
+        <li><code>test --flow &lt;id&gt;</code> on selected flows, headless</li>
+        <li>Verifies via DOM + console + network + vision</li>
+        <li>Files a <b>structured Jira issue</b>, posts to Slack</li>
+        <li>State on EFS, artifacts to S3 with 30-day lifecycle</li>
+      </ol>
+    </div>
+    <div class="arrow"><span class="g">&rarr;</span><span class="l">Jira<br>ticket</span></div>
+    <div class="stage s2">
+      <div class="st">Stage 02 · per-ticket</div>
+      <h4>Claude fix on Replicas</h4>
+      <ol>
+        <li>Webhook on label <code>autoqa</code></li>
+        <li>Isolated VM, repo + dev env ready</li>
+        <li>Claude Code reproduces and fixes</li>
+        <li>Verifies locally, opens a PR</li>
+        <li><b>Human reviews and merges</b> — never auto-merge</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="ct"><span class="v dq"><i>✕</i></span>Blocker — fix this before anything else ships</div>
+    <p>An unanswered prompt stalls <b>300 s</b> then takes a default. For a <b>console error</b> that default is
+    <code>noise</code> (<code>statements.ts:210</code>) — scoped <b>global</b>, and fed into
+    <code>allowedConsoleErrorPatterns</code>, which suppresses that error <b>site-wide, permanently</b>.</p>
+    <p>The codebase already knows this is dangerous: the LLM auto-noise pass <b>deliberately excludes console
+    errors</b> for exactly this reason, in its own comment. <b>The timeout default bypasses that safety property
+    at the human layer.</b> <code>Failed to fetch JSON from S3</code> is a console error — so an unattended loop
+    would teach itself to stop reporting the bug the Slack reporter exists to report.</p>
+    <p>Also: <b>approve-flows defaults to <code>all</code></b> when unanswered — auto-approving every LLM-proposed
+    flow with zero review. This project's history includes an auto-proposed flow that drove a real browser to a
+    live third-party Teachable checkout with an order ID.</p>
+  </div>
+
+  <div class="grid" style="margin-top:18px">
+    <div class="card reject">
+      <h4><span class="v dq"><i>✕</i></span>Duplicate tickets — fix before wiring Jira</h4>
+      <p>Slack dedupe groups errors <b>within one run</b>; there is no cross-run fingerprint store. So a 24/7
+      loop files a <b>new Jira ticket every cycle</b> for the same standing bug — and each one spawns a fix agent
+      burning tokens re-fixing what's already in an open PR.</p>
+    </div>
+    <div class="card reject">
+      <h4><span class="v dq"><i>✕</i></span>The agent must not silence the test</h4>
+      <p>Given a failing check, an agent can satisfy it by fixing the product <b>or by weakening the
+      assertion</b>. Scope stage 2 to the <b>product repo only</b> — never autoqa's <code>.autoqa-state</code>,
+      statements KB, or <code>verification.ts</code>. A bug that vanishes because the oracle got edited is worse
+      than the bug.</p>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>Backend bugs need the backend repo</h4>
+      <p>The S3 failure returns HTML where JSON is expected — a server-side fault. An agent can only fix that
+      with access to the service serving the endpoint. <b>Scope the pilot to front-end and harness findings.</b></p>
+    </div>
+    <div class="card caution">
+      <h4><span class="v warn"><i>!</i></span>Sequence it — don't build both at once</h4>
+      <p>Ship stage 1 with the console default fixed → add cross-run dedupe → add structured Jira issues →
+      <em>then</em> stage 2 on one narrow bug class. <b>A fix agent fed by an untrustworthy finder just automates
+      the production of bad PRs.</b></p>
+    </div>
+  </div>
+
+  <div class="callout amber" style="margin-top:18px">
+    <div class="ct"><span class="v warn"><i>!</i></span>Where VeilStream is genuinely relevant</div>
+    <p>Not as a host — but you're running an autonomous agent that fills forms, uploads files and screenshots
+    pages. Those <b>4.1 GB of screenshots and network logs can capture real user data</b>, and CLAUDE.md already
+    records live JWTs found in captured network JSON. If <code>xp</code>/<code>beta</code> are ever seeded from
+    production-like data, a PII-masking proxy in front of the test database is the right <em>category</em> of tool.
+    Separate decision from where the runner lives.</p>
+  </div>
+</section>
+
+<footer>
+  <p><b>Sources.</b> Run durations, artifact sizes and state sizes measured from this repo on 2026-07-29 (157 runs across beta.koyal.ai, xp.koyal.ai, filmarena.ai). Per-run cost from autoqa's own site-summary output. Anthropic pricing: Opus 5 $5/$25, Sonnet 5 $3/$15, Haiku 4.5 $1/$5 per MTok.</p>
+  <p><a href="https://tryreplicas.com/">tryreplicas.com</a> · <a href="https://docs.tryreplicas.com/">docs</a> · <a href="https://www.ycombinator.com/companies/replicas">YC profile</a> — <a href="https://www.veilstream.com/">veilstream.com</a> — status palette and dark surfaces from the validated dataviz reference instance; verdicts always carry icon + label so colour never conveys meaning alone.</p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -10,6 +10,7 @@
     "explore": "tsx src/cli.ts explore",
     "test:flows": "tsx src/cli.ts test",
     "test:unit": "node --import tsx --test 'src/**/*.test.ts'",
+    "test:manual-matrix": "node scripts/manual-v1-v2-matrix.mjs",
     "review": "tsx src/cli.ts review"
   },
   "dependencies": {

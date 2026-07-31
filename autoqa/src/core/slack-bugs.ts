@@ -4,11 +4,9 @@ import type { NetworkRequest, RunReport, TestStep } from './types.js';
  * Post ONLY genuine product bugs found in a run to the Slack bugs channel via an
  * incoming webhook (SLACK_BUGS_WEBHOOK_URL, loaded from login/.env — never hardcoded).
  *
- * Deliberately minimal per the reporting spec: for each product bug, exactly four
- * fields — Bug / Inputs / Reproduction / Error log — and NOTHING else. No
- * "harness OK" fluff, no full-report dump, no passing/needs-review noise. If a
- * run finds zero product bugs, this posts nothing at all (silence, not an
- * all-clear message).
+ * Deliberately minimal per the reporting spec: platform, exact page/location,
+ * front-end error log, matching backend log, then a three-line explanation.
+ * No reproduction dump, passing/needs-review noise, or "harness OK" fluff.
  *
  * What counts as a "product bug" (vs. a test-harness/probe artifact): a milestone
  * that FAILED *and* carries real site-emitted error evidence — a browser console
@@ -20,7 +18,19 @@ import type { NetworkRequest, RunReport, TestStep } from './types.js';
  */
 
 const MAX_ERROR_LINES = 12;
-const MAX_REPRO_STEPS = 12;
+const MAX_BACKEND_LOG_CHARS = 2_000;
+
+interface ProductBugGroup {
+  step: TestStep;
+  scenarioName: string;
+  occurrences: number;
+  flows: Set<string>;
+}
+
+interface BackendLogMatch {
+  text: string;
+  href?: string;
+}
 
 function failedNetworkLines(requests: NetworkRequest[] | undefined): string[] {
   if (!requests) return [];
@@ -87,55 +97,38 @@ function shortTitle(step: TestStep): string {
   return clipped ? `${step.workflow} — ${clipped}` : step.workflow;
 }
 
-function detectFileType(step: TestStep): string {
-  const hay = [step.action, ...(step.stepsToReproduce ?? [])].join(' ');
-  const m = hay.match(/\.(pdf|wav|mp3|png|jpe?g|txt|mp4|mov|csv|json)\b/i);
-  return m ? m[1].toLowerCase() : '—';
-}
-
-function detectPlan(step: TestStep): string {
-  const hay = [step.action, ...(step.stepsToReproduce ?? [])].join(' ');
-  const m = hay.match(/\b(standard|pro|free|premium|enterprise|basic)\b\s*(plan)?/i);
-  return m ? m[1].replace(/^\w/, (c) => c.toUpperCase()) : '—';
-}
-
 function formatBug(
   step: TestStep,
-  scenarioName: string,
-  credentialsType: string,
+  platform: string,
+  backendLog?: BackendLogMatch,
   occurrences = 1,
   flowCount = 1,
 ): string {
   const url = step.result.signals?.url || '—';
-  const repro = (step.stepsToReproduce ?? [])
-    .slice(0, MAX_REPRO_STEPS)
-    .map((s, i) => `  ${i + 1}. ${s.replace(/\s+/g, ' ').trim()}`)
-    .join('\n');
-  const errors = errorLines(step)
-    .map((l) => `  ${l}`)
-    .join('\n');
+  const errors = errorLines(step).join('\n');
+  const firstError =
+    errorLines(step)[0]?.replace(/^(console|exception|network):\s*/, '') ??
+    'The site emitted an error.';
+  const what = shortTitle(step).replace(`${step.workflow} — `, '');
+  const backendText = backendLog
+    ? `${backendLog.href ? `<${backendLog.href}|Open backend error logs>\n` : ''}\`\`\`${backendLog.text}\`\`\``
+    : 'No matching backend record was available.';
 
   return [
-    `Bug — ${shortTitle(step)}${occurrences > 1 ? ` (${occurrences} occurrences across ${flowCount} flow${flowCount === 1 ? '' : 's'})` : ''}`,
-    `Inputs — file: ${detectFileType(step)} · plan: ${detectPlan(step)} · credentials: ${credentialsType} · url: ${url}`,
-    `Reproduction —\n${repro || '  (no steps recorded)'}`,
-    `Error log —\n${errors}`,
+    `*Platform:* ${platform}${occurrences > 1 ? ` · ${occurrences} occurrences across ${flowCount} flow${flowCount === 1 ? '' : 's'}` : ''}`,
+    '',
+    `*Where bug was found:* ${url.startsWith('http') ? `<${url}|${new URL(url).pathname || '/'}>` : url}`,
+    `*Error log:*\n\`\`\`${errors}\`\`\``,
+    `*Backend log:*\n${backendText}`,
+    '',
+    `*What:* ${what}`,
+    `*Why:* ${firstError}`,
+    `*Impact:* The requested QA action could not complete reliably on this page.`,
   ].join('\n');
 }
 
-/**
- * The genuine product bugs in a run — failed milestones carrying real
- * site-emitted error evidence — each formatted as the Bug/Inputs/Reproduction/
- * Error-log block used for both Slack and the per-site summary. Shared so the two
- * surfaces never disagree about what counts as a product bug.
- */
-export function collectProductBugs(report: RunReport, credentialsType: string): string[] {
-  const grouped = new Map<string, {
-    step: TestStep;
-    scenarioName: string;
-    occurrences: number;
-    flows: Set<string>;
-  }>();
+function groupedProductBugs(report: RunReport): ProductBugGroup[] {
+  const grouped = new Map<string, ProductBugGroup>();
   for (const scenario of report.scenarios) {
     for (const step of scenario.steps) {
       if (!isProductBug(step)) continue;
@@ -154,13 +147,140 @@ export function collectProductBugs(report: RunReport, credentialsType: string): 
       }
     }
   }
-  return [...grouped.values()].map((bug) => formatBug(
+  return [...grouped.values()];
+}
+
+/**
+ * The genuine product bugs in a run — failed milestones carrying real
+ * site-emitted error evidence — each formatted with platform, page, front-end
+ * error, backend match, and a three-line explanation. Shared so Slack and the
+ * per-site summary never disagree about what counts as a product bug.
+ */
+export function collectProductBugs(report: RunReport, credentialsType: string): string[] {
+  void credentialsType;
+  let platform = report.baseUrl;
+  try {
+    platform = new URL(report.baseUrl).hostname;
+  } catch {
+    // Keep the report's literal platform when it is not a URL.
+  }
+  return groupedProductBugs(report).map((bug) => formatBug(
     bug.step,
-    bug.scenarioName,
-    credentialsType,
+    platform,
+    undefined,
     bug.occurrences,
     bug.flows.size,
   ));
+}
+
+function backendLogEndpoint(hostname: string): string | undefined {
+  const configured = process.env.KOYAL_ADMIN_ERROR_LOGS_URL?.trim();
+  if (configured) return configured;
+  return /\.koyal\.ai$/i.test(hostname)
+    ? `https://${hostname}/v1/api/admin/error-logs?limit=300`
+    : undefined;
+}
+
+function logCandidates(value: unknown, depth = 0): Record<string, unknown>[] {
+  if (depth > 5 || value === null || value === undefined) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => logCandidates(item, depth + 1));
+  }
+  if (typeof value !== 'object') return [];
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).join(' ');
+  const self = /\b(error|message|stack|status|url|path|project|timestamp|created)\b/i.test(keys)
+    ? [record]
+    : [];
+  return [
+    ...self,
+    ...Object.values(record).flatMap((item) => logCandidates(item, depth + 1)),
+  ];
+}
+
+function redactBackendLog(value: string): string {
+  return value
+    .replace(
+      /("(?:password|token|authorization|cookie|secret)"\s*:\s*)"[^"]*"/gi,
+      '$1"<redacted>"',
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer <redacted>')
+    .slice(0, MAX_BACKEND_LOG_CHARS);
+}
+
+function matchingBackendLog(
+  payload: unknown,
+  step: TestStep,
+  endpoint: string,
+): BackendLogMatch | undefined {
+  const errorText = errorLines(step).join(' ').toLowerCase();
+  const tokens = [...new Set(
+    errorText
+      .split(/[^a-z0-9]+/)
+      .filter(
+        (token) =>
+          token.length >= 5 &&
+          !['console', 'exception', 'network', 'https', 'error', 'failed'].includes(token),
+      ),
+  )].slice(0, 30);
+  let pagePath = '';
+  try {
+    pagePath = new URL(step.result.signals.url).pathname.toLowerCase();
+  } catch {
+    // URL matching is an optional signal.
+  }
+  const ranked = logCandidates(payload)
+    .map((candidate) => {
+      const serialized = JSON.stringify(candidate);
+      const hay = serialized.toLowerCase();
+      const tokenScore = tokens.reduce(
+        (score, token) => score + (hay.includes(token) ? 2 : 0),
+        0,
+      );
+      const pathScore = pagePath && hay.includes(pagePath) ? 5 : 0;
+      const href = Object.entries(candidate).find(
+        ([key, value]) =>
+          typeof value === 'string' &&
+          /^https?:\/\//i.test(value) &&
+          /\b(url|link|href)\b/i.test(key),
+      )?.[1] as string | undefined;
+      return { serialized, href, score: tokenScore + pathScore };
+    })
+    .sort((left, right) => right.score - left.score);
+  const best = ranked[0];
+  if (!best || best.score <= 0) return undefined;
+  return {
+    text: redactBackendLog(best.serialized),
+    href: best.href ?? endpoint,
+  };
+}
+
+async function fetchBackendLogsForBugs(
+  hostname: string,
+  bugs: ProductBugGroup[],
+): Promise<Array<BackendLogMatch | undefined>> {
+  const endpoint = backendLogEndpoint(hostname);
+  const token = process.env.KOYAL_ADMIN_TOKEN?.trim();
+  if (!endpoint || !token || bugs.length === 0) {
+    return bugs.map(() => undefined);
+  }
+  try {
+    const response = await fetch(endpoint, {
+      headers: { 'x-admin-token': token },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!response.ok) {
+      console.warn(`[slack] backend-log lookup failed: ${response.status}`);
+      return bugs.map(() => undefined);
+    }
+    const payload: unknown = await response.json();
+    return bugs.map((bug) => matchingBackendLog(payload, bug.step, endpoint));
+  } catch (error) {
+    console.warn(
+      `[slack] backend-log lookup unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return bugs.map(() => undefined);
+  }
 }
 
 export interface SlackBugReport {
@@ -178,8 +298,18 @@ export async function notifyKoyalBugsToSlack(opts: {
   credentialsType: string;
 }): Promise<SlackBugReport> {
   const url = process.env.SLACK_BUGS_WEBHOOK_URL?.trim();
-
-  const bugs = collectProductBugs(opts.report, opts.credentialsType);
+  void opts.credentialsType;
+  const grouped = groupedProductBugs(opts.report);
+  const backendLogs = await fetchBackendLogsForBugs(opts.hostname, grouped);
+  const bugs = grouped.map((bug, index) =>
+    formatBug(
+      bug.step,
+      opts.hostname,
+      backendLogs[index],
+      bug.occurrences,
+      bug.flows.size,
+    ),
+  );
 
   if (bugs.length === 0) {
     // No product bugs → post nothing (no all-clear/fluff, per spec).
@@ -193,10 +323,10 @@ export async function notifyKoyalBugsToSlack(opts: {
     return { posted: false, bugCount: bugs.length };
   }
 
-  const header = `*autoqa* · ${opts.hostname} · run \`${opts.report.runId}\` · ${bugs.length} product bug(s)`;
+  const header = `*AutoQA product bugs* · run \`${opts.report.runId}\` · ${bugs.length} bug${bugs.length === 1 ? '' : 's'}`;
   const body = bugs.join('\n\n────────\n\n');
   const clipped = body.length > 38_000 ? `${body.slice(0, 38_000)}\n… (truncated)` : body;
-  const text = `${header}\n\`\`\`\n${clipped}\n\`\`\``;
+  const text = `${header}\n\n${clipped}`;
 
   try {
     const res = await fetch(url, {

@@ -15,14 +15,19 @@ import {
   hasBlockingValidationState,
   hasRecoverableFieldValidation,
   hasInlineProcessing,
+  isGroundedManualUnlabelledClick,
+  isManualMutationAction,
   isSensitiveFieldLabel,
   isSafeStateCycleRecoveryLabel,
+  isVisionIdentifiedUnlabelledDismiss,
+  llmInfrastructureBlockReason,
   PROCESSING_VISION_POLL_THRESHOLD,
   requiresFreshArtifactIdentity,
   shouldDeferUnlabelledProgressClick,
   snapshotRefIsDisabled,
   uniquePostProcessingCompletionControl,
   uniqueSafeStateCycleRecoveryControl,
+  visibleManualProductError,
   type ExplorerResult,
 } from './explorer.js';
 
@@ -32,6 +37,19 @@ test('disabled GENERATING button is treated as active processing', () => {
 
 test('static generation copy is not treated as active processing', () => {
   assert.equal(hasInlineProcessing('- heading "AI Image Generation"'), false);
+});
+
+test('manual mode recognizes a raw product contract error without matching ordinary missing-field copy', () => {
+  assert.equal(
+    visibleManualProductError(
+      'Missing storyInstructions, storyElement for edit-story',
+    ),
+    'Missing storyInstructions, storyElement for edit-story',
+  );
+  assert.equal(
+    visibleManualProductError('Please complete the missing required fields'),
+    undefined,
+  );
 });
 
 test('avatar generation overlay is treated as active processing', () => {
@@ -88,6 +106,24 @@ test('persisted pending badge prevents vision from releasing artifact processing
 
 test('static rendering settings copy is not treated as active processing', () => {
   assert.equal(hasInlineProcessing('- heading "Video Rendering Settings"'), false);
+});
+
+test('manual mode ignores narrative remaining but preserves main crawler behavior', () => {
+  const narrative =
+    '- paragraph "The foam pattern on top remaining perfectly intact as the cup glides to a stop."';
+  assert.equal(hasInlineProcessing(narrative), true);
+  assert.equal(
+    hasInlineProcessing(narrative, { manualNarrativeSafe: true }),
+    false,
+  );
+  assert.equal(
+    hasInlineProcessing('- status "2 minutes remaining"', { manualNarrativeSafe: true }),
+    true,
+  );
+  assert.equal(
+    hasInlineProcessing('- status "Remaining: 01:42"', { manualNarrativeSafe: true }),
+    true,
+  );
 });
 
 test('vision affirmation is scheduled early in a prolonged processing wait', () => {
@@ -148,6 +184,95 @@ test('state-cycle recovery allowlist accepts navigation but rejects mutations an
   assert.equal(isSafeStateCycleRecoveryLabel('Create'), false);
   assert.equal(isSafeStateCycleRecoveryLabel('Regenerate'), false);
   assert.equal(isSafeStateCycleRecoveryLabel('Close'), false);
+  assert.equal(isSafeStateCycleRecoveryLabel('Close', { manualDismiss: true }), true);
+  assert.equal(isSafeStateCycleRecoveryLabel('Cancel', { manualDismiss: true }), true);
+});
+
+test('manual vision may identify one unlabeled close button but cannot bless arbitrary unlabeled actions', () => {
+  assert.equal(
+    isVisionIdentifiedUnlabelledDismiss(
+      'button',
+      '',
+      'A Scene 1 detail panel is blocking the journey; click its X button to close it.',
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    isVisionIdentifiedUnlabelledDismiss(
+      'button',
+      '',
+      'Try this unlabeled button to see what happens.',
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    isVisionIdentifiedUnlabelledDismiss(
+      'button',
+      '',
+      'Close the blocking modal with its X button.',
+      false,
+    ),
+    false,
+  );
+  assert.equal(
+    isVisionIdentifiedUnlabelledDismiss(
+      'button',
+      'Regenerate',
+      'Close the blocking modal.',
+      true,
+    ),
+    false,
+  );
+});
+
+test('manual icon clicks require explicit visual grounding and reject positional guesses', () => {
+  assert.equal(
+    isGroundedManualUnlabelledClick(
+      'button',
+      undefined,
+      'The bottom-right button is likely the add control.',
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    isGroundedManualUnlabelledClick(
+      'button',
+      undefined,
+      'VISUALLY CONFIRMED: the button shows a plus icon labeled by the surrounding Create panel.',
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    isGroundedManualUnlabelledClick(
+      'button',
+      undefined,
+      'VISUALLY CONFIRMED: the button shows a plus icon.',
+      false,
+    ),
+    false,
+  );
+});
+
+test('manual read-only policy recognizes destructive and form-changing actions', () => {
+  assert.equal(isManualMutationAction('click', 'Delete', 'confirm deletion'), true);
+  assert.equal(isManualMutationAction('fill', 'Project name'), true);
+  assert.equal(isManualMutationAction('click', 'Next page'), false);
+  assert.equal(isManualMutationAction('click', 'ADD ASSET', 'open the asset dialog'), false);
+  assert.equal(isManualMutationAction('click', 'Add Assets', 'apply assets to the scene'), true);
+});
+
+test('provider outages are classified as infrastructure blocks without exposing response bodies', () => {
+  assert.equal(
+    llmInfrastructureBlockReason(
+      'Anthropic request failed (529): {"type":"overloaded_error"}',
+    ),
+    'Infrastructure blocked: LLM provider overloaded (HTTP 529) after retries.',
+  );
+  assert.equal(llmInfrastructureBlockReason('Invalid explorer JSON'), undefined);
 });
 
 test('state-cycle recovery resolves only one unique enabled safe forward control', () => {
@@ -174,6 +299,13 @@ test('state-cycle recovery resolves only one unique enabled safe forward control
       '- button "Create Video" [ref=e19]\n- button "Close" [ref=e20]',
     ),
     null,
+  );
+  assert.deepEqual(
+    uniqueSafeStateCycleRecoveryControl(
+      '- button "Save" [ref=e19]\n- button "Close" [ref=e20]',
+      { manualDismiss: true },
+    ),
+    { ref: '@e20', label: 'Close', role: 'button' },
   );
 });
 
@@ -989,6 +1121,153 @@ test('a click that caused deterministic processing is not resubmitted after a fa
 
   assert.equal(clickCalls, 1);
   assert.match(result.stepsTaken.join('\n'), /suppressed duplicate mutation click/i);
+});
+
+test('manual mode keeps distinct Add controls separate after later processing', async () => {
+  let stage = 0;
+  let processing = false;
+  let addSelectionCalls = 0;
+  let llmCalls = 0;
+  let imageCalls = 0;
+  const snapshot = () => {
+    if (processing) return '- status "Saving uploaded character..."';
+    if (stage >= 3) return '- text "Three persisted characters"\n- button "Next" [ref=e4]';
+    return [
+      '- button "Add Character" [ref=e1]',
+      '- button "Save All" [ref=e2]',
+      '- button "Add (1)" [ref=e3]',
+    ].join('\n');
+  };
+  const browser = {
+    getUrl: () => 'https://example.test/characters',
+    snapshotInteractive: snapshot,
+    snapshotFull: snapshot,
+    dialogStatus: () => undefined,
+    fieldLabelAtRef: (ref: string) => (ref === '@e3' ? 'Add (1)' : ''),
+    wait: (ms: number) => {
+      if (processing && ms >= 5000) processing = false;
+    },
+    clickVisible: (ref: string) => {
+      if (ref === '@e1') stage = 1;
+      if (ref === '@e2') {
+        stage = 2;
+        processing = true;
+      }
+      if (ref === '@e3') {
+        addSelectionCalls++;
+        stage = 3;
+      }
+    },
+    screenshotAnnotated: (filePath: string) => {
+      imageCalls++;
+      fs.writeFileSync(filePath, Buffer.from('manual-state'));
+    },
+    errorsJson: () => ({ data: { errors: [] } }),
+    consoleJson: () => ({ data: { messages: [] } }),
+    networkRequestsJson: () => ({ data: { requests: [] } }),
+    clearSignals: () => undefined,
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete(options: LlmCompletionOptions) {
+      llmCalls++;
+      assert.ok(options.image, 'manual decisions should include the current screenshot');
+      if (llmCalls === 1) return '{"action":"click","ref":"@e1","reason":"add a character slot"}';
+      if (llmCalls === 2) return '{"action":"click","ref":"@e2","reason":"save the uploaded character"}';
+      if (llmCalls === 3) {
+        return '{"action":"click","ref":"@e3","reason":"VISUALLY CONFIRMED: the button shows Add (1), committing the selected existing character"}';
+      }
+      return '{"action":"done","reason":"three persisted characters are visible"}';
+    },
+  } as unknown as LlmClient;
+
+  const result = await new Explorer(browser, { llm }).achieveGoal(
+    'Create three characters using three different methods and visibly verify them',
+    { maxSteps: 4, manualMode: true },
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(addSelectionCalls, 1, result.stepsTaken.join('\n'));
+  assert.equal(imageCalls, llmCalls);
+  assert.doesNotMatch(
+    result.stepsTaken.join('\n'),
+    /suppressed duplicate mutation click .*"Add \(1\)"/i,
+  );
+});
+
+test('manual no-effect mutations stay unproven and are not saved as successful actions', async () => {
+  let llmCalls = 0;
+  let clickCalls = 0;
+  const snapshot = '- button "Add (1)" [ref=e1]';
+  const browser = {
+    getUrl: () => 'https://example.test/characters',
+    snapshotInteractive: () => snapshot,
+    snapshotFull: () => snapshot,
+    dialogStatus: () => undefined,
+    fieldLabelAtRef: () => '',
+    wait: () => undefined,
+    clickVisible: () => {
+      clickCalls++;
+    },
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete() {
+      llmCalls++;
+      if (llmCalls === 1) {
+        return '{"action":"click","ref":"@e1","reason":"commit the selected character"}';
+      }
+      return '{"action":"fail","reason":"the enabled control had no observable effect"}';
+    },
+  } as unknown as LlmClient;
+
+  const result = await new Explorer(browser, { llm }).achieveGoal(
+    'Commit the selected character',
+    { maxSteps: 2, manualMode: true },
+  );
+
+  assert.equal(result.success, false);
+  assert.equal(clickCalls, 1);
+  assert.equal(result.actions[0]?.executionFailed, true);
+  assert.match(result.stepsTaken.join('\n'), /no observable application-state change/i);
+});
+
+test('manual read-only proof blocks a destructive click before it reaches the browser', async () => {
+  let llmCalls = 0;
+  let clickCalls = 0;
+  const snapshot = '- button "Delete" [ref=e1]\n- text "Existing item remains"';
+  const browser = {
+    getUrl: () => 'https://example.test/items',
+    snapshotInteractive: () => snapshot,
+    snapshotFull: () => snapshot,
+    dialogStatus: () => undefined,
+    fieldLabelAtRef: () => 'Delete',
+    wait: () => undefined,
+    clickVisible: () => {
+      clickCalls++;
+    },
+    screenshotAnnotated: (filePath: string) =>
+      fs.writeFileSync(filePath, Buffer.from('proof')),
+    errorsJson: () => ({ data: { errors: [] } }),
+    consoleJson: () => ({ data: { messages: [] } }),
+    networkRequestsJson: () => ({ data: { requests: [] } }),
+    clearSignals: () => undefined,
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete() {
+      llmCalls++;
+      return llmCalls === 1
+        ? '{"action":"click","ref":"@e1","reason":"delete another item"}'
+        : '{"action":"done","reason":"the existing state is visible"}';
+    },
+  } as unknown as LlmClient;
+
+  const result = await new Explorer(browser, { llm }).achieveGoal(
+    'Read-only verification of the existing state',
+    { maxSteps: 2, manualMode: true, manualReadOnly: true },
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(clickCalls, 0);
+  assert.match(result.stepsTaken.join('\n'), /blocked mutation during manual read-only proof/i);
 });
 
 test('one-screen deep-walk goal returns immediately after a URL transition', async () => {

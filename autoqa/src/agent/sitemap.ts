@@ -149,6 +149,46 @@ export interface FlowMilestone {
    * junk that the site may reject. Empty/absent = fall back to the auto marker.
    */
   seedValue?: string;
+  /**
+   * A request-specific manual-mode audit is allowed to repair missing work.
+   * Unlike an ordinary `verify` milestone, it may navigate back to mapped
+   * feature areas and perform safe mutations before the final read-only proof.
+   */
+  manualContractAudit?: boolean;
+  /** One-based checklist item assigned to this request-specific audit. */
+  manualContractItem?: number;
+  /** Mapped recovery page used only when this manual audit cannot reach its feature through visible controls. */
+  manualContractTargetPageId?: string;
+  /** Task-graph manual engine node carried by this lowered milestone. */
+  manualTaskId?: string;
+  /** The next primary journey state that this navigation checkpoint must reach. */
+  manualJourneyDestinationPageId?: string;
+}
+
+export interface ManualAcceptanceTask {
+  id: string;
+  requirement: string;
+  targetPageId?: string;
+  phase: 'pre-terminal' | 'post-terminal';
+  dependsOn: string[];
+  /**
+   * Links a produced artifact to a later task that must consume that exact
+   * artifact. Manual mode uses this to preserve identity across page changes
+   * instead of accepting an unrelated upload as "the same" item.
+   */
+  artifactKey?: string;
+  artifactRole?: 'producer' | 'consumer';
+  /** Evidence task evaluated immediately after the verified fresh entry action. */
+  position?: 'after-entry';
+}
+
+export interface ManualExecutionPolicy {
+  /** Compile and prompt one acceptance task at a time instead of repeating the full request. */
+  context: 'active-task';
+  /** Normal flows retain their existing detector and recovery behavior. */
+  processing: 'manual-narrative-safe';
+  recovery: 'bounded-modal-dismiss';
+  probes: 'contract-only';
 }
 
 export interface Flow {
@@ -178,6 +218,27 @@ export interface Flow {
     freshEntryHint?: string;
   };
   milestones: FlowMilestone[];
+  /**
+   * Explicit acceptance contract compiled from `--manual`. Keeping it on the
+   * flow makes the request's individual obligations visible to every milestone
+   * and prevents the mapped journey's local success hints from silently
+   * replacing the user's broader request.
+   */
+  manualContract?: {
+    request: string;
+    checklist: string[];
+  };
+  /** Opt-in task graph used by the token-efficient manual engine. */
+  manualExecution?: {
+    version: 1;
+    sourceFlowId: string;
+    /** Stateful route sequence inherited from the mapped source flow. */
+    primaryJourneyPageIds: string[];
+    tasks: ManualAcceptanceTask[];
+    /** Non-actionable global rules checked at terminal proof, not rerun as tasks. */
+    constraints: string[];
+    policy: ManualExecutionPolicy;
+  };
   lastResult?: { runId: string; verdict: Verdict };
 }
 

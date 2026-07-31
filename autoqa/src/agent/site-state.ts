@@ -175,9 +175,11 @@ export class SiteState {
     // `approved` used to mean only "the human selected this proposal", even if
     // most milestones had never run and had no recipe. That made partial LLM
     // plans look deterministic. Migrate every legacy selected flow into the
-    // explicit lifecycle. Only a terminal deep walk with a recipe for every
-    // milestone is ready to TRY replay validation; everything else must learn
-    // each milestone through LLM exploration first.
+    // explicit lifecycle. Legacy approved flows only enter replay validation
+    // when their original evidence is complete. Once a current runner has
+    // explicitly qualified an exploratory flow for replay validation, however,
+    // missing recipes are intentional work for that phase: replay what exists
+    // and use the bounded explorer fallback to compile the remaining recipes.
     let lifecycleMigrated = false;
     for (const flow of this.sitemap.flows) {
       const allRecipes =
@@ -190,9 +192,6 @@ export class SiteState {
         lifecycleMigrated = true;
       } else if (flow.status === 'deterministic' && !allRecipes) {
         flow.status = 'exploratory';
-        flow.qualification = { phase: 'learning' };
-        lifecycleMigrated = true;
-      } else if (flow.status === 'exploratory' && flow.qualification?.phase === 'replay-validation' && !allRecipes) {
         flow.qualification = { phase: 'learning' };
         lifecycleMigrated = true;
       }

@@ -201,6 +201,8 @@ export interface ReplayResult {
   ok: boolean;
   failedAtStep?: number;
   detail?: string;
+  /** Steps that actually completed before replay returned or fell back. */
+  completedSteps?: RecipeStep[];
 }
 
 function normalizedHint(value: string): string {
@@ -356,6 +358,7 @@ export class RecipePlayer {
     console.log(`[replay] ${id} (${recipe.steps.length} steps, ${recipe.stats.successes} prior successes)`);
 
     let dynamicEditableOpened = false;
+    const completedSteps: RecipeStep[] = [];
     for (let i = 0; i < recipe.steps.length; i++) {
       const step = recipe.steps[i];
       try {
@@ -437,6 +440,7 @@ export class RecipePlayer {
                 );
               }
               dynamicEditableOpened = false;
+              completedSteps.push(step);
               continue;
             }
             // fall back to ref-based fill via snapshot label match
@@ -492,11 +496,12 @@ export class RecipePlayer {
           }
           if (!satisfied) throw new Error(`waitFor timeout (${step.maxMs}ms)`);
         }
+        completedSteps.push(step);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         console.log(`[replay] ${id} failed at step ${i + 1}: ${detail}`);
         this.recordFailure(recipe);
-        return { ok: false, failedAtStep: i, detail };
+        return { ok: false, failedAtStep: i, detail, completedSteps };
       }
     }
 
@@ -512,14 +517,14 @@ export class RecipePlayer {
 
     if (!urlOk || !snapOk) {
       this.recordFailure(recipe);
-      return { ok: false, detail: 'success check failed after replay' };
+      return { ok: false, detail: 'success check failed after replay', completedSteps };
     }
 
     recipe.stats.successes++;
     recipe.stats.lastSuccessAt = new Date().toISOString();
     this.state.saveRecipes();
     console.log(`[replay] ${id} OK (no LLM calls)`);
-    return { ok: true };
+    return { ok: true, completedSteps };
   }
 
   private recordFailure(recipe: Recipe): void {

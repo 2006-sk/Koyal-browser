@@ -8,7 +8,12 @@ import { captureRuntimeFailure } from './runtime-failure.js';
 import { normalizeNetworkRequests } from './verification.js';
 import { classifyAuthStatus, describeAuthFailure, pickAuthResponse } from './auth-response.js';
 import type { NetworkRequest } from './types.js';
-import { assessProcessingScreenshot, type ProcessingVisualAssessment } from './visual-verification.js';
+import {
+  assessProcessingScreenshot,
+  assessScreenshot,
+  type ProcessingVisualAssessment,
+  type VisualAssessment,
+} from './visual-verification.js';
 
 export type ExplorerActionType = 'click' | 'fill' | 'select' | 'press' | 'wait' | 'upload' | 'done' | 'fail';
 
@@ -33,6 +38,8 @@ export interface ExplorerAction {
   /** Synthetic deterministic barrier learned after a submitted async mutation. */
   waitForProcessing?: boolean;
   waitedMs?: number;
+  /** Manual-only visual proof captured before leaving the owning feature surface. */
+  visualAssessment?: VisualAssessment;
 }
 
 export interface ExplorerResult {
@@ -84,13 +91,22 @@ export function isSensitiveFieldLabel(label: string): boolean {
  */
 const IN_PROGRESS_RE =
   /(analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)(\s+[\w\s]{0,40})?(\.{2,3}|…)|(?:button|link)\s+"(?:analy[sz]ing|generating|rendering|exporting|transcribing|uploading|processing|validating|initializing|loading)"[^\n]*(?:disabled|busy)|\b(?:your|the)\s+(?:film|video|asset|image|audio|project)\s+is\s+(?:rendering|generating|processing|exporting)\b|\bnow in production\b|\bplease wait\b|\btaking longer than expected\b|\bserver may be busy\b|\b(est|eta)\.?\s*[:\s]?\s*\d|\bremaining\b|\b\d{1,3}\s?%\s*(complete|done|remaining|uploaded|processed|rendered)/i;
+const MANUAL_TIMED_REMAINING_RE =
+  /\b(?:\d+\s*(?:seconds?|minutes?|hours?)\s+remaining|remaining\s*(?::|-)?\s*\d+(?::\d+)?|\d{1,3}\s?%\s*remaining)\b/i;
 const IN_PROGRESS_DONE_RE = /(?:processing|rendering|export) complete|100\s?%|\bdone\b\s*[!.]/i;
 export const PROCESSING_VISION_POLL_THRESHOLD = 3;
 /** Maximum observations of one normalized page state within a single goal. */
 export const EXPLORER_STATE_VISIT_LIMIT = 4;
 
-export function hasInlineProcessing(snapshot: string): boolean {
-  return IN_PROGRESS_RE.test(snapshot) && !IN_PROGRESS_DONE_RE.test(snapshot);
+export function hasInlineProcessing(
+  snapshot: string,
+  options?: { manualNarrativeSafe?: boolean },
+): boolean {
+  const candidate = options?.manualNarrativeSafe
+    ? IN_PROGRESS_RE.test(snapshot.replace(/\bremaining\b/gi, '')) ||
+      MANUAL_TIMED_REMAINING_RE.test(snapshot)
+    : IN_PROGRESS_RE.test(snapshot);
+  return candidate && !IN_PROGRESS_DONE_RE.test(snapshot);
 }
 
 const MUTATION_CONTROL_RE =
@@ -105,6 +121,25 @@ function mutationControlKey(label: string): string | undefined {
 
 export function isLikelyMutationLabel(label: string): boolean {
   return MUTATION_CONTROL_RE.test(label);
+}
+
+export function isManualMutationAction(
+  action: ExplorerActionType,
+  label?: string,
+  reason?: string,
+): boolean {
+  if (action === 'fill' || action === 'select' || action === 'upload') return true;
+  if (action !== 'click') return false;
+  // This Koyal-shaped label is a library-dialog opener, not the later asset
+  // creation submission. Treating it as the one-shot mutation means a
+  // dismissed/failed method picker can never be reopened, so the bounded
+  // recovery loops on a permanently blocked opener instead of completing the
+  // asset flow. Keep the distinction narrow: plural "Add Assets" is the real
+  // scene mutation and remains protected.
+  if (/^add asset$/i.test(label?.trim() ?? '')) return false;
+  return /\b(?:new|add|create|generate|regenerate|finalize|save|submit|finish|complete|delete|remove|destroy|upload|render|export|apply|confirm deletion|pay|purchase|checkout)\b/i.test(
+    `${label ?? ''} ${reason ?? ''}`,
+  );
 }
 
 /** Exact walk-entry target embedded by deep-walker when deterministic navigation needs LLM fallback. */
@@ -160,9 +195,12 @@ export function uniquePostProcessingCompletionControl(
 }
 
 /** Narrow post-mutation detector; bare badges are safe only after a real mutation. */
-export function hasPostMutationProcessing(snapshot: string): boolean {
+export function hasPostMutationProcessing(
+  snapshot: string,
+  options?: { manualNarrativeSafe?: boolean },
+): boolean {
   return (
-    hasInlineProcessing(snapshot) ||
+    hasInlineProcessing(snapshot, options) ||
     /(?:text|status|badge)\s+"(?:processing|pending|finalizing|generating|rendering|uploading)"|\b(?:processing|pending|finalizing|generating|rendering|uploading)\s+(?:badge|status)\b/i.test(snapshot)
   );
 }
@@ -246,9 +284,28 @@ export function explorerStateSignature(url: string, snapshot: string): string {
   return `${url}|${stableSnapshot}`;
 }
 
-export function isSafeStateCycleRecoveryLabel(label: string): boolean {
-  return /^(?:next|continue|save and continue|proceed|advance|go forward)$/i.test(
-    label.trim(),
+export function isSafeStateCycleRecoveryLabel(
+  label: string,
+  options?: { manualDismiss?: boolean },
+): boolean {
+  const normalized = label.trim();
+  return (
+    /^(?:next|continue|save and continue|proceed|advance|go forward)$/i.test(normalized) ||
+    (Boolean(options?.manualDismiss) && /^(?:close|cancel|dismiss|x|×)$/i.test(normalized))
+  );
+}
+
+export function isVisionIdentifiedUnlabelledDismiss(
+  role: string | undefined,
+  label: string | undefined,
+  reason: string | undefined,
+  manualMode: boolean,
+): boolean {
+  if (!manualMode || role !== 'button' || Boolean(label?.trim()) || !reason) return false;
+  return (
+    /\b(?:close|dismiss)(?:ing)?\b[^.]{0,100}\b(?:modal|dialog|panel|overlay|detail)\b/i.test(reason) ||
+    /\b(?:modal|dialog|panel|overlay|detail)\b[^.]{0,100}\b(?:close|dismiss|x\s+button)\b/i.test(reason) ||
+    /\bx\s+button\b[^.]{0,100}\b(?:close|dismiss|blocking)\b/i.test(reason)
   );
 }
 
@@ -260,6 +317,7 @@ export function isSafeStateCycleRecoveryLabel(label: string): boolean {
  */
 export function uniqueSafeStateCycleRecoveryControl(
   snapshot: string,
+  options?: { manualDismiss?: boolean },
 ): { ref: string; label: string; role: string } | null {
   const matches = new Map<string, { ref: string; label: string; role: string }>();
   for (const line of snapshot.split('\n')) {
@@ -269,7 +327,7 @@ export function uniqueSafeStateCycleRecoveryControl(
     );
     if (!match) continue;
     const label = match[2].replace(/\s+/g, ' ').trim();
-    if (!isSafeStateCycleRecoveryLabel(label)) continue;
+    if (!isSafeStateCycleRecoveryLabel(label, options)) continue;
     const ref = `@${match[3]}`;
     matches.set(ref, { ref, label, role: match[1].toLowerCase() });
   }
@@ -348,6 +406,32 @@ export function shouldDeferUnlabelledProgressClick(
   return Boolean(returnOnUrlChange && !resolvedLabel?.trim() && !hasVisualEvidence);
 }
 
+/**
+ * Manual mode may use an icon-only control, but only when the same multimodal
+ * decision explicitly grounds it in the screenshot. A screenshot attachment by
+ * itself is not proof—the model can still say "likely add button" and guess.
+ */
+export function isGroundedManualUnlabelledClick(
+  role: string | undefined,
+  label: string | undefined,
+  reason: string | undefined,
+  hasVisualEvidence: boolean,
+): boolean {
+  if (label?.trim()) return true;
+  if (!hasVisualEvidence || !reason || !/^(?:button|link)$/i.test(role ?? '')) {
+    return false;
+  }
+  if (isVisionIdentifiedUnlabelledDismiss(role, label, reason, true)) return true;
+  if (
+    /\b(?:likely|probably|possibly|perhaps|may|might|guess|assuming|appears to be|try|explor(?:e|ing)|test(?:ing)?|remaining)\b/i.test(
+      reason,
+    )
+  ) {
+    return false;
+  }
+  return /^\s*VISUALLY CONFIRMED:/i.test(reason);
+}
+
 export function snapshotRefIsDisabled(snapshot: string, ref: string): boolean {
   const bareRef = ref.replace(/^@/, '');
   return snapshot
@@ -399,7 +483,32 @@ export function doneHasObservableProgress(
   return explorerStateSignature(currentUrl, currentSnapshot) !== startStateSignature;
 }
 
-function buildSystemPrompt(siteDescription: string, siteHints: string[]): string {
+export function visibleManualProductError(snapshot: string): string | undefined {
+  const match = snapshot.match(
+    /\bMissing\s+[A-Za-z][A-Za-z0-9_, ]{1,100}\s+for\s+[a-z][a-z0-9_-]+\b/i,
+  );
+  return match?.[0];
+}
+
+export function llmInfrastructureBlockReason(message: string): string | undefined {
+  if (/\b529\b|overloaded_error|\boverloaded\b/i.test(message)) {
+    return 'Infrastructure blocked: LLM provider overloaded (HTTP 529) after retries.';
+  }
+  if (
+    /\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|fetch failed|network error|request timed out|AbortError)\b/i.test(
+      message,
+    )
+  ) {
+    return 'Infrastructure blocked: LLM provider request failed or timed out after retries.';
+  }
+  return undefined;
+}
+
+function buildSystemPrompt(
+  siteDescription: string,
+  siteHints: string[],
+  manualMode = false,
+): string {
   const hints = siteHints.length
     ? `\nSite-specific hints learned from previous runs:\n${siteHints.map((h) => `- ${h}`).join('\n')}\n`
     : '';
@@ -423,7 +532,9 @@ Rules:
 - Use action "done" when the goal is clearly achieved in the current snapshot/URL.
 - Use action "fail" only if the goal is impossible (e.g. element missing after reasonable attempt).
 - If a prior step says an action was denied by the user, do not retry it — choose another path.
-- Respond with JSON only, no markdown.
+${manualMode ? `- Manual-mode screenshots are authoritative for ambiguous icon-only controls. Never guess an unlabeled control from its position. Choose an unlabeled click only when the screenshot makes its exact purpose visually unambiguous; begin the reason with "VISUALLY CONFIRMED:" and describe the visible icon/control. If its purpose is merely likely, possible, or inferred, do not click it.
+- A manual click that prior steps say was attempted, ineffective, or opened the wrong surface must not be retried from the same state. Choose a different visibly grounded control or fail with the missing capability.
+` : ''}- Respond with JSON only, no markdown.
 ${hints}
 JSON schema:
 {
@@ -443,9 +554,10 @@ export function resolveRefLabel(
   const refId = ref.replace(/^@/, '');
   const line = snapshot.split('\n').find((l) => l.includes(`[ref=${refId}]`));
   if (!line) return {};
-  const match = line.match(/-?\s*([a-zA-Z]+)\s+"([^"]+)"/);
-  if (!match) return {};
-  return { role: match[1].toLowerCase(), label: match[2] };
+  const named = line.match(/-?\s*([a-zA-Z]+)\s+"([^"]+)"/);
+  if (named) return { role: named[1].toLowerCase(), label: named[2] };
+  const roleOnly = line.match(/-?\s*([a-zA-Z]+)\b/);
+  return roleOnly ? { role: roleOnly[1].toLowerCase() } : {};
 }
 
 function truncateSnapshot(snapshot: string, maxChars: number): string {
@@ -508,6 +620,42 @@ export class Explorer {
     } catch (error) {
       console.warn(
         `  [vision] processing affirmation unavailable: ${error instanceof Error ? error.message : error}`,
+      );
+      return undefined;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * A manual acceptance task can be visibly complete immediately before its
+   * safe forward click, while the post-click milestone screenshot belongs to
+   * the next wizard page. Preserve one narrow pre-advance visual assessment so
+   * the later audit does not create a duplicate artifact merely because it is
+   * looking at the next screen.
+   */
+  private async assessManualPreAdvanceState(
+    goal: string,
+    url: string,
+    observations: string,
+  ): Promise<VisualAssessment | undefined> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-manual-pre-advance-'));
+    const filePath = path.join(dir, 'page.png');
+    try {
+      // Character slots and dedicated uploaded-character sections can extend
+      // below the viewport. The audit must see the whole owning surface before
+      // deciding that one of the three finalized entities is missing.
+      this.browser.screenshotAnnotated(filePath, { fullPage: true });
+      return await assessScreenshot(this.llm, filePath, {
+        action: goal,
+        expected:
+          'The current workflow visibly shows exactly three finalized character entities relevant to the selection, including any dedicated uploaded-character or character-asset section, with no empty required slot or blocking validation.',
+        url,
+        observations,
+      });
+    } catch (error) {
+      console.warn(
+        `  [vision] manual pre-advance affirmation unavailable: ${error instanceof Error ? error.message : error}`,
       );
       return undefined;
     } finally {
@@ -608,6 +756,12 @@ export class Explorer {
       blockedClickLabels?: string[];
       /** Deep-walk one-screen goals return as soon as navigation proves advancement. */
       returnOnUrlChange?: boolean;
+      /** Manual acceptance runs ignore bare narrative "remaining" as a progress signal. */
+      manualMode?: boolean;
+      /** Manual proof/audit is observational and must never mutate application state. */
+      manualReadOnly?: boolean;
+      /** A task-specific evidence check already proved this exact goal before this call. */
+      allowDoneWithoutProgress?: boolean;
     },
   ): Promise<ExplorerResult> {
     const maxSteps = options?.maxSteps ?? config.llm.maxStepsPerGoal;
@@ -626,6 +780,8 @@ export class Explorer {
     let stateCycleRecoveryUsed = false;
     let goalStartStateSignature: string | undefined;
     const deniedClickLabels = new Set<string>();
+    const attemptedManualClickKeys = new Set<string>();
+    const ineffectiveManualClickRefs = new Set<string>();
     const stateVisitCounts = new Map<string, number>();
     const submittedMutation = (): boolean =>
       actions.some(
@@ -635,7 +791,9 @@ export class Explorer {
           isLikelyMutationLabel(action.resolvedLabel ?? ''),
       );
     const processingVisible = (value: string): boolean =>
-      hasInlineProcessing(value) || (submittedMutation() && hasPostMutationProcessing(value));
+      hasInlineProcessing(value, { manualNarrativeSafe: options?.manualMode }) ||
+      (submittedMutation() &&
+        hasPostMutationProcessing(value, { manualNarrativeSafe: options?.manualMode }));
 
     const goalForLog = this.redact(goal);
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
@@ -692,6 +850,33 @@ export class Explorer {
           // Interactive state is still a valid conservative baseline.
         }
         goalStartStateSignature = explorerStateSignature(url, initialSnapshot);
+      }
+
+      if (options?.manualMode) {
+        let productError = visibleManualProductError(snapshot);
+        let errorSnapshot = snapshot;
+        if (!productError) {
+          try {
+            errorSnapshot = this.browser.snapshotFull();
+            productError = visibleManualProductError(errorSnapshot);
+          } catch {
+            // The interactive snapshot remains the available evidence.
+          }
+        }
+        if (productError) {
+          stepsTaken.push(
+            `manual task stopped on concrete visible product error: ${productError}`,
+          );
+          return {
+            goal,
+            success: false,
+            actions,
+            stepsTaken,
+            finalUrl: url,
+            finalSnapshot: errorSnapshot,
+            error: `Visible product error: ${productError}`,
+          };
+        }
       }
 
       // SPA navigation can commit just after the post-action boundary check.
@@ -1030,7 +1215,9 @@ export class Explorer {
           );
           let recheckReason = '';
           const deterministicForward =
-            uniqueSafeStateCycleRecoveryControl(cycleSnapshot);
+            uniqueSafeStateCycleRecoveryControl(cycleSnapshot, {
+              manualDismiss: options?.manualMode,
+            });
           try {
             const recheck = await this.decideNextAction(
               goal,
@@ -1043,13 +1230,18 @@ export class Explorer {
                   (deterministicForward
                     ? `The goal is not yet complete and exactly one enabled safe forward control exists: ${deterministicForward.role} "${deterministicForward.label}" (${deterministicForward.ref}). Choose that click now. `
                     : 'No unique enabled safe Next/Continue/Proceed control was found. ') +
+                  (options?.manualMode
+                    ? 'If the screenshot shows a blocking detail panel, modal, dialog, or overlay with an unlabeled X/close button, choose click on that exact button ref now; do not merely describe the close action. '
+                    : '') +
                   'Use done only if the goal is visibly complete. Use wait only for a visibly active asynchronous operation; otherwise use fail and quote the visible blocker or no-progress condition.',
               ],
               this.captureVisionImage(),
+              Boolean(options?.manualMode),
             );
             recheckReason = recheck.reason ?? '';
             if (recheck.action === 'done') {
               if (
+                options?.allowDoneWithoutProgress ||
                 doneHasObservableProgress(
                   goal,
                   goalStartUrl,
@@ -1081,13 +1273,27 @@ export class Explorer {
               recheck.ref
             ) {
               const resolved = resolveRefLabel(cycleSnapshot, recheck.ref);
-              if (resolved.label && isSafeStateCycleRecoveryLabel(resolved.label)) {
-                recheck.resolvedLabel = resolved.label;
+              const visualUnlabelledDismiss = isVisionIdentifiedUnlabelledDismiss(
+                resolved.role,
+                resolved.label,
+                recheck.reason,
+                Boolean(options?.manualMode),
+              );
+              if (
+                (
+                  resolved.label &&
+                  isSafeStateCycleRecoveryLabel(resolved.label, {
+                    manualDismiss: options?.manualMode,
+                  })
+                ) ||
+                visualUnlabelledDismiss
+              ) {
+                recheck.resolvedLabel = resolved.label || 'Close';
                 recheck.resolvedRole = resolved.role;
                 await this.executeAction(recheck, stepsTaken);
                 actions.push(recheck);
                 stepsTaken.push(
-                  `state-cycle visual recovery executed one bounded safe advance click (${resolved.role ?? ''} "${resolved.label}")`,
+                  `state-cycle visual recovery executed one bounded safe advance click (${resolved.role ?? ''} "${recheck.resolvedLabel}")`,
                 );
                 stateCycleRecoveryUsed = true;
                 stateVisitCounts.clear();
@@ -1139,7 +1345,16 @@ export class Explorer {
       console.log(`  [explorer] step ${step + 1}/${maxSteps} — asking LLM (url: ${url})...`);
       const llmStart = Date.now();
       let decisionSnapshot = snapshot;
-      let decisionImage = options?.visionFirst && step === 0 ? this.captureVisionImage() : undefined;
+      // A manual request can name two visually adjacent but semantically
+      // different surfaces whose accessibility controls look identical (for
+      // example, an upload inside a Character slot versus a separate Assets
+      // uploader). Text-only refs lose that grouping. Manual mode therefore
+      // gets the current screenshot on every decision; ordinary crawl/walk/
+      // replay behavior keeps the existing narrow vision policy unchanged.
+      let decisionImage =
+        options?.manualMode || (options?.visionFirst && step === 0)
+          ? this.captureVisionImage()
+          : undefined;
       {
         try {
           const fullSnapshot = this.browser.snapshotFull();
@@ -1305,6 +1520,7 @@ export class Explorer {
         decisionSnapshot,
         stepsTaken,
         decisionImage,
+        Boolean(options?.manualMode),
       );
       console.log(
         `  [explorer] LLM responded in ${Date.now() - llmStart}ms → ${decision.action}${decision.ref ? ` ${decision.ref}` : ''}${decision.reason ? ` (${decision.reason})` : ''}`,
@@ -1349,6 +1565,44 @@ export class Explorer {
         continue;
       }
 
+      if (
+        options?.manualReadOnly &&
+        isManualMutationAction(
+          decision.action,
+          decision.resolvedLabel,
+          decision.reason,
+        )
+      ) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `blocked mutation during manual read-only proof (${decision.action} "${
+            decision.resolvedLabel ?? decision.ref ?? ''
+          }"); inspect existing evidence or finish without changing application state`,
+        );
+        continue;
+      }
+
+      if (
+        options?.manualMode &&
+        decision.action === 'click' &&
+        decision.ref &&
+        !decision.resolvedLabel &&
+        !isGroundedManualUnlabelledClick(
+          decision.resolvedRole,
+          decision.resolvedLabel,
+          decision.reason,
+          Boolean(decisionImage),
+        )
+      ) {
+        decision.executionFailed = true;
+        actions.push(decision);
+        stepsTaken.push(
+          `deferred ambiguous unlabeled manual click ${decision.ref}: screenshot presence alone is not proof; use "VISUALLY CONFIRMED:" only when the exact icon purpose is unambiguous, otherwise choose a labeled control or fail`,
+        );
+        continue;
+      }
+
       // An unlabeled icon can be Edit, Report a Bug, Delete, or navigation; its
       // ref alone carries no semantics. During a one-screen deep walk, defer it
       // until a screenshot-assisted decision has grounded its purpose.
@@ -1367,6 +1621,25 @@ export class Explorer {
           `deferred unlabeled progress click ${decision.ref}: use screenshot-assisted recovery to identify the icon before activating it`,
         );
         continue;
+      }
+
+      let manualClickKey: string | undefined;
+      if (options?.manualMode && decision.action === 'click' && decision.ref) {
+        const decisionState = explorerStateSignature(url, decisionSnapshot);
+        manualClickKey = `${decisionState}|${decision.ref}`;
+        if (
+          ineffectiveManualClickRefs.has(decision.ref) ||
+          attemptedManualClickKeys.has(manualClickKey)
+        ) {
+          decision.executionFailed = true;
+          actions.push(decision);
+          stepsTaken.push(
+            `blocked repeated manual click ${decision.ref}${
+              decision.resolvedLabel ? ` ("${decision.resolvedLabel}")` : ''
+            } from the same state; its bounded attempt was already consumed`,
+          );
+          continue;
+        }
       }
 
       const normalizedDecisionLabel = decision.resolvedLabel?.trim().toLowerCase();
@@ -1399,6 +1672,14 @@ export class Explorer {
                 (
                   action.resolvedLabel?.trim().toLowerCase() === decision.resolvedLabel!.trim().toLowerCase() ||
                   (
+                    // Broad mutation-family aliases are useful for ordinary
+                    // one-shot crawl recovery ("Generate" vs "Regenerate"),
+                    // but are unsafe inside a detailed manual contract. A
+                    // single form can legitimately contain distinct controls
+                    // such as "Add Character", "Add Assets", and "Add (1)".
+                    // Treating all of them as key "add" suppressed the FIRST
+                    // Add(1) click in both live Manual v1 and v2 Audio runs.
+                    !options?.manualMode &&
                     currentMutationKey &&
                     mutationControlKey(action.resolvedLabel ?? '') === currentMutationKey
                   )
@@ -1543,12 +1824,20 @@ export class Explorer {
         // through to the original honest abort unchanged.
         try {
           const fullSnapshot = this.browser.snapshotFull();
-          const recheck = await this.decideNextAction(goal, url, fullSnapshot, [
-            ...stepsTaken,
-            'note: the interactive view showed no change after repeating this action. Use the screenshot plus FULL page content to check for a non-interactive result, visible validation rule, modal, disabled GENERATING control, or other progress state before giving up.',
-          ], this.captureVisionImage());
+          const recheck = await this.decideNextAction(
+            goal,
+            url,
+            fullSnapshot,
+            [
+              ...stepsTaken,
+              'note: the interactive view showed no change after repeating this action. Use the screenshot plus FULL page content to check for a non-interactive result, visible validation rule, modal, disabled GENERATING control, or other progress state before giving up.',
+            ],
+            this.captureVisionImage(),
+            Boolean(options?.manualMode),
+          );
           if (recheck.action === 'done') {
             if (
+              options?.allowDoneWithoutProgress ||
               doneHasObservableProgress(
                 goal,
                 goalStartUrl,
@@ -1670,6 +1959,7 @@ export class Explorer {
         }
         const doneSnapshot = fullSnapshot;
         if (
+          !options?.allowDoneWithoutProgress &&
           !processingVisuallyComplete &&
           !doneHasObservableProgress(
             goal,
@@ -1700,6 +1990,51 @@ export class Explorer {
         };
       }
 
+      let manualClickBefore: string | undefined;
+      if (
+        options?.manualMode &&
+        decision.action === 'click' &&
+        decision.ref
+      ) {
+        let beforeSnapshot = decisionSnapshot;
+        try {
+          beforeSnapshot = this.browser.snapshotFull();
+        } catch {
+          // The decision snapshot is still a conservative baseline.
+        }
+        manualClickBefore = explorerStateSignature(url, beforeSnapshot);
+        if (manualClickKey) attemptedManualClickKeys.add(manualClickKey);
+      }
+      if (
+        options?.manualMode &&
+        decision.action === 'click' &&
+        /\bexactly three distinct characters\b/i.test(goal) &&
+        /^(?:next|continue|save and continue|proceed)$/i.test(
+          decision.resolvedLabel?.trim() ?? '',
+        )
+      ) {
+        const assessment = await this.assessManualPreAdvanceState(
+          goal,
+          url,
+          [
+            decisionSnapshot,
+            ...actions
+              .filter((action) => !action.executionFailed && !action.deniedByUser)
+              .map(
+                (action) =>
+                  `${action.action} "${action.resolvedLabel ?? action.ref ?? ''}"${
+                    action.uploadedPath ? ` uploaded "${action.uploadedPath}"` : ''
+                  }`,
+              ),
+          ].join('\n'),
+        );
+        if (assessment) {
+          decision.visualAssessment = assessment;
+          stepsTaken.push(
+            `manual pre-advance vision: ${assessment.status} — ${assessment.summary}`,
+          );
+        }
+      }
       try {
         await this.executeAction(decision, stepsTaken);
         if (decision.deniedByUser && decision.resolvedLabel) {
@@ -1727,6 +2062,43 @@ export class Explorer {
         // a dialog may have appeared between the check above and this wait
         // (rare timing edge) — resolve once more and move on regardless.
         resolveBlockingDialog(this.browser);
+      }
+
+      // Browser command success is not application success. In manual mode,
+      // require a mutation click to produce an observable URL/semantic-state
+      // change before it can become recipe/evidence or suppress a retry. Give
+      // delayed frameworks one bounded settle turn. This is intentionally
+      // manual-only: normal crawler/replay timing and one-shot behavior remain
+      // exactly as before.
+      if (
+        options?.manualMode &&
+        decision.action === 'click' &&
+        !decision.executionFailed &&
+        decision.ref &&
+        typeof manualClickBefore === 'string'
+      ) {
+        let effectObserved = false;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const effectUrl = this.browser.getUrl();
+          let effectSnapshot = this.browser.snapshotInteractive();
+          try {
+            effectSnapshot = this.browser.snapshotFull();
+          } catch {
+            // Interactive state remains sufficient for the comparison.
+          }
+          effectObserved =
+            effectUrl !== url ||
+            explorerStateSignature(effectUrl, effectSnapshot) !== manualClickBefore;
+          if (effectObserved || attempt === 1) break;
+          this.browser.wait(Math.max(config.actionDelayMs, 1500));
+        }
+        if (!effectObserved) {
+          decision.executionFailed = true;
+          ineffectiveManualClickRefs.add(decision.ref);
+          stepsTaken.push(
+            `manual click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel ?? decision.ref}") produced no observable application-state change; this control is blacklisted for the rest of the task`,
+          );
+        }
       }
 
       // A wait can be the final action on a screen: the preceding Save/Continue
@@ -1854,6 +2226,7 @@ export class Explorer {
     snapshot: string,
     priorSteps: string[],
     image?: { data: string; mediaType: 'image/png' },
+    manualMode = false,
   ): Promise<ExplorerAction> {
     const userPrompt = [
       `Goal: ${goal}`,
@@ -1864,7 +2237,10 @@ export class Explorer {
     ].join('\n\n');
 
     const messages: LlmMessage[] = [
-      { role: 'system', content: buildSystemPrompt(this.siteDescription, this.siteHints) },
+      {
+        role: 'system',
+        content: buildSystemPrompt(this.siteDescription, this.siteHints, manualMode),
+      },
       { role: 'user', content: userPrompt },
     ];
 
@@ -1919,7 +2295,9 @@ export class Explorer {
         // misreading a parse crash as a legitimate idempotent skip.
         return {
           action: 'fail',
-          reason: 'LLM reply could not be parsed as a valid action after one retry (see logs for detail).',
+          reason:
+            llmInfrastructureBlockReason(message) ??
+            'LLM reply could not be parsed as a valid action after one retry (see logs for detail).',
         };
       }
     }

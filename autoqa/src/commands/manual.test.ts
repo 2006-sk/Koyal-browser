@@ -4,6 +4,7 @@ import type { SiteMap } from '../agent/sitemap.js';
 import {
   bestManualFlow,
   bestManualPage,
+  manualAcceptanceChecklist,
   planManualRequest,
   upsertManualFlow,
   validateManualPlan,
@@ -76,6 +77,38 @@ test('upsertManualFlow creates a stable focused flow and does not duplicate it',
   assert.equal(saves, 1);
 });
 
+test('focused task-graph flow runs enumerated functions as separate milestones', () => {
+  const map = sitemap();
+  const request =
+    'Test the visible final-video functions Retake, Add Reference using a file, and Reframe; verify the video after each operation';
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    {
+      mode: 'focused-page',
+      targetPageId: 'locations',
+      title: 'Focused functions',
+      goal: request,
+      kind: 'edit',
+    },
+    { engine: 'task-graph' },
+  );
+
+  assert.deepEqual(
+    flow.manualExecution?.tasks.map((task) => task.requirement),
+    [
+      'Test the visible final-video function: Retake; verify the video after each operation',
+      'Test the visible final-video function: Add Reference using a file; verify the video after each operation',
+      'Test the visible final-video function: Reframe; verify the video after each operation',
+    ],
+  );
+  assert.deepEqual(
+    flow.milestones.map((milestone) => milestone.id),
+    ['manual-task-1', 'manual-task-2', 'manual-task-3', 'manual-task-final-proof'],
+  );
+  assert.equal(flow.milestones[1].kind, 'upload');
+});
+
 test('upsertManualFlow creates a request-specific copy of a matching platform flow', () => {
   const map = sitemap();
   const original = {
@@ -103,12 +136,377 @@ test('upsertManualFlow creates a request-specific copy of a matching platform fl
   assert.match(selected.id, /^manual-/);
   assert.equal(selected.status, 'exploratory');
   assert.equal(selected.qualification?.phase, 'learning');
-  assert.match(selected.milestones[0].goal, /Click Add New Location, name it Harbor Point, and save it/);
+  assert.equal(
+    selected.manualContract?.request,
+    'Click Add New Location, name it Harbor Point, and save it',
+  );
   assert.match(selected.milestones[0].goal, /Create a location/);
+  assert.equal(selected.milestones.at(-2)?.manualContractAudit, true);
+  assert.match(selected.milestones.at(-1)?.goal ?? '', /FINAL MANUAL CONTRACT PROOF/);
   assert.equal(original.status, 'proposed');
   assert.equal(original.milestones[0].goal, 'Create a location');
   assert.equal(map.flows.length, 2);
   assert.equal(saves, 1);
+});
+
+test('task-graph manual engine stores compact active tasks without mutating the source flow', () => {
+  const map = sitemap();
+  const original = {
+    id: 'location-e2e',
+    title: 'Location end to end',
+    description: 'Create and persist a location',
+    status: 'deterministic',
+    entry: { pageId: 'locations', url: '/locations' },
+    milestones: [
+      {
+        id: 'open',
+        goal: 'Open locations',
+        kind: 'navigate',
+        guardPhases: ['locations'],
+      },
+      {
+        id: 'final',
+        goal: 'Verify the final persisted location',
+        kind: 'verify',
+        guardPhases: ['locations'],
+      },
+    ],
+  } satisfies SiteMap['flows'][number];
+  map.flows.push(original);
+  const request =
+    'Create one new location and verify it persists. After rendering verify the final artifact.';
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    {
+      mode: 'existing-flow',
+      existingFlowId: original.id,
+      title: original.title,
+      goal: request,
+      kind: 'create',
+    },
+    { engine: 'task-graph' },
+  );
+
+  assert.equal(flow.manualExecution?.version, 1);
+  assert.equal(flow.manualExecution?.policy.context, 'active-task');
+  assert.deepEqual(
+    flow.manualExecution?.tasks.map((task) => task.requirement),
+    [
+      'Create one new location and verify it persists',
+      'After rendering verify the final artifact',
+    ],
+  );
+  assert.ok(flow.milestones.some((milestone) => milestone.manualTaskId === 'acceptance-1'));
+  assert.ok(flow.milestones.some((milestone) => milestone.id === 'manual-task-final-proof'));
+  assert.doesNotMatch(flow.milestones[0].goal, /After rendering verify/);
+  assert.equal(original.milestones[0].goal, 'Open locations');
+});
+
+test('task-graph end-to-end creation starts through a dedicated fresh-entry checkpoint', () => {
+  const map = sitemap();
+  map.pages.dashboard.interactives.push({
+    label: 'New Project',
+    role: 'button',
+    category: 'create',
+  });
+  const original = {
+    id: 'script-video',
+    title: 'Script to final video',
+    description: 'Upload a script and render a video',
+    status: 'deterministic',
+    entry: { pageId: 'locations', url: '/upload' },
+    milestones: [
+      {
+        id: 'upload',
+        goal: 'Upload script',
+        kind: 'upload',
+        guardPhases: ['locations'],
+      },
+      {
+        id: 'final',
+        goal: 'Verify final video',
+        kind: 'verify',
+        guardPhases: ['locations'],
+      },
+    ],
+  } satisfies SiteMap['flows'][number];
+  map.flows.push(original);
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    'Upload a script and create a final rendered video.',
+    {
+      mode: 'existing-flow',
+      existingFlowId: original.id,
+      title: original.title,
+      goal: 'Upload a script and create a final rendered video.',
+      kind: 'create',
+    },
+    { engine: 'task-graph' },
+  );
+  assert.equal(flow.entry.pageId, 'dashboard');
+  assert.equal(flow.milestones[0].id, 'manual-fresh-entry');
+  assert.deepEqual(flow.milestones[0].guardPhases, ['dashboard']);
+  assert.equal(flow.milestones[0].manualJourneyDestinationPageId, 'locations');
+  assert.match(flow.milestones[0].goal, /New Project/);
+  assert.equal(flow.milestones[1].id, 'upload');
+  assert.ok(flow.manualExecution?.primaryJourneyPageIds.includes('dashboard'));
+});
+
+test('task-graph location creation targets the mapped wizard instead of the read-only library', () => {
+  const map = sitemap();
+  const now = new Date().toISOString();
+  map.pages['wizard-locations'] = {
+    id: 'wizard-locations',
+    title: 'Locations',
+    description: 'Wizard step for creating and editing story locations',
+    urlPatterns: ['/wizard/locations'],
+    detection: { snapshotAnyOf: ['Location Description', 'Add New Location'] },
+    requiresAuth: true,
+    kind: 'wizard-step',
+    interactives: [
+      { label: 'Add New Location', role: 'button', category: 'create' },
+      { label: 'Edit', role: 'button', category: 'edit' },
+    ],
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
+  const original = {
+    id: 'script-video',
+    title: 'Script video workflow',
+    description: 'Render a video',
+    status: 'deterministic',
+    entry: { pageId: 'dashboard' },
+    milestones: [
+      {
+        id: 'locations-step',
+        goal: 'Advance through locations',
+        kind: 'navigate',
+        guardPhases: ['wizard-locations'],
+      },
+    ],
+  } satisfies SiteMap['flows'][number];
+  map.flows.push(original);
+  const state = { sitemap: map, saveSitemap: () => {} };
+  const createFlow = upsertManualFlow(
+    state,
+    'Create one new test location and edit it.',
+    {
+      mode: 'existing-flow',
+      existingFlowId: original.id,
+      title: original.title,
+      goal: 'Create one new test location and edit it.',
+      kind: 'create',
+    },
+    { engine: 'task-graph' },
+  );
+  assert.equal(createFlow.manualExecution?.tasks[0].targetPageId, 'wizard-locations');
+});
+
+test('both manual planners route location creation to the mapped builder capability', () => {
+  const map = sitemap();
+  const now = new Date().toISOString();
+  map.pages['locations-list'] = {
+    id: 'locations-list',
+    title: 'Your Locations',
+    description: 'Search and manage saved locations',
+    urlPatterns: ['/locations-list'],
+    detection: { snapshotAnyOf: ['Your Locations'] },
+    requiresAuth: true,
+    interactives: [
+      { label: 'Search locations', role: 'textbox', category: 'edit' },
+      { label: 'Edit Harbor', role: 'button', category: 'edit' },
+    ],
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
+  map.pages['wizard-locations'] = {
+    id: 'wizard-locations',
+    title: 'Locations',
+    description: 'Wizard location builder',
+    urlPatterns: ['/wizard/locations'],
+    detection: { snapshotAnyOf: ['Add New Location'] },
+    requiresAuth: true,
+    kind: 'wizard-step',
+    interactives: [
+      { label: 'Add New Location', role: 'button', category: 'create' },
+      { label: 'Regenerate', role: 'button', category: 'edit' },
+    ],
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
+
+  const plan = validateManualPlan(
+    map,
+    'Go to Locations, create one new location and edit its description',
+    {
+      mode: 'focused-page',
+      targetPageId: 'locations-list',
+      title: 'Location lifecycle',
+      kind: 'create',
+    },
+  );
+
+  assert.equal(plan.mode, 'focused-page');
+  assert.equal(plan.targetPageId, 'wizard-locations');
+});
+
+test('stateful manual capability inherits the mapped journey prefix instead of direct-opening its URL', () => {
+  const map = sitemap();
+  const now = new Date().toISOString();
+  map.pages['wizard-locations'] = {
+    id: 'wizard-locations',
+    title: 'Locations',
+    description: 'Wizard location builder',
+    urlPatterns: ['/wizard/locations'],
+    detection: { snapshotAnyOf: ['Add New Location'] },
+    requiresAuth: true,
+    kind: 'wizard-step',
+    interactives: [
+      { label: 'Add New Location', role: 'button', category: 'create' },
+    ],
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
+  map.flows.push({
+    id: 'script-journey',
+    title: 'Script journey',
+    description: 'Mapped script journey',
+    status: 'exploratory',
+    entry: { pageId: 'dashboard' },
+    milestones: [
+      { id: 'upload', goal: 'Upload script', kind: 'upload', guardPhases: ['dashboard'] },
+      { id: 'theme', goal: 'Choose theme', kind: 'navigate', guardPhases: ['locations'] },
+      {
+        id: 'locations-step',
+        goal: 'Configure locations',
+        kind: 'navigate',
+        guardPhases: ['wizard-locations'],
+      },
+      { id: 'final', goal: 'Render final video', kind: 'verify' },
+    ],
+  });
+
+  const plan = validateManualPlan(map, 'Create one new location', {
+    mode: 'focused-page',
+    targetPageId: 'wizard-locations',
+  });
+  assert.equal(plan.mode, 'existing-flow');
+  assert.equal(plan.existingFlowId, 'script-journey');
+
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    'Create one new location',
+    plan,
+  );
+  assert.deepEqual(
+    flow.milestones
+      .filter((milestone) => !milestone.manualContractAudit)
+      .map((milestone) => milestone.id),
+    ['upload', 'theme', 'locations-step', 'manual-contract-final-proof'],
+  );
+  assert.ok(!flow.milestones.some((milestone) => milestone.id === 'final'));
+});
+
+test('focused legacy manual flows carry the contract and disable generic replay probes', () => {
+  const map = sitemap();
+  const request = 'Create one location and verify it persists';
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    {
+      mode: 'focused-page',
+      targetPageId: 'locations',
+      title: 'Create location',
+      goal: request,
+      kind: 'create',
+    },
+  );
+
+  assert.deepEqual(flow.manualContract?.checklist, [request]);
+  assert.equal(flow.milestones[0].manualContractAudit, true);
+  assert.equal(flow.milestones.at(-1)?.id, 'manual-contract-final-proof');
+  assert.match(flow.milestones.at(-1)?.goal ?? '', /Do not perform another mutation/);
+});
+
+test('detailed manual flow preserves atomic acceptance clauses and audits beyond mapped terminal state', () => {
+  const map = sitemap();
+  map.pages.dashboard.interactives.push({
+    label: 'New Project',
+    role: 'button',
+    category: 'create',
+  });
+  map.flows.push({
+    id: 'script-video',
+    title: 'Script to final video',
+    description: 'Upload a script and render a final video',
+    status: 'deterministic',
+    entry: { pageId: 'locations', url: '/upload' },
+    milestones: [
+      { id: 'script', goal: 'Edit Script and advance', kind: 'edit' },
+      { id: 'scenes', goal: 'Edit scenes', kind: 'edit' },
+      { id: 'final', goal: 'Verify final rendered video', kind: 'verify' },
+    ],
+  });
+  const request =
+    'Start one genuinely new project through the verified Dashboard to New Project button path. ' +
+    'Change one character voice, change one emotion, and edit one dialogue line. ' +
+    'After rendering, test Edit Video, Retake, Add Reference, and Reframe.';
+  assert.deepEqual(manualAcceptanceChecklist(request), [
+    'Start one genuinely new project through the verified Dashboard to New Project button path',
+    'Change one character voice, change one emotion, and edit one dialogue line',
+    'After rendering, test Edit Video, Retake, Add Reference, and Reframe',
+  ]);
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    {
+      mode: 'existing-flow',
+      existingFlowId: 'script-video',
+      title: 'Script',
+      goal: request,
+      kind: 'create',
+    },
+  );
+  assert.equal(flow.entry.pageId, 'dashboard');
+  assert.equal(flow.entry.url, 'https://example.test/dashboard');
+  assert.deepEqual(flow.milestones[0].guardPhases, ['dashboard']);
+  assert.match(flow.milestones[0].goal, /activate the mapped "New Project" control/);
+  assert.match(flow.milestones[0].goal, /do not use a resumed draft/i);
+  assert.ok(
+    flow.milestones
+      .filter((milestone) => !milestone.manualContractAudit)
+      .slice(0, 2)
+      .every((milestone) => /Manual acceptance contract is active/.test(milestone.goal)),
+  );
+  assert.ok(
+    flow.milestones
+      .filter((milestone) => !milestone.manualContractAudit)
+      .slice(0, 2)
+      .every((milestone) => !/Non-optional acceptance checklist/.test(milestone.goal)),
+  );
+  assert.match(flow.milestones[0].goal, /Before using a forward\/Next control/);
+  assert.equal(flow.manualContract?.checklist.length, 3);
+  const audits = flow.milestones.filter((milestone) => milestone.manualContractAudit);
+  assert.equal(audits.length, 3);
+  assert.deepEqual(audits.map((milestone) => milestone.manualContractItem), [1, 2, 3]);
+  assert.ok(audits.every((milestone) => milestone.kind === 'navigate'));
+  assert.match(audits[1]?.goal ?? '', /Audit only acceptance item 2/);
+  assert.match(audits[1]?.goal ?? '', /one mapped-page recovery/);
+  assert.deepEqual(
+    flow.milestones.map((milestone) => milestone.id),
+    [
+      'script',
+      'scenes',
+      'manual-contract-audit-1',
+      'manual-contract-audit-2',
+      'final',
+      'manual-contract-audit-3',
+      'manual-contract-final-proof',
+    ],
+  );
+  assert.equal(flow.milestones.at(-1)?.kind, 'verify');
+  assert.match(flow.milestones.at(-1)?.goal ?? '', /every numbered obligation/);
 });
 
 test('a stricter follow-up request never reuses a stale generated manual flow', () => {
@@ -283,14 +681,16 @@ test('audio rendered-video request selects and copies every milestone of the ful
   const plan = validateManualPlan(map, request, {});
   assert.equal(plan.mode, 'existing-flow');
   const manual = upsertManualFlow({ sitemap: map, saveSitemap: () => {} }, request, plan);
-  assert.equal(manual.milestones.length, 3);
-  assert.deepEqual(manual.milestones.map((milestone) => milestone.id), [
+  assert.equal(manual.milestones.length, 5);
+  assert.deepEqual(manual.milestones.slice(0, 3).map((milestone) => milestone.id), [
     'upload',
     'theme',
     'render',
   ]);
-  assert.ok(manual.milestones.every((milestone) => milestone.goal.includes(request)));
-  assert.equal(manual.milestones.at(-1)?.successHint, 'Final video');
+  assert.equal(manual.manualContract?.request, request);
+  assert.equal(manual.milestones[2]?.successHint, 'Final video');
+  assert.equal(manual.milestones.at(-2)?.manualContractAudit, true);
+  assert.match(manual.milestones.at(-1)?.goal ?? '', /FINAL MANUAL CONTRACT PROOF/);
 });
 
 test('malformed planning output falls back to the matching complete flow', async () => {
@@ -334,6 +734,157 @@ test('a feature appearing only inside an unrelated long flow does not hijack a f
   const plan = validateManualPlan(map, 'test locations', {});
   assert.equal(plan.mode, 'focused-page');
   assert.equal(plan.targetPageId, 'locations');
+});
+
+test('a focused character upload trims a required wizard path after its character checkpoint', () => {
+  const map = sitemap();
+  map.pages.characters = {
+    id: 'characters',
+    title: 'Characters',
+    description: 'Create, upload, and manage reusable characters',
+    urlPatterns: ['/characters'],
+    detection: { snapshotAnyOf: ['Your Characters'] },
+    requiresAuth: true,
+    interactives: [
+      { label: 'Add New Character', role: 'button', category: 'create' },
+      { label: 'Upload image', role: 'button', category: 'upload' },
+    ],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.pages.storyType = {
+    id: 'wizard-story-type',
+    title: 'Select Story Type',
+    description: 'Choose Character Driven and add characters to the project',
+    urlPatterns: ['/selectStoryType'],
+    detection: { snapshotAnyOf: ['Character Driven'] },
+    requiresAuth: true,
+    interactives: [
+      { label: 'Character Driven', role: 'button', category: 'edit' },
+      { label: 'Upload image', role: 'button', category: 'upload' },
+    ],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.flows.push({
+    id: 'audio-wizard',
+    title: 'Start with Audio Upload',
+    description: 'Upload audio and complete the full video wizard',
+    status: 'deterministic',
+    entry: { pageId: 'dashboard' },
+    milestones: [
+      { id: 'upload', goal: 'Upload an audio file', kind: 'upload' },
+      { id: 'character', goal: 'Create or upload a character image', kind: 'create' },
+      { id: 'theme', goal: 'Choose a story theme', kind: 'edit' },
+      { id: 'style', goal: 'Choose a video style', kind: 'edit' },
+      { id: 'render', goal: 'Render the final video', kind: 'create' },
+    ],
+  });
+  const request =
+    'Go to Characters and create exactly one new character using a character image file I provide. Use a realistic human name, finalize it, and verify it persists in the character library.';
+
+  assert.equal(bestManualFlow(map, request)?.id, 'audio-wizard');
+  const plan = validateManualPlan(map, request, {
+    mode: 'existing-flow',
+    existingFlowId: 'audio-wizard',
+    title: 'Character upload',
+    goal: request,
+    kind: 'upload',
+  });
+  assert.equal(plan.mode, 'existing-flow');
+  const legacy = upsertManualFlow({ sitemap: map, saveSitemap: () => {} }, request, plan);
+  assert.match(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Upload an audio file/);
+  assert.match(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Create or upload a character image/);
+  assert.doesNotMatch(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Choose a story theme|Render the final video/);
+  assert.match(legacy.milestones.at(-1)?.goal ?? '', /focused result remains visibly completed/);
+
+  const taskGraph = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    plan,
+    { engine: 'task-graph' },
+  );
+  assert.doesNotMatch(
+    taskGraph.milestones.map((milestone) => milestone.goal).join('\n'),
+    /Choose a story theme|Render the final video/,
+  );
+  assert.equal(taskGraph.manualExecution?.tasks.length, 1);
+  assert.equal(taskGraph.manualExecution?.tasks[0]?.targetPageId, 'wizard-story-type');
+  assert.match(
+    taskGraph.manualExecution?.tasks[0]?.requirement ?? '',
+    /Go to Characters and create exactly one new character/,
+  );
+  assert.match(taskGraph.milestones.at(-1)?.goal ?? '', /focused result remains visibly completed/);
+});
+
+test('a destructive character request never reuses a character-creation flow', () => {
+  const map = sitemap();
+  map.pages.characters = {
+    id: 'characters',
+    title: 'Characters',
+    description: 'Create and delete saved characters',
+    urlPatterns: ['/characters'],
+    detection: { snapshotAnyOf: ['Your Characters'] },
+    requiresAuth: true,
+    interactives: [
+      { label: 'New Character', role: 'button', category: 'create' },
+      { label: 'Delete (Mina)', role: 'button', category: 'edit' },
+    ],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.flows.push({
+    id: 'create-character',
+    title: 'Create character',
+    description: 'Create and finalize a character',
+    status: 'deterministic',
+    entry: { pageId: 'characters' },
+    milestones: [
+      { id: 'create', goal: 'Create one character', kind: 'create' },
+      { id: 'verify', goal: 'Verify the character persists', kind: 'verify' },
+    ],
+  });
+  const request = 'Go to Characters and delete exactly 10 existing characters.';
+  assert.equal(bestManualFlow(map, request), undefined);
+  const plan = validateManualPlan(map, request, {
+    mode: 'existing-flow',
+    existingFlowId: 'create-character',
+    title: 'Wrong mutation',
+    goal: request,
+    kind: 'edit',
+  });
+  assert.equal(plan.mode, 'focused-page');
+  assert.equal(plan.targetPageId, 'characters');
+});
+
+test('a generic projects request prefers the primary projects page over a qualified collaborated-projects page', () => {
+  const map = sitemap();
+  map.pages.projects = {
+    id: 'projects-list',
+    title: 'Your Projects',
+    description: 'Lists video projects with status tabs and pagination',
+    urlPatterns: ['/projects'],
+    detection: { snapshotAnyOf: ['Your Projects'] },
+    requiresAuth: true,
+    interactives: [{ label: 'Search projects', role: 'textbox', category: 'unknown' }],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.pages.collaborated = {
+    id: 'collaborated-projects-list',
+    title: 'Collaborated Projects',
+    description: 'Lists projects shared by other users',
+    urlPatterns: ['/collaborated-projects'],
+    detection: { snapshotAnyOf: ['Collaborated Projects'] },
+    requiresAuth: true,
+    interactives: [],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  assert.equal(
+    bestManualPage(map, 'Go to Projects and delete exactly 10 existing projects')?.id,
+    'projects-list',
+  );
 });
 
 test('a single distinctive feature name can still select its purpose-built flow', () => {

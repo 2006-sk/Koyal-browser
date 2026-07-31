@@ -56,21 +56,36 @@ export function hasVerifiedTerminalArtifact(
   const finalStep = [...milestoneSteps]
     .reverse()
     .find((step) => step.workflow === finalMilestone.id || step.workflow === finalWorkflowId);
-  if (!finalStep || finalStep.result.verdict !== 'pass') return false;
+  const terminalProofSteps =
+    flow.manualContract
+      ? flow.milestones.flatMap((milestone) => {
+          if (!/\b(final video|terminal artifact|create video)\b/i.test(milestone.goal)) return [];
+          const workflowId = `${flow.id}:${milestone.id}`;
+          const proof = [...milestoneSteps]
+            .reverse()
+            .find((step) => step.workflow === milestone.id || step.workflow === workflowId);
+          return proof ? [proof] : [];
+        })
+      : finalStep
+        ? [finalStep]
+        : [];
+  const passingTerminalProofs = terminalProofSteps.filter((step) => step.result.verdict === 'pass');
+  if (passingTerminalProofs.length === 0) return false;
   if (finalPageKind === 'terminal') return true;
+  const terminalProof = passingTerminalProofs.at(-1)!;
   // recordVerifiedStep sets this only after the dedicated artifact-persistence
   // vision prompt confirms that the new item is visibly saved in its
   // list/library or that the terminal artifact is usable. Do not throw that
   // structured proof away and try to infer it again from incidental DOM words:
   // Koyal's completed Asset/Outfit pages use ordinary card UI and may contain
   // none of the generic "completed/download" vocabulary below.
-  if (finalStep.result.artifactPersistenceVerified) return true;
+  if (terminalProof.result.artifactPersistenceVerified) return true;
 
   const signalText = [
-    finalStep.result.signals.url,
-    finalStep.result.signals.title,
-    finalStep.result.signals.snapshot.raw,
-    finalStep.result.signals.snapshot.interactive,
+    terminalProof.result.signals.url,
+    terminalProof.result.signals.title,
+    terminalProof.result.signals.snapshot.raw,
+    terminalProof.result.signals.snapshot.interactive,
   ]
     .join('\n')
     .toLowerCase();
@@ -81,9 +96,15 @@ export function hasVerifiedTerminalArtifact(
   if (artifactVisible) return true;
 
   const goalPromisesPersistence =
-    /\b(verify|confirm)\b/i.test(finalMilestone.goal) &&
-    /\b(persist|appears?|visible|list|library|artifact|playable|downloadable|completed)\b/i.test(finalMilestone.goal);
-  return goalPromisesPersistence && finalStep.result.visualAssessment?.status === 'clear';
+    flow.milestones.some(
+      (milestone) =>
+        /\b(final video|terminal artifact|create video)\b/i.test(milestone.goal) &&
+        /\b(verify|confirm|wait)\b/i.test(milestone.goal) &&
+        /\b(persist|appears?|visible|list|library|artifact|playable|downloadable|completed|rendered)\b/i.test(
+          milestone.goal,
+        ),
+    );
+  return goalPromisesPersistence && terminalProof.result.visualAssessment?.status === 'clear';
 }
 
 export interface QualificationInput {
@@ -92,6 +113,22 @@ export interface QualificationInput {
   terminalArtifactVerified: boolean;
   allRecipesPresent: boolean;
   now?: string;
+}
+
+/**
+ * A learning run that proves a terminal artifact and passes at least 80% of
+ * its milestones has learned enough to enter replay validation. Uncertain or
+ * failed milestones stay visible and are retried there; they are never counted
+ * as passes. Hard deterministic promotion remains intentionally stricter.
+ */
+export const REPLAY_VALIDATION_MIN_PASS_RATE = 0.8;
+
+function passRate(flow: Flow, byId: Map<string, MilestoneExecution>): number {
+  if (flow.milestones.length === 0) return 0;
+  const passes = flow.milestones.filter(
+    (milestone) => byId.get(milestone.id)?.verdict === 'pass',
+  ).length;
+  return passes / flow.milestones.length;
 }
 
 /** Update the flow's lifecycle after one full attempted run. */
@@ -104,19 +141,22 @@ export function qualifyFlowAfterRun(flow: Flow, input: QualificationInput): stri
   const everyMilestoneReplayed = flow.milestones.every(
     (milestone) => byId.get(milestone.id)?.execution === 'replay',
   );
+  const replayCoverage = passRate(flow, byId);
+  const replayEligible =
+    replayCoverage >= REPLAY_VALIDATION_MIN_PASS_RATE && input.terminalArtifactVerified;
   const fullyLearned = everyMilestonePassed && input.allRecipesPresent && input.terminalArtifactVerified;
 
   if (input.mode === 'learning') {
     flow.status = 'exploratory';
-    flow.qualification = fullyLearned
+    flow.qualification = replayEligible
       ? {
           phase: 'replay-validation',
           learnedAt: now,
           terminalArtifactVerifiedAt: now,
         }
       : { phase: 'learning' };
-    return fullyLearned
-      ? 'all milestones learned with terminal evidence; replay validation is required before promotion'
+    return replayEligible
+      ? `${Math.round(replayCoverage * 1000) / 10}% of milestones passed with terminal evidence; entered replay validation`
       : 'flow remains exploratory because one or more milestones/recipes/terminal checks are incomplete';
   }
 
@@ -154,14 +194,14 @@ export function qualifyFlowAfterRun(flow: Flow, input: QualificationInput): stri
   }
 
   flow.status = 'exploratory';
-  flow.qualification = fullyLearned
+  flow.qualification = replayEligible
     ? {
         phase: 'replay-validation',
         learnedAt: flow.qualification?.learnedAt ?? now,
         terminalArtifactVerifiedAt: now,
       }
     : { phase: 'learning' };
-  return fullyLearned
-    ? 'recipe fallback occurred; refreshed recipes must pass a complete replay-validation run'
+  return replayEligible
+    ? 'at least 80% of milestones passed with terminal evidence; replay validation remains active while missing or refreshed recipes are retried'
     : 'deterministic proof was lost; flow demoted to exploratory learning';
 }

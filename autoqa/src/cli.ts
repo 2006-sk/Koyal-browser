@@ -23,6 +23,7 @@ Flags:
   --url <URL>        target site (or AUTOQA_URL in .env)
   --flow id[,id]     only these flow ids (test/run)
   --manual "<goal>"  use the saved sitemap to run one focused, recipe-learning test
+  --manual-v2        compile --manual into small dependency-aware tasks (opt-in)
   --fresh            re-explore even if a sitemap exists (run)
   --wipeout          delete all saved state for this site, then explore + test from zero (run)
   --reset-values     forget saved names/field values, then ask again during explore or replay
@@ -104,7 +105,9 @@ async function main(): Promise<number> {
       }
       resetValuesBeforeCommand();
       if (flagValue(argv, '--manual')) {
-        const { failed } = await manualCommand(flagValue(argv, '--manual')!);
+        const { failed } = await manualCommand(flagValue(argv, '--manual')!, {
+          engine: argv.includes('--manual-v2') ? 'task-graph' : 'legacy',
+        });
         return failed > 0 ? 1 : 0;
       }
       return runCommand({ fresh: argv.includes('--fresh'), only });

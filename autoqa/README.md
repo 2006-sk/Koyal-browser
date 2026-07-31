@@ -199,6 +199,44 @@ field-value, guard, processing-wait, screenshot, and outcome-verification
 behavior still applies. `--manual` cannot be combined with `--wipeout`; map the
 site first.
 
+For long, multi-surface acceptance requests, opt into the task-graph engine:
+
+```bash
+npm run qa -- run \
+  --url https://your-app.example \
+  --manual-v2 \
+  --manual "Start a fresh project, upload a script, create an asset, use it in a scene, render the final video, and verify it is downloadable"
+```
+
+`--manual-v2` compiles the request once into small dependency-aware tasks.
+Focused requests may use the necessary prefix of a mapped multi-page journey
+(for example reaching an upload-only character step), but stop after that
+feature is completed and persisted. Only requests that explicitly ask for an
+end-to-end journey or final rendered artifact inherit the full mapped flow.
+Manual flow matching also respects the requested operation: an upload request
+needs an upload-capable path, a deletion request cannot reuse a creation recipe,
+and a render request needs a terminal render path.
+
+To compare the same focused requests in manual v1 and v2, use the checked-in
+10-test matrix. Runs are sequential and a reported product failure does not
+prevent later matrix cases from running:
+
+```bash
+npm run test:manual-matrix -- --url https://beta.koyal.ai
+npm run test:manual-matrix -- --url https://beta.koyal.ai --tests 3,6,9,10 --engines v1,v2
+```
+
+Matrix tests 6, 9, and 10 delete data. Test 6 deletes only the location it
+creates. Tests 9 and 10 delete exactly ten existing characters/projects and
+must be run only with explicit authorization for that account.
+Mapped journey checkpoints determine page order; explicit dependencies carry
+artifacts between tasks; policy sentences become constraints instead of extra
+browser actions. Only the active task is sent to the LLM, completed mutations
+are not repeated by later journey steps, and unresolved tasks make the final
+proof fail rather than being hidden by reaching a terminal page. This mode is
+opt-in and does not change ordinary crawling, exploration, or legacy manual
+runs.
+
 ## How sitemap coverage stays current
 
 AutoQA treats authentication as a change in the visible application surface,
@@ -354,6 +392,7 @@ inspect or delete stale walk/recipe data, and manage remembered guard choices.
 | `--url <URL>` | all | Target application. Overrides `AUTOQA_URL`. |
 | `--flow <id[,id]>` | `run`, `test` | Run only the listed flow IDs. |
 | `--manual "<request>"` | `run` | Use the saved sitemap to plan and run one focused, recipe-learning test. |
+| `--manual-v2` | `run --manual` | Compile a detailed manual request into a dependency-aware, active-task execution graph. |
 | `--fresh` | `run` | Force exploration while preserving saved state. |
 | `--wipeout` | `run` | Delete all saved AutoQA state for the hostname, then explore and test from zero. |
 | `--reset-values` | `run`, `explore`, `test` | Forget saved non-secret field answers but keep sitemap, recipes, and authentication. |
@@ -402,6 +441,8 @@ Selectors can be combined.
 | `AGENT_BROWSER_HEADED` | `true` | Set `false` to hide Chrome. |
 | `AGENT_SHOW_CURSOR` | `true` | Set `false` to hide the cursor overlay. |
 | `SLACK_BUGS_WEBHOOK_URL` | none | Post verified product bugs to Slack. Leave unset to disable posting. |
+| `KOYAL_ADMIN_TOKEN` | none | Admin token used only to fetch a matching backend error record for Slack bug reports. Never included in report output. |
+| `KOYAL_ADMIN_ERROR_LOGS_URL` | `https://<target-host>/v1/api/admin/error-logs?limit=300` for `*.koyal.ai` | Optional override for the backend error-log endpoint. |
 
 CLI flags override the corresponding environment values for that process.
 

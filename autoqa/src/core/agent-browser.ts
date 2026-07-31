@@ -687,19 +687,34 @@ export class AgentBrowser {
     }>;
   }
 
-  screenshotAnnotated(filePath: string): void {
+  screenshotAnnotated(filePath: string, options?: { fullPage?: boolean }): void {
     const baseArgs = ['--session', this.session, ...(this.headed ? ['--headed'] : [])];
+    const captureArgs = [
+      'screenshot',
+      '--annotate',
+      ...(options?.fullPage ? ['--full'] : []),
+      filePath,
+    ];
     const annotate = spawnSync(
       this.binary,
-      [...baseArgs, 'screenshot', '--annotate', filePath],
+      [...baseArgs, ...captureArgs],
       { encoding: 'utf8', timeout: 10_000 },
     );
     if (annotate.status === 0) return;
 
-    const plain = spawnSync(this.binary, [...baseArgs, 'screenshot', filePath], {
-      encoding: 'utf8',
-      timeout: 15_000,
-    });
+    const plain = spawnSync(
+      this.binary,
+      [
+        ...baseArgs,
+        'screenshot',
+        ...(options?.fullPage ? ['--full'] : []),
+        filePath,
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 15_000,
+      },
+    );
     if (plain.status !== 0) {
       throw new Error(`screenshot failed: ${plain.stderr || plain.stdout || annotate.stderr}`);
     }

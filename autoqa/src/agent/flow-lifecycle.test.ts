@@ -83,6 +83,65 @@ test('complete LLM-learned flow waits for a separate replay-validation run', () 
   assert.equal(flowRunMode(candidate), 'replay-validation');
 });
 
+test('exactly 80% passing milestones with terminal proof enters replay validation', () => {
+  const candidate = flow();
+  candidate.milestones = Array.from({ length: 10 }, (_, index) => ({
+    id: `m${index + 1}`,
+    goal: index === 9 ? 'Verify the final video is playable and downloadable' : `Complete step ${index + 1}`,
+    kind: index === 9 ? 'verify' : 'edit',
+  }));
+  const message = qualifyFlowAfterRun(candidate, {
+    mode: 'learning',
+    executions: candidate.milestones.map((milestone, index) => ({
+      milestoneId: milestone.id,
+      verdict: index === 1 ? 'fail' : index === 2 ? 'needs-review' : 'pass',
+      execution: 'explore',
+    })),
+    terminalArtifactVerified: true,
+    // Replay validation may fill a missing recipe. Deterministic promotion
+    // still requires every recipe and every milestone to replay below.
+    allRecipesPresent: false,
+    now: '2026-01-01T00:00:00.000Z',
+  });
+  assert.equal(candidate.status, 'exploratory');
+  assert.equal(candidate.qualification?.phase, 'replay-validation');
+  assert.match(message, /80% of milestones passed/);
+});
+
+test('below 80% pass coverage does not enter replay validation', () => {
+  const candidate = flow();
+  candidate.milestones = Array.from({ length: 10 }, (_, index) => ({
+    id: `m${index + 1}`,
+    goal: `Complete step ${index + 1}`,
+    kind: 'edit',
+  }));
+  qualifyFlowAfterRun(candidate, {
+    mode: 'learning',
+    executions: candidate.milestones.slice(0, 7).map((milestone) => ({
+      milestoneId: milestone.id,
+      verdict: 'pass',
+      execution: 'explore',
+    })),
+    terminalArtifactVerified: true,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.qualification?.phase, 'learning');
+});
+
+test('above-threshold coverage still requires verified terminal evidence', () => {
+  const candidate = flow();
+  qualifyFlowAfterRun(candidate, {
+    mode: 'learning',
+    executions: [
+      { milestoneId: 'm1', verdict: 'pass', execution: 'explore' },
+      { milestoneId: 'm2', verdict: 'needs-review', execution: 'explore' },
+    ],
+    terminalArtifactVerified: false,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.qualification?.phase, 'learning');
+});
+
 test('only a complete successful replay with terminal evidence promotes deterministic', () => {
   const candidate = flow();
   candidate.qualification = { phase: 'replay-validation', learnedAt: 'earlier' };
@@ -171,6 +230,23 @@ test('dedicated artifact-persistence vision qualifies a creation flow without ma
     concerns: [],
   };
   assert.equal(hasVerifiedTerminalArtifact(candidate, [step('create-video:m1'), final]), true);
+});
+
+test('manual flow accepts an earlier passed terminal proof when its final aggregate audit fails', () => {
+  const candidate = flow();
+  candidate.manualContract = {
+    request: 'Create and verify a final video, then audit every requested check',
+    checklist: ['Create a final video'],
+  };
+  candidate.milestones = [
+    { id: 'create', goal: 'Click Create Video and wait for the final video to render', kind: 'create' },
+    { id: 'terminal', goal: 'Verify the final video is playable and downloadable', kind: 'verify' },
+    { id: 'audit', goal: 'Read-only final task graph proof', kind: 'verify' },
+  ];
+  const terminal = step('create-video:terminal', 'Final Video\nPlay\nDownload Video');
+  const audit = step('create-video:audit', 'Final Video\nPlay\nDownload Video');
+  audit.result.verdict = 'fail';
+  assert.equal(hasVerifiedTerminalArtifact(candidate, [terminal, audit]), true);
 });
 
 test('every milestone must have a recipe', () => {

@@ -1,42 +1,47 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import test from 'node:test';
-import type { Recipe } from './recipes.js';
-import { normalizeSamePageContextualMutationGoal } from './site-state.js';
+import { SiteState } from './site-state.js';
 
-const recipe: Recipe = {
-  id: 'flow:regenerate:m1',
-  goal: 'old',
-  steps: [
-    {
-      kind: 'click',
-      label: 'REGENERATE (Wayfinder Compass)',
-      role: 'button',
-    },
-    { kind: 'waitForProcessing', maxMs: 1200000 },
-  ],
-  successCheck: { urlIncludes: '/assets' },
-  stats: { successes: 0, failures: 0 },
-};
+test('replay-validation qualification survives startup when recipes are incomplete', () => {
+  const url = `https://replay-startup-${randomUUID()}.invalid`;
+  const seed = new SiteState(url);
+  try {
+    seed.sitemap.flows.push({
+      id: 'partially-compiled',
+      title: 'Partially compiled flow',
+      description: 'Qualified by a high-coverage terminal learning run',
+      status: 'exploratory',
+      qualification: {
+        phase: 'replay-validation',
+        learnedAt: '2026-07-29T00:00:00.000Z',
+        terminalArtifactVerifiedAt: '2026-07-29T00:00:00.000Z',
+      },
+      entry: { pageId: 'start' },
+      milestones: [
+        { id: 'm1', goal: 'Open the workflow', kind: 'navigate' },
+        { id: 'm2', goal: 'Finish the workflow', kind: 'verify' },
+      ],
+    });
+    seed.recipes['flow:partially-compiled:m1'] = {
+      id: 'flow:partially-compiled:m1',
+      goal: 'Open the workflow',
+      steps: [],
+      successCheck: {},
+      stats: { successes: 1, failures: 0 },
+    };
+    seed.saveSitemap();
+    seed.saveRecipes();
 
-test('migrates a learned same-page card mutation away from stale next-screen wording', () => {
-  const migrated = normalizeSamePageContextualMutationGoal(
-    'On "Your Assets": click "REGENERATE (Wayfinder Compass)", then advance one screen. Stop as soon as a new page appears.',
-    recipe,
-  );
-  assert.match(migrated, /click "REGENERATE \(Wayfinder Compass\)" exactly once/i);
-  assert.match(migrated, /Remaining on the same page is valid/i);
-  assert.doesNotMatch(migrated, /advance one screen/i);
-});
-
-test('does not rewrite a contextual click whose recipe proves real navigation', () => {
-  const navigating: Recipe = {
-    ...recipe,
-    steps: [
-      ...recipe.steps,
-      { kind: 'waitFor', urlIncludes: '/editor', maxMs: 20000 },
-    ],
-  };
-  const goal =
-    'Click "EDIT (Wayfinder Compass)", then advance one screen.';
-  assert.equal(normalizeSamePageContextualMutationGoal(goal, navigating), goal);
+    const reloaded = new SiteState(url);
+    const flow = reloaded.sitemap.flows.find((candidate) => candidate.id === 'partially-compiled');
+    assert.equal(flow?.status, 'exploratory');
+    assert.equal(flow?.qualification?.phase, 'replay-validation');
+    assert.equal(flow?.qualification?.learnedAt, '2026-07-29T00:00:00.000Z');
+    assert.equal(flow?.qualification?.terminalArtifactVerifiedAt, '2026-07-29T00:00:00.000Z');
+    assert.equal(fs.existsSync(reloaded.recipesPath), true);
+  } finally {
+    seed.reset({ all: true });
+  }
 });
