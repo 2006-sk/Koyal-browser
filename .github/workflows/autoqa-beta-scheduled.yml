@@ -119,7 +119,7 @@ jobs:
           perl -pi -e "s#/Users/apple/Desktop/happyflow#$GITHUB_WORKSPACE#g" \
             "$state/sitemap.json" "$state/recipes.json"
           perl -pi \
-            -e "s#${GITHUB_WORKSPACE}/happyflow/test-audio-5sec.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
+            -e "s#${GITHUB_WORKSPACE}/happyflow/test-audio-5sec.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g;" \
             -e "s#${GITHUB_WORKSPACE}/happyflow/test-narration-short.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
             "$state/sitemap.json" "$state/recipes.json"
 
