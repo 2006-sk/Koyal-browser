@@ -223,7 +223,7 @@ export class AgentBrowser {
     exitCode: number;
     parsed?: AgentBrowserJsonResponse;
   } {
-    const timeoutMs = options.timeoutMs ?? 30_000;
+    const timeoutMs = options.timeoutMs ?? 90_000;
     const fullArgs = [
       '--session',
       this.session,
