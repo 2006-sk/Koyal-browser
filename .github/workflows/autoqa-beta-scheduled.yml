@@ -50,6 +50,7 @@ jobs:
       AUTOQA_ALLOW_BROAD_RECYCLE_KILL: "true"
       AUTOQA_HOSTED_ATTEMPTS: "3"
       AGENT_SHOW_CURSOR: "false"
+      DISPLAY: ":99"
 
     steps:
       - name: Check out repository
@@ -84,6 +85,20 @@ jobs:
           test -x "$chrome_path"
           "$chrome_path" --version
           echo "AGENT_BROWSER_EXECUTABLE_PATH=$chrome_path" >> "$GITHUB_ENV"
+
+      - name: Start persistent virtual display
+        run: |
+          Xvfb "$DISPLAY" -screen 0 1440x1000x24 -ac \
+            > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          for attempt in $(seq 1 20); do
+            if [[ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]]; then
+              echo "Virtual display $DISPLAY is ready."
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/xvfb.log"
+          exit 1
 
       - name: Validate required secrets
         run: |
@@ -139,7 +154,7 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
-            if xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+            if (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
@@ -147,10 +162,10 @@ jobs:
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
                 --budget 800 --max-steps 40
-            '; then
+            ); then
               exit 0
             fi
-            echo "[hosted] Script attempt $attempt failed; retrying with a fresh Xvfb/browser subprocess"
+            echo "[hosted] Script attempt $attempt failed; retrying on the persistent virtual display"
           done
           exit 1
 
@@ -162,7 +177,7 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
-            if xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+            if (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
@@ -170,10 +185,10 @@ jobs:
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
                 --budget 800 --max-steps 40
-            '; then
+            ); then
               exit 0
             fi
-            echo "[hosted] Audio attempt $attempt failed; retrying with a fresh Xvfb/browser subprocess"
+            echo "[hosted] Audio attempt $attempt failed; retrying on the persistent virtual display"
           done
           exit 1
 
