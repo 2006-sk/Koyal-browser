@@ -137,22 +137,22 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
-          xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
-            set -euo pipefail
-            for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
-              echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+          for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
+            echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+            if xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+              set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
-              if npm run qa -- test \
+              npm run qa -- test \
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
-                --budget 800 --max-steps 40; then
-                exit 0
-              fi
-              echo "[hosted] Script attempt $attempt failed; retrying with the recycled browser"
-            done
-            exit 1
-          '
+                --budget 800 --max-steps 40
+            '; then
+              exit 0
+            fi
+            echo "[hosted] Script attempt $attempt failed; retrying with a fresh Xvfb/browser subprocess"
+          done
+          exit 1
 
       - name: Run Audio replay validation
         id: audio
@@ -160,22 +160,22 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
-          xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
-            set -euo pipefail
-            for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
-              echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+          for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
+            echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+            if xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+              set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
-              if npm run qa -- test \
+              npm run qa -- test \
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
-                --budget 800 --max-steps 40; then
-                exit 0
-              fi
-              echo "[hosted] Audio attempt $attempt failed; retrying with the recycled browser"
-            done
-            exit 1
-          '
+                --budget 800 --max-steps 40
+            '; then
+              exit 0
+            fi
+            echo "[hosted] Audio attempt $attempt failed; retrying with a fresh Xvfb/browser subprocess"
+          done
+          exit 1
 
       - name: Encrypt updated learned state
         if: always()
