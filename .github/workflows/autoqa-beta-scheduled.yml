@@ -73,15 +73,9 @@ jobs:
           npx agent-browser install --with-deps
           sudo apt-get install -y xvfb unzip
 
-      - name: Install pinned Chrome for Testing 150
+      - name: Use Google Chrome Stable
         run: |
-          chrome_root="$RUNNER_TEMP/pinned-chrome"
-          mkdir -p "$chrome_root"
-          curl -fsSL \
-            https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.24/linux64/chrome-linux64.zip \
-            -o "$RUNNER_TEMP/chrome-linux64.zip"
-          unzip -q "$RUNNER_TEMP/chrome-linux64.zip" -d "$chrome_root"
-          chrome_path="$chrome_root/chrome-linux64/chrome"
+          chrome_path="$(command -v google-chrome-stable || command -v google-chrome)"
           test -x "$chrome_path"
           "$chrome_path" --version
           echo "AGENT_BROWSER_EXECUTABLE_PATH=$chrome_path" >> "$GITHUB_ENV"
