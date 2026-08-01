@@ -12,7 +12,22 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; ✅ = completed.
 
-### HIGH — `#in-app-product-bug-reporting` — report verified bugs through Koyal, not Slack
+### 🟡 HIGH — `#supervisor-hindrance-cleanup-confirmation` — character/asset cleanup approval must survive site confirmation — CODE + UNIT VALIDATED 2026-07-31
+
+- The production supervisor approved a browser-grounded `Remove character` action for an empty slot blocking Next, but independently denied the site's immediately following generic `Remove` confirmation. The denial became user authority, so Explorer correctly refused to retry it and the Audio journey could not self-heal past the disabled forward control.
+- The supervisor now authorizes character/asset deletion only when current browser evidence identifies a concrete workflow hindrance (empty, duplicate, stale, corrupt, wrong, blocking, or preventing progress), carries that narrow authority through the immediate generic confirmation, and still denies unrelated project/account/payment deletion or removal of a required finalized entity.
+- Manual v2 task prompts now explicitly require character creation/upload to originate in the owning Character section/slot and reusable asset creation to originate in the standalone Asset section/library. A migrated character display counts only with same-run provenance from the Character section.
+- Focused policy/prompt tests and the complete 309/309 unit suite pass; TypeScript build and diff check are clean. A fresh live Audio validation remains before marking this complete.
+
+### 🟡 HIGH — `#manual-operational-edit-contract` — generic edits need concrete input but error-based verdicts — FALSE-NEGATIVE FIX + UNIT VALIDATED 2026-07-31
+
+- Manual v1/v2 previously accepted vague instructions such as “make a realistic edit,” which gave the agent no stable input contract and made visual/persistence judgment subjective.
+- Every edit task now preserves an exact user value or chooses one simple concrete delta supported by the visible control. It must record the exact text/option/color/object/lighting/framing/camera request, submit once, and wait for processing to settle.
+- The verdict intentionally tests operational health rather than artistic compliance or persistence: changed appearance/text is not required. The edit passes when it genuinely submits, processing settles, the surface remains usable, and the fresh milestone capture contains no page exception, console error, unexpected 5xx/backend failure, or visible/modal application error. A no-op click, active spinner, timeout, broken result, or concrete error fails.
+- Koyal/Chrome can return cumulative errors even after the signal channel is cleared. Operational audits now compare the before/after signal bundles as multisets, ignore only narrowly identified WaveSurfer/PostHog teardown noise after a proven input+submit action, and can accept that action when Explorer later loops on `done`. Newly appearing product exceptions, visible/modal errors, and 5xx responses still fail. Focused boundary tests plus the complete 314/314 suite and TypeScript build pass.
+- The prompt contract is injected into both newly compiled and previously saved manual flows without duplicate text. Manual contract version 28 prevents unsafe reuse of older learned manual recipes. Focused tests and the complete 309/309 unit suite pass; TypeScript build and diff check are clean. Live Audio validation remains.
+
+### ✅ HIGH — `#in-app-product-bug-reporting` — report verified bugs through Koyal, not Slack — LIVE VALIDATED 2026-07-31
 
 - Stop sending AutoQA product-bug reports to Slack.
 - When AutoQA verifies a product-side bug, open the mapped in-app **Report a Bug** modal and submit it there.
@@ -21,13 +36,17 @@ Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; 
 - A reporting failure must not change the QA verdict or cause the tested product action to be repeated.
 - Validate with the final-video edit failure (`video is not edited please try again later!!`) and a synthetic verified product-error case.
 
-### HIGH — `#production-prompt-supervisor-llm` — unattended, realistic answers for production runs
+The Koyal reporter now runs after verdict finalization, opens only the in-app Report-a-Bug modal, fills an exact redacted AutoQA description deterministically, submits once, polls for the asynchronous confirmation, and stores the submitted text in `in-app-bug-reporting.json`. Manual audits softened to NEEDS REVIEW remain reportable when concrete visible/network product evidence exists; unrelated historical SPA console/page errors are filtered out. Live Audio validation authenticated, opened the real `/finalvideo` modal, submitted the `video is not edited please try again later` bug, saw confirmation, and recorded the exact description. Reporting failure was separately live-proven safe. Unit/build gate is part of the current 283/283 suite.
+
+### ✅ HIGH — `#production-prompt-supervisor-llm` — unattended, realistic answers for production runs — LIVE VALIDATED 2026-07-31
 
 - Add a top-level production supervisor LLM that consumes AutoQA's structured question context and answers field values, upload requests, classifications, guard questions, and flow approvals without a person present.
 - Answers must be realistic, semantically appropriate to the field, unique when the site requires uniqueness, and consistent across producer/consumer tasks; it must not invent credentials, secrets, or unavailable files.
 - Keep a human override/inbox path, explicit safety boundaries for destructive actions, bounded retries, and an auditable decision log.
 - Run it as the production companion for scheduled morning/evening QA so AutoQA remains unattended without weakening deterministic replay.
 - Validate duplicate-name recovery, mismatched suggestions (for example a car suggested for a location), file-type selection, verified product-error classification, and safe refusal of unrelated destructive actions.
+
+The opt-in supervisor preserves the human inbox override window, refuses secrets/unallowlisted destructive actions/nonexistent files, chooses upload files by semantic media type, rotates realistic constrained names after rejection, and logs its decision source. The Audio live run proved duplicate-name recovery, PNG-vs-audio selection, car-vs-location correction, character/look/theme/transcript values, safe destructive refusal, and product-error classification while reaching a new playable/downloadable final video without manual steering. Narrow empty-placeholder cleanup requires browser-agent evidence. Unit/build gate is part of the current 283/283 suite.
 
 ### 🟡 HIGH — `#script-audio-replay-validation-2026-07-30` — finish both long manual contracts and replay them
 
@@ -38,6 +57,7 @@ Execution order requested by the user:
 - [x] Run Script replay validation: 20 PASS / 1 FAIL / 9 NEEDS REVIEW; base 10-second terminal video passed, Koyal final-video edit error blocked post-render functions, and the flow was demoted.
 - [x] Run Audio replay validation: 17 PASS / 1 FAIL / 12 NEEDS REVIEW; a multi-hour user-requested pause expired auth, recovery lost project context (`projectId is not allowed to be empty`), terminal positioning failed, and the flow was demoted. This is not a clean uninterrupted replay judgment.
 - [x] Rerun Audio replay uninterrupted: 22 PASS / 1 FAIL / 7 NEEDS REVIEW; a fresh playable/downloadable terminal video was verified. Four post-render tasks were blocked by the reproducible Koyal error `video is not edited please try again later!!`; excluding those product-blocked tasks yields 22/26 = 84.6% automation coverage, so the Audio flow was restored to replay-validation pending the product-failure lifecycle fix.
+- [x] Validate the product-failure lifecycle with the production supervisor: 20 PASS / 1 FAIL / 9 NEEDS REVIEW, 184 LLM calls; a new Audio final video rendered, played, and exposed Download/Export. The flow remained `replay-validation` instead of being demoted because concrete product-blocked checks are excluded from recipe-health qualification, while automation gaps remain visible and prevent deterministic promotion.
 - [x] Report both learning/replay results, all remaining failed or needs-review milestones, lifecycle state, LLM usage, and whether either flow was demoted.
 - [ ] Commit and push only if both replay validations succeed and remain qualified; otherwise ask the user before committing or pushing.
 

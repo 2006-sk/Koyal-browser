@@ -95,6 +95,11 @@ export const config = {
     requestTimeoutMs: Number(process.env.AUTOQA_LLM_TIMEOUT_MS || '60000'),
   },
 
+  supervisor: {
+    enabled: process.env.AUTOQA_PRODUCTION_SUPERVISOR === 'true',
+    humanOverrideMs: Number(process.env.AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS ?? '3000'),
+  },
+
   projectRoot,
   loginRoot,
   reportsDir: path.join(projectRoot, 'reports'),

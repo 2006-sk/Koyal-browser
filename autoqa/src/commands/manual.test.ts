@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { SiteMap } from '../agent/sitemap.js';
 import {
+  authoritativeManualSourceFlow,
   bestManualFlow,
   bestManualPage,
   manualAcceptanceChecklist,
+  manualAuditTargetPage,
   planManualRequest,
   upsertManualFlow,
   validateManualPlan,
@@ -53,6 +55,72 @@ function sitemap(): SiteMap {
 
 test('bestManualPage grounds a feature request in matching sitemap content', () => {
   assert.equal(bestManualPage(sitemap(), 'go test the locations part')?.id, 'locations');
+});
+
+test('return to the character library targets the standalone Characters page', () => {
+  const map = sitemap();
+  map.pages.characters = {
+    id: 'characters-list',
+    title: 'Your Characters',
+    description: 'Character library',
+    urlPatterns: ['/characters'],
+    detection: { snapshotAnyOf: ['Your Characters'] },
+    requiresAuth: true,
+    interactives: [{ label: 'NEW CHARACTER', role: 'button', category: 'create' }],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.pages.storyType = {
+    id: 'wizard-story-type',
+    title: 'Select Story Type',
+    description: 'Choose project characters',
+    urlPatterns: ['/selectStoryType'],
+    detection: { snapshotAnyOf: ['Character Driven'] },
+    requiresAuth: true,
+    interactives: [],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  assert.equal(
+    manualAuditTargetPage(
+      map,
+      'Wait for generation, finalize the character, then return to the character library and search by name',
+    )?.id,
+    'characters-list',
+  );
+});
+
+test('three in-flow character methods target the wizard instead of the standalone library', () => {
+  const map = sitemap();
+  map.pages.characters = {
+    id: 'characters-list',
+    title: 'Your Characters',
+    description: 'Standalone character library',
+    urlPatterns: ['/characters'],
+    detection: { snapshotAnyOf: ['Your Characters'] },
+    requiresAuth: true,
+    interactives: [{ label: 'NEW CHARACTER', role: 'button', category: 'create' }],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  map.pages.storyType = {
+    id: 'wizard-story-type',
+    title: 'Select Story Type',
+    description: 'Choose project characters inside the active video wizard',
+    urlPatterns: ['/selectStoryType'],
+    detection: { snapshotAnyOf: ['Character Driven'] },
+    requiresAuth: true,
+    interactives: [],
+    firstSeenAt: map.updatedAt,
+    lastSeenAt: map.updatedAt,
+  };
+  assert.equal(
+    manualAuditTargetPage(
+      map,
+      'In the Character section, exercise exactly three distinct character methods',
+    )?.id,
+    'wizard-story-type',
+  );
 });
 
 test('upsertManualFlow creates a stable focused flow and does not duplicate it', () => {
@@ -201,6 +269,47 @@ test('task-graph manual engine stores compact active tasks without mutating the 
   assert.ok(flow.milestones.some((milestone) => milestone.id === 'manual-task-final-proof'));
   assert.doesNotMatch(flow.milestones[0].goal, /After rendering verify/);
   assert.equal(original.milestones[0].goal, 'Open locations');
+});
+
+test('task-graph prompts keep character creation and reusable assets in their owning sections', () => {
+  const map = sitemap();
+  const original = {
+    id: 'audio-e2e',
+    title: 'Audio end to end',
+    description: 'Complete mapped audio creation flow',
+    status: 'exploratory',
+    entry: { pageId: 'upload', url: '/upload' },
+    milestones: [
+      { id: 'characters', goal: 'Choose characters', kind: 'create' as const },
+      { id: 'final', goal: 'Verify final video', kind: 'verify' as const },
+    ],
+  } satisfies SiteMap['flows'][number];
+  map.flows.push(original);
+  const request =
+    'In the Character section, exercise exactly three distinct character methods using AI, image upload, and the existing library. Create one new reusable asset in the asset library.';
+  const flow = upsertManualFlow(
+    { sitemap: map, saveSitemap: () => {} },
+    request,
+    {
+      mode: 'existing-flow',
+      existingFlowId: original.id,
+      title: original.title,
+      goal: request,
+      kind: 'create',
+    },
+    { engine: 'task-graph' },
+  );
+  const characterTask = flow.milestones.find((milestone) =>
+    /In-flow character requirement/i.test(milestone.goal),
+  );
+  const assetTask = flow.milestones.find((milestone) =>
+    /Asset-section requirement/i.test(milestone.goal),
+  );
+  assert.match(characterTask?.goal ?? '', /owning Character section/i);
+  assert.match(characterTask?.goal ?? '', /do not substitute the separate reusable Assets/i);
+  assert.match(characterTask?.goal ?? '', /Never defer this task.*standalone Characters library/i);
+  assert.match(assetTask?.goal ?? '', /standalone Asset section or Asset library/i);
+  assert.match(assetTask?.goal ?? '', /Do not use a character slot/i);
 });
 
 test('task-graph end-to-end creation starts through a dedicated fresh-entry checkpoint', () => {
@@ -693,6 +802,48 @@ test('audio rendered-video request selects and copies every milestone of the ful
   assert.match(manual.milestones.at(-1)?.goal ?? '', /FINAL MANUAL CONTRACT PROOF/);
 });
 
+test('explicit Script-to-video source overrides an LLM-selected Audio journey', () => {
+  const map = sitemap();
+  const commonTail = [
+    { id: 'characters', goal: 'Create three characters and edit dialogue', kind: 'edit' as const },
+    { id: 'render', goal: 'Render and verify the final video', kind: 'create' as const },
+  ];
+  map.flows.push(
+    {
+      id: 'walked-start-with-audio-upload',
+      title: 'Start with Audio Upload',
+      description: 'Complete mapped Audio-to-final-video journey',
+      status: 'exploratory',
+      entry: { pageId: 'upload' },
+      milestones: [
+        { id: 'upload', goal: 'Upload an audio narration', kind: 'upload' },
+        ...commonTail,
+      ],
+    },
+    {
+      id: 'walked-start-with-script-upload',
+      title: 'Start with Script Upload',
+      description: 'Complete mapped Script-to-final-video journey',
+      status: 'exploratory',
+      entry: { pageId: 'upload' },
+      milestones: [
+        { id: 'upload', goal: 'Upload a script PDF', kind: 'upload' },
+        ...commonTail,
+      ],
+    },
+  );
+  const request =
+    'Use the complete mapped Script-to-final-video flow. Upload the script file, create three characters including one selected from the existing character library, edit dialogue, create a reusable asset, change a theme and outfit, create and edit a location, exercise four scene functions, then render and verify the final video.';
+  assert.equal(bestManualFlow(map, request)?.id, 'walked-start-with-script-upload');
+  assert.equal(authoritativeManualSourceFlow(map, request)?.id, 'walked-start-with-script-upload');
+  const plan = validateManualPlan(map, request, {
+    mode: 'existing-flow',
+    existingFlowId: 'walked-start-with-audio-upload',
+  });
+  assert.equal(plan.mode, 'existing-flow');
+  assert.equal(plan.existingFlowId, 'walked-start-with-script-upload');
+});
+
 test('malformed planning output falls back to the matching complete flow', async () => {
   const map = sitemap();
   map.flows.push({
@@ -736,7 +887,7 @@ test('a feature appearing only inside an unrelated long flow does not hijack a f
   assert.equal(plan.targetPageId, 'locations');
 });
 
-test('a focused character upload trims a required wizard path after its character checkpoint', () => {
+test('an explicitly Characters-scoped creation stays on the standalone character library', () => {
   const map = sitemap();
   map.pages.characters = {
     id: 'characters',
@@ -783,7 +934,7 @@ test('a focused character upload trims a required wizard path after its characte
   const request =
     'Go to Characters and create exactly one new character using a character image file I provide. Use a realistic human name, finalize it, and verify it persists in the character library.';
 
-  assert.equal(bestManualFlow(map, request)?.id, 'audio-wizard');
+  assert.equal(bestManualFlow(map, request), undefined);
   const plan = validateManualPlan(map, request, {
     mode: 'existing-flow',
     existingFlowId: 'audio-wizard',
@@ -791,12 +942,14 @@ test('a focused character upload trims a required wizard path after its characte
     goal: request,
     kind: 'upload',
   });
-  assert.equal(plan.mode, 'existing-flow');
+  assert.equal(plan.mode, 'focused-page');
+  assert.equal(plan.targetPageId, 'characters');
   const legacy = upsertManualFlow({ sitemap: map, saveSitemap: () => {} }, request, plan);
-  assert.match(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Upload an audio file/);
-  assert.match(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Create or upload a character image/);
-  assert.doesNotMatch(legacy.milestones.map((milestone) => milestone.goal).join('\n'), /Choose a story theme|Render the final video/);
-  assert.match(legacy.milestones.at(-1)?.goal ?? '', /focused result remains visibly completed/);
+  assert.doesNotMatch(
+    legacy.milestones.map((milestone) => milestone.goal).join('\n'),
+    /Upload an audio file|Choose a story theme|Render the final video/,
+  );
+  assert.equal(legacy.entry.pageId, 'characters');
 
   const taskGraph = upsertManualFlow(
     { sitemap: map, saveSitemap: () => {} },
@@ -806,15 +959,15 @@ test('a focused character upload trims a required wizard path after its characte
   );
   assert.doesNotMatch(
     taskGraph.milestones.map((milestone) => milestone.goal).join('\n'),
-    /Choose a story theme|Render the final video/,
+    /Upload an audio file|Choose a story theme|Render the final video/,
   );
   assert.equal(taskGraph.manualExecution?.tasks.length, 1);
-  assert.equal(taskGraph.manualExecution?.tasks[0]?.targetPageId, 'wizard-story-type');
+  assert.equal(taskGraph.manualExecution?.tasks[0]?.targetPageId, 'characters');
   assert.match(
     taskGraph.manualExecution?.tasks[0]?.requirement ?? '',
     /Go to Characters and create exactly one new character/,
   );
-  assert.match(taskGraph.milestones.at(-1)?.goal ?? '', /focused result remains visibly completed/);
+  assert.match(taskGraph.milestones.at(-1)?.goal ?? '', /FINAL TASK-GRAPH PROOF/);
 });
 
 test('a destructive character request never reuses a character-creation flow', () => {

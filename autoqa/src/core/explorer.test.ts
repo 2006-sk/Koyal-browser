@@ -13,8 +13,12 @@ import {
   identityReassertionsForReview,
   hasPendingArtifactBadge,
   hasBlockingValidationState,
+  hasBlockingProcessingSnapshot,
   hasRecoverableFieldValidation,
   hasInlineProcessing,
+  hasNonBlockingCollectionItemProcessing,
+  hasPostMutationProcessing,
+  hasUnsubmittedMutationForm,
   isGroundedManualUnlabelledClick,
   isManualMutationAction,
   isSensitiveFieldLabel,
@@ -102,6 +106,112 @@ test('persisted pending badge prevents vision from releasing artifact processing
   );
   // Static generation copy on an ordinary form is not a persisted pending badge.
   assert.equal(hasPendingArtifactBadge('- heading "AI Image Generation"'), false);
+});
+
+test('one stale processing item does not freeze an otherwise usable collection picker', () => {
+  const picker = [
+    '- heading "Choose Existing Character"',
+    '- textbox "Search characters by name..." [ref=e7]',
+    '- combobox [ref=e8]: All Types',
+    '- generic "AvatarCrispin" [ref=e10] clickable',
+    '- generic "ProcessingNo ImageAvatarcharacter" [ref=e11] clickable',
+    '  - text "Processing..."',
+    '- generic "AvatarElias" [ref=e12] clickable',
+    '- button "Next" [ref=e3]',
+    '- button "Confirm" [disabled, ref=e5]',
+    '- button "Close" [ref=e6]',
+  ].join('\n');
+  assert.equal(hasPostMutationProcessing(picker), true);
+  assert.equal(hasNonBlockingCollectionItemProcessing(picker), true);
+  assert.equal(
+    hasBlockingProcessingSnapshot(picker, { submittedMutation: true }),
+    false,
+  );
+});
+
+test('expanded full-tree collection does not turn one stale item into global processing', () => {
+  const picker = [
+    '- heading "Create New Character"',
+    '- button "Close" [ref=e1]',
+    '- combobox [ref=e2]: All Genders',
+    '- article [ref=e3] clickable',
+    '  - heading "PriyaKapoor"',
+    '  - button "Try outfit" [ref=e4]',
+    '- article [ref=e5] clickable',
+    '  - StaticText "Processing"',
+    '  - heading "character-123"',
+    '- button "Next" [ref=e6]',
+  ].join('\n');
+  assert.equal(hasNonBlockingCollectionItemProcessing(picker), true);
+  assert.equal(
+    hasBlockingProcessingSnapshot(picker, { submittedMutation: true }),
+    false,
+  );
+});
+
+test('expanded generic picker cards keep one stale library item non-blocking', () => {
+  const picker = [
+    '- dialog "Choose Existing Character"',
+    '  - textbox "Search characters by name..." [ref=e1]',
+    '  - combobox [ref=e2]: All Types',
+    '  - generic [ref=e3] clickable',
+    '    - StaticText "Processing"',
+    '    - StaticText "character-123"',
+    '  - generic [ref=e4] clickable',
+    '    - image "Caspian"',
+    '    - StaticText "Avatar"',
+    '  - button "Next" [ref=e5]',
+    '  - button "Close" [ref=e6]',
+  ].join('\n');
+  assert.equal(hasNonBlockingCollectionItemProcessing(picker), true);
+  assert.equal(
+    hasBlockingProcessingSnapshot(picker, { submittedMutation: true }),
+    false,
+  );
+});
+
+test('stale background Processing card cannot block an unsubmitted active creation form', () => {
+  const modalOverLibrary = [
+    '- article "Old character Processing" [ref=e1] clickable',
+    '  - StaticText "Processing"',
+    '- dialog "Create New Character"',
+    '  - textbox "Describe your character" [ref=e2]',
+    '  - textbox "Name your character" [ref=e3]',
+    '  - button "Create" [ref=e4]',
+    '  - button "Finalize character" [disabled, ref=e5]',
+  ].join('\n');
+  assert.equal(hasUnsubmittedMutationForm(modalOverLibrary), true);
+  assert.equal(
+    hasBlockingProcessingSnapshot(modalOverLibrary, { submittedMutation: true }),
+    false,
+  );
+});
+
+test('active processing inside a creation form remains blocking', () => {
+  const activeGeneration = [
+    '- dialog "Create New Character"',
+    '  - textbox "Describe your character" [ref=e2]',
+    '  - button "Processing..." [disabled, busy, ref=e4]',
+    '  - status "Generating avatar..."',
+  ].join('\n');
+  assert.equal(
+    hasBlockingProcessingSnapshot(activeGeneration, { submittedMutation: true }),
+    true,
+  );
+});
+
+test('a single pending artifact is still blocking processing', () => {
+  const artifact = [
+    '- heading "Create Character"',
+    '- generic "ProcessingNo ImageAvatar" [ref=e11] clickable',
+    '  - text "Processing"',
+    '- button "Finalize character" [disabled, ref=e5]',
+  ].join('\n');
+  assert.equal(hasNonBlockingCollectionItemProcessing(artifact), false);
+  assert.equal(
+    hasBlockingProcessingSnapshot(artifact, { submittedMutation: true }),
+    true,
+  );
 });
 
 test('static rendering settings copy is not treated as active processing', () => {

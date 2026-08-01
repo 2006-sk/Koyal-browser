@@ -9,7 +9,7 @@ import {
   finalizeRunReport,
   writeRunReport,
 } from '../core/report.js';
-import { notifyKoyalBugsToSlack } from '../core/slack-bugs.js';
+import { reportKoyalBugsInApp } from '../core/in-app-bugs.js';
 import { writeSiteSummary } from '../core/site-summary.js';
 import { bootstrap, teardown, type Session } from './shared.js';
 
@@ -61,19 +61,19 @@ export async function testCommand(
       ? 'email/password test account (secrets omitted)'
       : 'none (unauthenticated)';
 
-    // Post genuine product bugs (failed milestones with real site-emitted error
-    // evidence) to the Slack bugs channel — platform/location/front-end error,
-    // matching backend log, and a three-line explanation. Post nothing when
-    // there are zero product bugs.
-    // Never lets a notify failure affect teardown/exit.
+    // File genuine product bugs through Koyal's own Report-a-Bug modal after
+    // verdicts are final. Reporting failure cannot alter the report or repeat
+    // the tested action.
     try {
-      await notifyKoyalBugsToSlack({
+      await reportKoyalBugsInApp({
         report: finalized,
         hostname: state.hostname,
-        credentialsType,
+        runDir,
+        browser,
+        explorer,
       });
     } catch (err) {
-      console.warn(`[autoqa] slack bug notify skipped: ${err instanceof Error ? err.message : err}`);
+      console.warn(`[autoqa] in-app bug report skipped: ${err instanceof Error ? err.message : err}`);
     }
 
     // (Re)write the per-site summary: flows designed, the product bugs sent to

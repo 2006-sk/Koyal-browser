@@ -58,7 +58,7 @@ export interface ExplorerResult {
 
 export interface ExplorerHooks {
   /** Called before every click; return false to deny (destructive-action guard) */
-  beforeClick?: (label: string, ref: string) => Promise<boolean>;
+  beforeClick?: (label: string, ref: string, actionReason?: string) => Promise<boolean>;
   /** Called when the LLM signals a file upload is needed; return a local path or null to decline */
   onUploadRequested?: (selectorHint: string | undefined, reason: string | undefined) => Promise<string | null>;
   /** Ask-once resolver for every non-secret free-text fill. */
@@ -203,6 +203,90 @@ export function hasPostMutationProcessing(
     hasInlineProcessing(snapshot, options) ||
     /(?:text|status|badge)\s+"(?:processing|pending|finalizing|generating|rendering|uploading)"|\b(?:processing|pending|finalizing|generating|rendering|uploading)\s+(?:badge|status)\b/i.test(snapshot)
   );
+}
+
+/**
+ * A creation/edit modal can sit above a library containing an old pending
+ * card. Until the active form's own submit control has been activated, that
+ * background badge is not evidence that this mutation is processing. Genuine
+ * processing remains detectable through the stronger inline indicators (a
+ * disabled/busy Processing button, ETA, spinner copy, and so on).
+ */
+export function hasUnsubmittedMutationForm(snapshot: string): boolean {
+  const hasEditableField =
+    /(?:textbox|searchbox|combobox)\b[^\n]*(?:\[ref=e\d+\]|value=|placeholder=)/i.test(snapshot);
+  const hasSubmitControl =
+    /button\s+"[^\"]*\b(?:create|generate|finalize|save|apply|submit|upload)\b[^\"]*"[^\n]*(?!busy)/i.test(
+      snapshot,
+    );
+  return hasEditableField && hasSubmitControl;
+}
+
+/**
+ * A searchable/paged picker can contain one stale item whose own badge says
+ * "Processing" while the collection itself is usable. That item-scoped state
+ * must not freeze the whole explorer after an earlier mutation elsewhere in
+ * the same milestone. Require both a pending clickable item and a distinct
+ * completed clickable item, plus collection-browser controls, so genuine
+ * single-artifact generation continues to use the normal long wait.
+ */
+export function hasNonBlockingCollectionItemProcessing(snapshot: string): boolean {
+  const lines = snapshot.split('\n');
+  const clickableItems = lines.filter(
+    (line) => /\b(?:generic|article|listitem)\s+"[^"]+"[^\n]*\bclickable\b/i.test(line),
+  );
+  // The compact interactive tree keeps an item's accessible name on the same
+  // line. The full tree expands an article into indented descendants, so the
+  // pending badge and completed controls live on later lines. Build those
+  // article blocks as well; otherwise consulting the full tree turns the same
+  // usable collection back into a global 20-minute processing wait.
+  const articleBlocks: string[] = [];
+  for (let index = 0; index < lines.length; index++) {
+    const match = lines[index].match(
+      /^(\s*)-\s+(?:article|listitem|generic)\b[^\n]*\bclickable\b/i,
+    );
+    if (!match) continue;
+    const indent = match[1].length;
+    const block = [lines[index]];
+    for (let next = index + 1; next < lines.length; next++) {
+      const nextIndent = lines[next].match(/^(\s*)-/)?.[1].length ?? Number.POSITIVE_INFINITY;
+      if (nextIndent <= indent) break;
+      block.push(lines[next]);
+    }
+    articleBlocks.push(block.join('\n'));
+  }
+  const collectionItems = [...clickableItems, ...articleBlocks];
+  const hasPendingItem = collectionItems.some((line) =>
+    /\b(?:processing|pending|finalizing|generating|rendering|uploading)/i.test(line),
+  );
+  const hasCompletedItem = collectionItems.some(
+    (line) =>
+      !/\b(?:processing|pending|finalizing|generating|rendering|uploading|no image)/i.test(line),
+  );
+  const hasCollectionControls =
+    /\b(?:searchbox|textbox)\s+"[^"]*(?:search|filter)[^"]*"/i.test(snapshot) ||
+    /\bcombobox\b/i.test(snapshot);
+  const hasUsableExitOrPaging =
+    /button\s+"(?:next|previous|cancel|close|confirm)"(?![^\n]*disabled)/i.test(snapshot);
+  return hasPendingItem && hasCompletedItem && hasCollectionControls && hasUsableExitOrPaging;
+}
+
+export function hasBlockingProcessingSnapshot(
+  snapshot: string,
+  options: { manualNarrativeSafe?: boolean; submittedMutation?: boolean } = {},
+): boolean {
+  const inline = hasInlineProcessing(snapshot, {
+    manualNarrativeSafe: options.manualNarrativeSafe,
+  });
+  const postMutation =
+    Boolean(options.submittedMutation) &&
+    hasPostMutationProcessing(snapshot, {
+      manualNarrativeSafe: options.manualNarrativeSafe,
+    });
+  const backgroundBadgeBehindUnsubmittedForm =
+    postMutation && !inline && hasUnsubmittedMutationForm(snapshot);
+  const observed = inline || (postMutation && !backgroundBadgeBehindUnsubmittedForm);
+  return observed && !hasNonBlockingCollectionItemProcessing(snapshot);
 }
 
 /** Persistent-library proof that the artifact itself is still pending. */
@@ -791,9 +875,10 @@ export class Explorer {
           isLikelyMutationLabel(action.resolvedLabel ?? ''),
       );
     const processingVisible = (value: string): boolean =>
-      hasInlineProcessing(value, { manualNarrativeSafe: options?.manualMode }) ||
-      (submittedMutation() &&
-        hasPostMutationProcessing(value, { manualNarrativeSafe: options?.manualMode }));
+      hasBlockingProcessingSnapshot(value, {
+        manualNarrativeSafe: options?.manualMode,
+        submittedMutation: submittedMutation(),
+      });
 
     const goalForLog = this.redact(goal);
     console.log(`\n[explorer] Goal: ${goalForLog.slice(0, 120)}${goalForLog.length > 120 ? '…' : ''}`);
@@ -2313,6 +2398,7 @@ export class Explorer {
           const allowed = await this.hooks.beforeClick(
             decision.resolvedLabel ?? decision.ref,
             decision.ref,
+            decision.reason,
           );
           if (!allowed) {
             decision.executionFailed = true;

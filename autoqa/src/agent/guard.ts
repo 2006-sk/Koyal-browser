@@ -36,7 +36,7 @@ export class Guard {
     return false;
   }
 
-  async confirmClick(label: string, pageId: string): Promise<boolean> {
+  async confirmClick(label: string, pageId: string, actionReason?: string): Promise<boolean> {
     if (LOGOUT_RE.test(label)) {
       console.log(`[guard] auto-denied "${label}" (logout destroys the session)`);
       return false;
@@ -53,7 +53,10 @@ export class Guard {
     }
 
     const answer = await this.interact.askConfirmAction(
-      `About to click "${label}" on page "${pageId}" — this looks destructive/irreversible. Allow?`,
+      [
+        `About to click "${label}" on page "${pageId}" — this looks destructive/irreversible. Allow?`,
+        actionReason ? `Current browser-agent evidence: ${actionReason}` : '',
+      ].filter(Boolean).join('\n'),
     );
     if (answer === 'always' || answer === 'never') {
       this.state.allowlist[key] = answer;

@@ -4,9 +4,25 @@ import type { Flow } from './sitemap.js';
 import {
   compileManualTaskGraph,
   lowerManualTaskGraph,
+  manualEditVerificationGuidance,
   splitCrossPageAcceptanceItems,
   splitIndependentFunctionItems,
 } from './manual-task-engine.js';
+
+test('generic edits compile to concrete inputs with operational error-based verification', () => {
+  const guidance = manualEditVerificationGuidance(
+    'Edit one generated scene and change its camera angle',
+  );
+  assert.match(guidance, /choose one simple concrete/i);
+  assert.match(guidance, /Never use unverifiable wording/i);
+  assert.match(guidance, /processing finishes/i);
+  assert.match(guidance, /no page exception/i);
+  assert.match(guidance, /console error/i);
+  assert.match(guidance, /network\/backend response/i);
+  assert.match(guidance, /Do not require the requested visual\/text delta to remain visible/i);
+  assert.match(guidance, /result looks unchanged/i);
+  assert.equal(manualEditVerificationGuidance('Upload one audio file'), '');
+});
 
 function sourceFlow(): Flow {
   return {

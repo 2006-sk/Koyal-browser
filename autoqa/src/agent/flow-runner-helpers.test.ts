@@ -19,6 +19,11 @@ import {
   manualEntryNeedsContextRecovery,
   manualEntryExpectedControlLabels,
   manualJourneyDestinationIssue,
+  manualEditRequiresZeroErrorSignals,
+  manualFreshSignalBundle,
+  manualVisualConcernIsHistoricalProductError,
+  manualOperationalMutationVerified,
+  manualRoundedUploadVerified,
   manualTaskGraphRepairIssue,
   manualVisualAssessmentFromActions,
   manualVisionAffirmsPersistedOutcome,
@@ -29,6 +34,8 @@ import {
   successfulMutationLabelsFromRecipeSteps,
   milestoneReturnsOnUrlChange,
   orderRunnableFlows,
+  productionBinaryVerdict,
+  skippedMilestoneVerdict,
   requiresPersistedCreation,
   recoveryGuardPageIds,
   shouldContinueAfterVerification,
@@ -51,6 +58,298 @@ function flow(id: string, status: Flow['status'], phase?: 'learning' | 'replay-v
     qualification: phase ? { phase } : undefined,
   };
 }
+
+test('production supervisor converts structurally skipped milestones to binary fail', () => {
+  assert.equal(skippedMilestoneVerdict(true), 'fail');
+  assert.equal(skippedMilestoneVerdict(false), 'needs-review');
+});
+
+test('a stale product-error tile is charged only to its originating manual task', () => {
+  const visual = {
+    status: 'concern' as const,
+    summary: 'The final video is playable, but Shot 1 tile displays an Error state.',
+    concerns: ['Shot 1 tile displays a red Error icon instead of a thumbnail.'],
+  };
+  const stale = 'video is not edited please try again later!!\nbutton "! Error"\nDownload Video';
+  assert.equal(
+    manualVisualConcernIsHistoricalProductError(visual, stale, `${stale}\nvideo time 0:05 / 0:10`),
+    true,
+  );
+  assert.equal(
+    manualVisualConcernIsHistoricalProductError(visual, 'Download Video', stale),
+    false,
+  );
+});
+
+test('manual edit tasks use zero-tolerance fresh error signals without changing ordinary flows', () => {
+  const manual = flow('manual-edit', 'exploratory');
+  manual.manualContract = {
+    request: 'Edit one scene',
+    checklist: ['Edit one scene'],
+  };
+  manual.manualExecution = {
+    version: 1,
+    sourceFlowId: 'source',
+    primaryJourneyPageIds: ['edit-scenes'],
+    tasks: [
+      {
+        id: 'acceptance-1',
+        requirement: 'Edit one scene',
+        phase: 'pre-terminal',
+        dependsOn: [],
+      },
+    ],
+    constraints: [],
+    policy: {
+      context: 'active-task',
+      processing: 'manual-narrative-safe',
+      recovery: 'bounded-modal-dismiss',
+      probes: 'contract-only',
+    },
+  };
+  assert.equal(
+    manualEditRequiresZeroErrorSignals(manual, {
+      id: 'manual-task-1',
+      goal: 'Edit scene',
+      kind: 'navigate',
+      manualTaskId: 'acceptance-1',
+    }),
+    true,
+  );
+  assert.equal(
+    manualEditRequiresZeroErrorSignals(flow('ordinary', 'exploratory'), {
+      id: 'edit',
+      goal: 'Edit scene',
+      kind: 'edit',
+    }),
+    false,
+  );
+});
+
+test('clean submitted manual mutations override semantic persistence ambiguity but never product errors', () => {
+  const makeStep = (consoleErrors: Array<{ text: string; type: string }> = []): TestStep => ({
+    workflow: 'manual:edit',
+    action: 'edit dialogue',
+    expected: 'healthy mutation',
+    result: {
+      verdict: 'needs-review',
+      severity: 'medium',
+      expected: 'healthy mutation',
+      actual: 'Edit Script',
+      signals: {
+        url: 'https://example.test/script',
+        title: 'Edit Script',
+        snapshot: { raw: 'Edit Script', interactive: 'Edit Script' },
+        pageErrors: [],
+        consoleMessages: [],
+        consoleErrors,
+        networkRequests: [],
+      },
+      reasons: ['Visual review found a concrete concern: change not visibly persisted'],
+      retried: false,
+    },
+    stepsToReproduce: [],
+  });
+  const item = 'perform one voice change, one emotion change, and one dialogue-text edit';
+  const evidence = [
+    'clicked "Character Voices"',
+    'filled "description" with "Calm lower voice"',
+    'clicked "Save"',
+    'clicked "melancholy"',
+    'filled "editable field" with "A revised dialogue line"',
+    'clicked "Save"',
+  ];
+  assert.equal(manualOperationalMutationVerified(item, evidence, makeStep(), true), true);
+  assert.equal(
+    manualOperationalMutationVerified(
+      item,
+      evidence,
+      makeStep([{ text: 'Failed to save dialogue', type: 'error' }]),
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    manualOperationalMutationVerified('Create and finalize one new asset', evidence, makeStep(), true),
+    false,
+    'creation outcomes retain strict persisted-artifact proof',
+  );
+
+  const staleErrorStep = makeStep();
+  staleErrorStep.result.signals.snapshot = {
+    raw: 'Final video\nvideo is not edited please try again later!!\nDownload Video',
+    interactive: 'button "Download Video"',
+  };
+  assert.equal(
+    manualOperationalMutationVerified(
+      'Retake one scene with a concrete motion prompt',
+      ['filled "motion prompt" with "slow zoom"', 'clicked "Retake Scene"'],
+      staleErrorStep,
+      true,
+      'video is not edited please try again later!!',
+    ),
+    true,
+    'an unchanged visible error from an earlier task cannot fail a later healthy mutation',
+  );
+  assert.equal(
+    manualOperationalMutationVerified(
+      'Retake one scene with a concrete motion prompt',
+      ['filled "motion prompt" with "slow zoom"', 'clicked "Retake Scene"'],
+      staleErrorStep,
+      true,
+      'Final video without an error',
+    ),
+    false,
+    'a newly appearing visible error still blocks operational success',
+  );
+
+  const recurringNoiseStep = makeStep();
+  recurringNoiseStep.result.verdict = 'fail';
+  recurringNoiseStep.result.signals.pageErrors = [
+    { message: 'WaveSurfer AbortError: signal is aborted without reason' },
+    { message: 'PostHog recorder TypeError: Failed to fetch' },
+  ];
+  recurringNoiseStep.result.reasons = [
+    'Uncaught page exceptions: WaveSurfer AbortError',
+  ];
+  const beforeSignals = {
+    ...recurringNoiseStep.result.signals,
+    pageErrors: [{ message: 'WaveSurfer AbortError: signal is aborted without reason' }],
+  };
+  assert.equal(
+    manualOperationalMutationVerified(item, evidence, recurringNoiseStep, false, '', beforeSignals),
+    true,
+    'submitted operational evidence overrides a later explorer bookkeeping failure and recurring media/analytics noise',
+  );
+  assert.equal(
+    manualOperationalMutationVerified(
+      'Change Camera Angle to a clearly named perspective',
+      ['clicked "Side Profile Camera at 90° to the side"', 'clicked "Apply Camera Angle"'],
+      makeStep(),
+      false,
+    ),
+    true,
+    'a named camera option plus Apply is sufficient same-run operational evidence',
+  );
+  assert.equal(
+    manualOperationalMutationVerified(
+      'Add Reference using the supplied suitable media file',
+      [
+        'clicked "Add Reference"',
+        'uploaded "/tmp/reference-motion.mp4"',
+        'clicked "Add Video"',
+      ],
+      makeStep(),
+      false,
+    ),
+    true,
+    'a supplied reference upload plus Add Video is sufficient same-run operational evidence',
+  );
+
+  const freshProductErrorStep = makeStep();
+  freshProductErrorStep.result.verdict = 'fail';
+  freshProductErrorStep.result.signals.pageErrors = [
+    { message: 'Failed to save dialogue' },
+  ];
+  assert.equal(
+    manualOperationalMutationVerified(item, evidence, freshProductErrorStep, true, '', {
+      ...freshProductErrorStep.result.signals,
+      pageErrors: [],
+    }),
+    false,
+    'a genuinely new product exception remains a failure',
+  );
+
+  const serverFailureStep = makeStep();
+  serverFailureStep.result.verdict = 'fail';
+  serverFailureStep.result.signals.networkRequests = [
+    { url: 'https://example.test/api/dialogue', status: 500 },
+  ];
+  assert.equal(
+    manualOperationalMutationVerified(item, evidence, serverFailureStep, true, '', {
+      ...serverFailureStep.result.signals,
+      networkRequests: [],
+    }),
+    false,
+    'a new 5xx remains a failure',
+  );
+});
+
+test('manual fresh-signal classification removes cumulative teardown noise but preserves new failures', () => {
+  const baseline = {
+    url: 'https://example.test/theme',
+    title: 'Theme',
+    snapshot: { raw: 'Theme', interactive: 'button "Next"' },
+    pageErrors: [
+      { message: 'WaveSurfer AbortError: signal is aborted without reason' },
+      { message: 'An older application exception' },
+    ],
+    consoleMessages: [],
+    consoleErrors: [],
+    networkRequests: [{ url: 'https://example.test/old', status: 500 }],
+  };
+  const after = {
+    ...baseline,
+    pageErrors: [
+      ...baseline.pageErrors,
+      { message: 'PostHog recorder TypeError: Failed to fetch' },
+      { message: 'Failed to save theme' },
+    ],
+    networkRequests: [
+      ...baseline.networkRequests,
+      { url: 'https://example.test/healthy', status: 200 },
+      { url: 'https://example.test/new', status: 503 },
+    ],
+  };
+  const fresh = manualFreshSignalBundle(after, baseline);
+  assert.deepEqual(fresh.pageErrors, [{ message: 'Failed to save theme' }]);
+  assert.deepEqual(
+    fresh.networkRequests.map((request) => [request.url, request.status]),
+    [
+      ['https://example.test/healthy', 200],
+      ['https://example.test/new', 503],
+    ],
+  );
+});
+
+test('tiny accepted upload wins over a rounded 0.00 MB visual concern', () => {
+  const step: TestStep = {
+    workflow: 'manual:upload',
+    action: 'upload supplied PDF',
+    expected: 'attached PDF',
+    result: {
+      verdict: 'needs-review',
+      severity: 'medium',
+      expected: 'attached PDF',
+      actual: 'test-script-5-second.pdf 0.00 MB Next',
+      signals: {
+        url: 'https://example.test/upload',
+        title: 'Upload',
+        snapshot: {
+          raw: 'test-script-5-second.pdf 0.00 MB\nbutton "Next"',
+          interactive: 'button "Next"',
+        },
+        pageErrors: [],
+        consoleMessages: [],
+        consoleErrors: [],
+        networkRequests: [],
+      },
+      reasons: ['Visual review found a concrete concern: size shows 0.00 MB'],
+      retried: false,
+      visualAssessment: {
+        status: 'concern',
+        summary: 'The attached PDF size shows 0.00 MB.',
+        concerns: ['The file size shows 0.00 MB.'],
+      },
+    },
+    stepsToReproduce: [],
+  };
+  const item = 'upload the PDF file supplied by the production supervisor';
+  const evidence = ['uploaded "/tmp/test-script-5-second.pdf"'];
+  assert.equal(manualRoundedUploadVerified(item, evidence, step, true), true);
+  step.result.signals.snapshot.raw += '\nbutton "Next" disabled';
+  assert.equal(manualRoundedUploadVerified(item, evidence, step, true), false);
+});
 
 test('credential preparation is distinct from submitting a login', () => {
   assert.equal(isCredentialPreparationGoal('Fill EMAIL and PASSWORD with valid credentials'), true);
@@ -215,6 +514,14 @@ test('task-graph fast-forward never skips pending tasks but still accepts a comp
   assert.equal(isManualFinalProofMilestone({ id: 'manual-task-final-proof', goal: '', kind: 'verify' }), true);
   assert.equal(isManualFinalProofMilestone({ id: 'manual-contract-final-proof', goal: '', kind: 'verify' }), true);
   assert.equal(
+    isManualFinalProofMilestone({
+      id: 'manual-task-1',
+      goal: 'Create and persist a character, then verify it exists',
+      kind: 'verify',
+    }),
+    false,
+  );
+  assert.equal(
     canDirectOpenManualTarget(candidate, 'edit-scenes', new Set(['upload'])),
     false,
   );
@@ -265,6 +572,34 @@ test('task-graph fast-forward never skips pending tasks but still accepts a comp
       'edit-scenes',
     ),
     undefined,
+  );
+  assert.equal(
+    manualJourneyDestinationIssue(
+      candidate,
+      {
+        id: 'journey-upload',
+        goal: 'Advance',
+        kind: 'navigate',
+        manualJourneyDestinationPageId: 'upload',
+      },
+      'final-video',
+    ),
+    undefined,
+    'a later ordered journey state proves the earlier destination was crossed',
+  );
+  assert.match(
+    manualJourneyDestinationIssue(
+      candidate,
+      {
+        id: 'journey-final',
+        goal: 'Advance',
+        kind: 'navigate',
+        manualJourneyDestinationPageId: 'final-video',
+      },
+      'upload',
+    ) ?? '',
+    /did not reach required mapped state "final-video"/,
+    'an earlier state must not satisfy a later destination',
   );
 });
 
@@ -443,6 +778,54 @@ test('post-verification recovery is requested for unfinished automation but not 
       completionActionSeen: true,
     }),
     false,
+  );
+});
+
+test('production binary verdict passes operation-specific success and fails unresolved audits', () => {
+  const milestone: Flow['milestones'][number] = {
+    id: 'retake',
+    goal: 'Retake one scene and verify the updated video is playable',
+    kind: 'edit',
+  };
+  assert.equal(
+    productionBinaryVerdict({
+      current: 'needs-review',
+      milestone,
+      explorerSucceeded: true,
+      explorerSteps: ['Retake completed; player is actively playing and scrubber advancing'],
+      visual: {
+        status: 'concern',
+        summary: 'An older unrelated shot still says Error.',
+        concerns: ['Old shot error remains visible.'],
+      },
+    }),
+    'pass',
+  );
+  assert.equal(
+    productionBinaryVerdict({
+      current: 'needs-review',
+      milestone,
+      explorerSucceeded: false,
+      explorerSteps: ['No Reshoot control produced a state change'],
+      manualAuditIssue: 'Manual audit lacks distinct persisted evidence for Reshoot',
+    }),
+    'fail',
+  );
+});
+
+test('production binary verdict accepts clear read-only terminal proof', () => {
+  assert.equal(
+    productionBinaryVerdict({
+      current: 'needs-review',
+      milestone: { id: 'proof', goal: 'Verify terminal video', kind: 'verify' },
+      explorerSucceeded: false,
+      visual: {
+        status: 'clear',
+        summary: 'The final video is playable and Download Video is enabled.',
+        concerns: [],
+      },
+    }),
+    'pass',
   );
 });
 
@@ -1005,6 +1388,22 @@ test('two named character cards plus the named uploaded-character asset may sett
   );
 });
 
+test('Koyal character-slot results may migrate into its Assets and Animals as Character subsection', () => {
+  const item =
+    'During the in-flow Character step, exercise exactly three distinct characters using AI generation, image upload, and existing library selection';
+  assert.equal(
+    manualVisionAffirmsPersistedOutcome(item, {
+      status: 'concern',
+      summary:
+        "ElenaMarin and NolanMercer appear under the 'Add Assets and Animals as Character' section, while AdrianCole is shown as the generated character.",
+      concerns: [
+        "ElenaMarin and NolanMercer are displayed in the Assets and Animals as Character subsection rather than the in-flow character slot.",
+      ],
+    }),
+    true,
+  );
+});
+
 test('an optional empty Add-another slot does not invalidate three named finalized sources', () => {
   const item =
     'Create exactly three distinct characters: AI avatar, uploaded image, and existing library';
@@ -1044,7 +1443,7 @@ test('three-character vision may be uncertain only because methods and sections 
   );
 });
 
-test('three-character runtime guidance permits a dedicated character-assets section only for that task', () => {
+test('three-character runtime guidance requires character-section creation before accepting its migrated display', () => {
   const threeCharacterFlow = flow('manual-three-characters', 'exploratory');
   threeCharacterFlow.manualContract = {
     request: 'Create exactly three distinct characters.',
@@ -1083,9 +1482,54 @@ test('three-character runtime guidance permits a dedicated character-assets sect
     },
     [],
   );
-  assert.match(guidance, /dedicated character-assets\/animals-as-character section/i);
+  assert.match(guidance, /owning Character section or an empty character slot/i);
+  assert.match(guidance, /upload.*must begin.*character slot/i);
+  assert.match(guidance, /dedicated character-assets\/animals-as-character subsection/i);
+  assert.match(guidance, /only when same-run actions prove.*originated from the Character section/i);
   assert.match(guidance, /remove that empty placeholder once/i);
-  assert.doesNotMatch(guidance, /Never use a visually separate assets/i);
+  assert.match(guidance, /never substitute the standalone reusable Assets/i);
+});
+
+test('reusable-asset runtime guidance requires the standalone Asset section', () => {
+  const assetFlow = flow('manual-reusable-asset', 'exploratory');
+  assetFlow.manualContract = {
+    request: 'Create one new reusable asset.',
+    checklist: ['Create one new reusable asset in the asset library.'],
+  };
+  assetFlow.manualExecution = {
+    version: 1,
+    sourceFlowId: 'walked-audio',
+    primaryJourneyPageIds: ['assets-list'],
+    tasks: [
+      {
+        id: 'acceptance-1',
+        requirement: 'Create one new reusable asset in the asset library.',
+        phase: 'pre-terminal',
+        dependsOn: [],
+      },
+    ],
+    constraints: [],
+    policy: {
+      context: 'active-task',
+      processing: 'manual-narrative-safe',
+      recovery: 'bounded-modal-dismiss',
+      probes: 'contract-only',
+    },
+  };
+  const guidance = manualContractRuntimeGuidance(
+    assetFlow,
+    {
+      id: 'manual-task-1',
+      kind: 'navigate',
+      goal: 'Create reusable asset',
+      manualContractAudit: true,
+      manualContractItem: 1,
+      manualTaskId: 'acceptance-1',
+    },
+    [],
+  );
+  assert.match(guidance, /standalone Asset section or Asset library/i);
+  assert.match(guidance, /Never use a character slot/i);
 });
 
 test('Animated style audit accepts Animated provenance and clear visual persistence', () => {
@@ -1172,6 +1616,9 @@ test('manual runtime guidance is mutation-capable only for the audit and read-on
   assert.match(ordinary, /Never restart an obligation that already has matching evidence/);
   assert.match(ordinary, /do not reopen and repeat it merely because a collapsed summary shows stale text/);
   assert.match(ordinary, /continue forward; do not trap the entire journey retrying it/);
+  assert.match(ordinary, /Operational edit contract/);
+  assert.match(ordinary, /operational health, not artistic compliance or persistence/i);
+  assert.match(ordinary, /no page exception, console error/i);
 
   const audit = manualContractRuntimeGuidance(
     candidate,

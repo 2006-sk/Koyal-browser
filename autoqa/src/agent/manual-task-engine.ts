@@ -17,6 +17,32 @@ export interface ManualTaskGraph {
   constraints: string[];
 }
 
+/**
+ * Vague edit requests are not independently testable. Convert them into a
+ * before-to-after evidence contract without inventing site-specific controls
+ * or overriding an exact value supplied by the user.
+ */
+export function manualEditVerificationGuidance(requirement: string): string {
+  const editShaped =
+    /\b(?:edit|change|update|regenerate|reshoot|retake|reframe|camera angle|outfit|emotion|voice)\b/i.test(
+      requirement,
+    );
+  if (!editShaped) return '';
+  return (
+    '\nOperational edit contract: preserve any exact target supplied by the user. If the request is generic, choose one simple concrete ' +
+    'and objectively observable delta that the current control supports; state the exact replacement text, named ' +
+    'option, color, object, lighting condition, framing, or camera perspective in the Fill/Select action and its ' +
+    'reason. Never use unverifiable wording such as “improve it”, “make it better”, or “change it somehow”. Submit ' +
+    'the mutation once and wait until processing finishes or a bounded processing timeout occurs. This QA check ' +
+    'tests operational health, not artistic compliance or persistence: pass when the edit was genuinely submitted, ' +
+    'processing settled, the resulting surface remains usable, and deterministic capture finds no page exception, ' +
+    'console error, unexpected failing network/backend response, or visible/modal application error. Do not require ' +
+    'the requested visual/text delta to remain visible and do not fail merely because the result looks unchanged. ' +
+    'A click that never submits, an active spinner, a timeout, a disabled/broken result surface, or any concrete ' +
+    'captured error remains a failure.'
+  );
+}
+
 function isConstraintOnly(requirement: string): boolean {
   const normalized = requirement.trim();
   // A clause such as "On the same Location feature, delete..." is still an
@@ -240,13 +266,31 @@ function taskMilestone(task: ManualAcceptanceTask, ordinal: number): FlowMilesto
   const artifactIdentityGuidance =
     task.artifactRole === 'producer'
       ? '\nThis artifact is consumed by a later acceptance task. Preserve a stable reusable identity and source. ' +
-        'Prefer a finalized, uniquely named library artifact that a later picker can select. Use an upload-backed ' +
-        'creation only when this requirement or the visible consumer explicitly requires a file, and then retain ' +
-        'the exact source path. Do not choose a creation method merely because it mentions uploading.'
+        'Prefer a finalized upload-backed artifact and retain its exact source path whenever the later consumer may ' +
+        'accept a file. Do not choose a text-only generated artifact unless a visible later picker can select that ' +
+        'exact persisted library identity. If selection capability is not proven, upload now so the exact same file ' +
+        'can be supplied later.'
       : task.artifactRole === 'consumer'
         ? '\nConsume the exact artifact produced by the dependency task. Match its visible name or reuse the exact ' +
           'same source file path. An unrelated file or merely similar artifact must remain unproven.'
         : '';
+  const sectionOwnershipGuidance =
+    /\bexactly three distinct (?:characters|character methods)\b/i.test(task.requirement)
+    ? '\nIn-flow character requirement: complete every requested character method inside the active video wizard\'s owning Character section ' +
+      'or an empty character slot. For the image-upload method, use the upload control exposed by that character ' +
+      'slot; do not substitute the separate reusable Assets, Animals, Attachments, or Media section. If the app ' +
+      'later displays the finalized uploaded character in a dedicated character-assets subsection, count it only ' +
+      'when same-run evidence proves the upload originated from the in-flow Character section. Finish all requested ' +
+      'methods and confirm the selected set before leaving this wizard step. Never defer this task to, or navigate ' +
+      'back later through, the standalone Characters library.'
+    : /\b(?:new )?reusable asset\b|\basset library\b/i.test(task.requirement)
+      ? '\nAsset-section requirement: create/add this item through the standalone Asset section or Asset library. ' +
+        'Do not use a character slot, character uploader, or the Assets/Animals-as-Character subsection as proof ' +
+        'of a reusable asset.'
+      : /\b(?:same|that) asset\b|\basset created earlier\b/i.test(task.requirement)
+        ? '\nAsset-consumer requirement: select the exact persisted reusable asset from the scene’s Add Assets ' +
+          'control; do not create a replacement in a character or media section.'
+      : '';
   return {
     id: `manual-task-${ordinal}`,
     kind: task.position === 'after-entry' ? 'verify' : 'navigate',
@@ -261,6 +305,8 @@ function taskMilestone(task: ManualAcceptanceTask, ordinal: number): FlowMilesto
       'or the attempt has no effect, leave this task unproven and return control; do not retry it from later tasks. ' +
       'When the requirement names an artifact type and an upload/creation method, use the control inside that ' +
       "artifact's own section or slot; never substitute a separate assets, attachments, or media uploader." +
+      sectionOwnershipGuidance +
+      manualEditVerificationGuidance(task.requirement) +
       artifactIdentityGuidance,
   };
 }

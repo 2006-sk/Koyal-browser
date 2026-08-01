@@ -8,6 +8,14 @@ export interface MilestoneExecution {
   milestoneId: string;
   verdict: TestStep['result']['verdict'];
   execution: 'explore' | 'replay' | 'auth' | 'none';
+  /**
+   * The browser automation reached and exercised the intended product action,
+   * but the application returned concrete error evidence. Product failures are
+   * still reported as FAIL; they are not evidence that the recipe is stale.
+   */
+  productBlocked?: boolean;
+  /** Not independently testable because a verified product failure blocked it. */
+  qualificationExcluded?: boolean;
 }
 
 export function flowRecipeId(flow: Flow, milestoneId: string): string {
@@ -123,28 +131,50 @@ export interface QualificationInput {
  */
 export const REPLAY_VALIDATION_MIN_PASS_RATE = 0.8;
 
-function passRate(flow: Flow, byId: Map<string, MilestoneExecution>): number {
-  if (flow.milestones.length === 0) return 0;
-  const passes = flow.milestones.filter(
-    (milestone) => byId.get(milestone.id)?.verdict === 'pass',
-  ).length;
-  return passes / flow.milestones.length;
+function qualificationExecutions(
+  flow: Flow,
+  byId: Map<string, MilestoneExecution>,
+): MilestoneExecution[] {
+  return flow.milestones.flatMap((milestone) => {
+    const execution = byId.get(milestone.id);
+    if (execution?.productBlocked || execution?.qualificationExcluded) return [];
+    // An ordinary milestone that never ran is still missing coverage. Only an
+    // explicit product-blocked marker may remove a checkpoint from the
+    // denominator.
+    if (!execution) {
+      return [{
+        milestoneId: milestone.id,
+        verdict: 'needs-review' as const,
+        execution: 'none' as const,
+      }];
+    }
+    return [execution];
+  });
+}
+
+function passRate(executions: MilestoneExecution[]): number {
+  if (executions.length === 0) return 0;
+  return executions.filter((execution) => execution.verdict === 'pass').length / executions.length;
 }
 
 /** Update the flow's lifecycle after one full attempted run. */
 export function qualifyFlowAfterRun(flow: Flow, input: QualificationInput): string {
   const now = input.now ?? new Date().toISOString();
   const byId = new Map(input.executions.map((execution) => [execution.milestoneId, execution]));
-  const everyMilestonePassed = flow.milestones.every(
-    (milestone) => byId.get(milestone.id)?.verdict === 'pass',
-  );
-  const everyMilestoneReplayed = flow.milestones.every(
-    (milestone) => byId.get(milestone.id)?.execution === 'replay',
-  );
-  const replayCoverage = passRate(flow, byId);
+  const eligible = qualificationExecutions(flow, byId);
+  const verifiedProductFailure = input.executions.some((execution) => execution.productBlocked);
+  const everyMilestonePassed =
+    eligible.length > 0 && eligible.every((execution) => execution.verdict === 'pass');
+  const everyMilestoneReplayed =
+    eligible.length > 0 && eligible.every((execution) => execution.execution === 'replay');
+  const replayCoverage = passRate(eligible);
   const replayEligible =
     replayCoverage >= REPLAY_VALIDATION_MIN_PASS_RATE && input.terminalArtifactVerified;
-  const fullyLearned = everyMilestonePassed && input.allRecipesPresent && input.terminalArtifactVerified;
+  const fullyLearned =
+    !verifiedProductFailure &&
+    everyMilestonePassed &&
+    input.allRecipesPresent &&
+    input.terminalArtifactVerified;
 
   if (input.mode === 'learning') {
     flow.status = 'exploratory';
@@ -169,6 +199,30 @@ export function qualifyFlowAfterRun(flow: Flow, input: QualificationInput): stri
       replayValidatedAt: now,
     };
     return 'every milestone recipe replayed successfully and terminal evidence was verified; promoted to deterministic';
+  }
+
+  if (
+    verifiedProductFailure &&
+    replayEligible &&
+    everyMilestoneReplayed
+  ) {
+    if (input.mode === 'deterministic') {
+      flow.status = 'deterministic';
+      flow.qualification = {
+        phase: 'replay-validation',
+        learnedAt: flow.qualification?.learnedAt ?? now,
+        terminalArtifactVerifiedAt: now,
+        replayValidatedAt: flow.qualification?.replayValidatedAt,
+      };
+      return 'product failure reported, while every eligible recipe replayed successfully; deterministic qualification preserved';
+    }
+    flow.status = 'exploratory';
+    flow.qualification = {
+      phase: 'replay-validation',
+      learnedAt: flow.qualification?.learnedAt ?? now,
+      terminalArtifactVerifiedAt: now,
+    };
+    return 'product failure reported and product-blocked milestones excluded; replay validation remains qualified';
   }
 
   const noMilestoneHardFailed = flow.milestones.every(

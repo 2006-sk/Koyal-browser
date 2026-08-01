@@ -209,6 +209,88 @@ test('needs-review terminal evidence does not erase mechanically successful repl
   assert.equal(candidate.qualification?.phase, 'replay-validation');
 });
 
+test('verified product failure does not demote an otherwise healthy replay validation', () => {
+  const candidate = flow();
+  candidate.milestones = [
+    { id: 'render', goal: 'Verify final video is playable and downloadable', kind: 'verify' },
+    { id: 'edit', goal: 'Submit Edit Video and verify the result', kind: 'edit' },
+    { id: 'retake', goal: 'Verify Retake after the edit', kind: 'verify' },
+    { id: 'proof', goal: 'Read-only final task graph proof', kind: 'verify' },
+  ];
+  candidate.qualification = { phase: 'replay-validation', learnedAt: 'earlier' };
+  const message = qualifyFlowAfterRun(candidate, {
+    mode: 'replay-validation',
+    executions: [
+      { milestoneId: 'render', verdict: 'pass', execution: 'replay' },
+      {
+        milestoneId: 'edit',
+        verdict: 'fail',
+        execution: 'replay',
+        productBlocked: true,
+      },
+      {
+        milestoneId: 'retake',
+        verdict: 'needs-review',
+        execution: 'none',
+        qualificationExcluded: true,
+      },
+      {
+        milestoneId: 'proof',
+        verdict: 'fail',
+        execution: 'none',
+        qualificationExcluded: true,
+      },
+    ],
+    terminalArtifactVerified: true,
+    allRecipesPresent: false,
+  });
+  assert.equal(candidate.status, 'exploratory');
+  assert.equal(candidate.qualification?.phase, 'replay-validation');
+  assert.match(message, /product failure reported/);
+});
+
+test('verified product failure preserves an already deterministic recipe', () => {
+  const candidate = flow();
+  candidate.status = 'deterministic';
+  candidate.qualification = {
+    phase: 'replay-validation',
+    learnedAt: 'earlier',
+    replayValidatedAt: 'validated-earlier',
+  };
+  const message = qualifyFlowAfterRun(candidate, {
+    mode: 'deterministic',
+    executions: [
+      { milestoneId: 'm1', verdict: 'pass', execution: 'replay' },
+      {
+        milestoneId: 'm2',
+        verdict: 'fail',
+        execution: 'replay',
+        productBlocked: true,
+      },
+    ],
+    terminalArtifactVerified: true,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.status, 'deterministic');
+  assert.equal(candidate.qualification?.replayValidatedAt, 'validated-earlier');
+  assert.match(message, /deterministic qualification preserved/);
+});
+
+test('automation-side replay failure still demotes the flow', () => {
+  const candidate = flow();
+  candidate.qualification = { phase: 'replay-validation', learnedAt: 'earlier' };
+  qualifyFlowAfterRun(candidate, {
+    mode: 'replay-validation',
+    executions: [
+      { milestoneId: 'm1', verdict: 'pass', execution: 'replay' },
+      { milestoneId: 'm2', verdict: 'fail', execution: 'replay' },
+    ],
+    terminalArtifactVerified: true,
+    allRecipesPresent: true,
+  });
+  assert.equal(candidate.qualification?.phase, 'learning');
+});
+
 test('video terminal proof accepts visible playable/downloadable artifact controls', () => {
   const candidate = flow();
   assert.equal(

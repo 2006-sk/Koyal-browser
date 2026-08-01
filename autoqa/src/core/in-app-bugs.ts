@@ -1,0 +1,161 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import type { Explorer } from './explorer.js';
+import type { AgentBrowser } from './agent-browser.js';
+import type { RunReport } from './types.js';
+import { fillFieldByHint } from './edits.js';
+import {
+  groupedProductBugs,
+  productErrorLines,
+  type ProductBugGroup,
+} from './slack-bugs.js';
+
+export interface InAppBugReportResult {
+  found: number;
+  submitted: number;
+  failures: string[];
+  submittedReports: Array<{ workflow: string; description: string }>;
+}
+
+function redact(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer <redacted>')
+    .replace(
+      /\b(password|token|authorization|cookie|secret|api[ -]?key)\b\s*[:=]\s*\S+/gi,
+      '$1: <redacted>',
+    )
+    .slice(0, 6000);
+}
+
+function likelyCause(bug: ProductBugGroup): string {
+  const text = productErrorLines(bug.step).join(' ');
+  if (/s3|json|unexpected token|doctype/i.test(text)) {
+    return 'The application received an invalid or unavailable generated-media response and could not parse or load it.';
+  }
+  if (/5\d\d|internal server/i.test(text)) {
+    return 'The application backend returned a server error after the requested action was submitted.';
+  }
+  if (/try again later|not edited|failed to/i.test(text)) {
+    return 'The application rejected the submitted operation after AutoQA reached the correct feature state.';
+  }
+  return 'The application emitted concrete runtime error evidence after the requested action.';
+}
+
+export function inAppBugDescription(bug: ProductBugGroup, runId: string): string {
+  const errors = productErrorLines(bug.step).join('\n');
+  return redact(
+    [
+      `AutoQA: ${bug.step.workflow} failed`,
+      'Reported automatically by AutoQA.',
+      `Run: ${runId}`,
+      `Page: ${bug.step.result.signals.url}`,
+      `Observed error: ${errors}`,
+      `Likely cause: ${likelyCause(bug)}`,
+      `Blocked capability: ${bug.step.action}`,
+      `Occurrences in this run: ${bug.occurrences}`,
+    ].join('\n'),
+  );
+}
+
+function reportGoal(): string {
+  return [
+    'Open the visible in-app "Report a Bug" control and stop as soon as its report form/modal is visible.',
+    'Do not fill or submit the form, do not repeat the failed product action, and do not use any unrelated control.',
+    'If the control is unavailable, fail safely.',
+  ].join('\n');
+}
+
+/**
+ * File verified Koyal product errors through its own Report-a-Bug UI. This runs
+ * after report finalization, so navigation/reporting failures cannot alter QA
+ * verdicts or cause the product action to be repeated.
+ */
+export async function reportKoyalBugsInApp(opts: {
+  report: RunReport;
+  hostname: string;
+  runDir: string;
+  browser: AgentBrowser;
+  explorer: Explorer;
+}): Promise<InAppBugReportResult> {
+  const bugs = groupedProductBugs(opts.report);
+  const result: InAppBugReportResult = {
+    found: bugs.length,
+    submitted: 0,
+    failures: [],
+    submittedReports: [],
+  };
+  if (bugs.length === 0) return result;
+  if (!/\.?koyal\.ai$/i.test(opts.hostname)) {
+    result.failures.push('in-app product reporting is currently available only on Koyal properties');
+    return result;
+  }
+
+  for (const bug of bugs) {
+    try {
+      const url = bug.step.result.signals.url;
+      if (url.startsWith('http')) {
+        opts.browser.open(url);
+        opts.browser.wait(1200);
+      }
+      const attempt = await opts.explorer.achieveGoal(reportGoal(), {
+        maxSteps: 4,
+        visionFirst: true,
+        manualMode: true,
+      });
+      if (!attempt.success) {
+        result.failures.push(`${bug.step.workflow}: ${attempt.error ?? 'report form was not confirmed submitted'}`);
+        continue;
+      }
+      const description = inAppBugDescription(bug, opts.report.runId);
+      const filled =
+        fillFieldByHint(opts.browser, 'Please describe the bug', description).ok ||
+        fillFieldByHint(opts.browser, 'Bug Description', description).ok ||
+        fillFieldByHint(opts.browser, 'Description', description).ok;
+      if (!filled) {
+        result.failures.push(`${bug.step.workflow}: report description field was not fillable`);
+        continue;
+      }
+      if (!opts.browser.clickButtonByText('Submit Report', true)) {
+        result.failures.push(`${bug.step.workflow}: Submit Report was not available`);
+        continue;
+      }
+      let confirmed = false;
+      for (let poll = 0; poll < 12; poll++) {
+        opts.browser.wait(poll === 0 ? 1000 : 750);
+        const confirmation = `${opts.browser.snapshotInteractive()}\n${opts.browser.snapshotFull()}`;
+        if (/\b(?:submitted successfully|report submitted|thank you for your feedback)\b/i.test(confirmation)) {
+          confirmed = true;
+          break;
+        }
+      }
+      if (!confirmed) {
+        result.failures.push(`${bug.step.workflow}: submission confirmation was not visible`);
+        continue;
+      }
+      result.submitted++;
+      result.submittedReports.push({
+        workflow: bug.step.workflow,
+        description,
+      });
+    } catch (error) {
+      result.failures.push(
+        `${bug.step.workflow}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  try {
+    fs.writeFileSync(
+      path.join(opts.runDir, 'in-app-bug-reporting.json'),
+      `${JSON.stringify(result, null, 2)}\n`,
+      'utf8',
+    );
+  } catch {
+    // Evidence logging is best-effort and cannot alter the QA result.
+  }
+  console.log(
+    `[bugs] in-app reporting: ${result.submitted}/${result.found} submitted` +
+      (result.failures.length ? ` (${result.failures.length} safely skipped/failed)` : ''),
+  );
+  return result;
+}

@@ -20,7 +20,7 @@ import type { NetworkRequest, RunReport, TestStep } from './types.js';
 const MAX_ERROR_LINES = 12;
 const MAX_BACKEND_LOG_CHARS = 2_000;
 
-interface ProductBugGroup {
+export interface ProductBugGroup {
   step: TestStep;
   scenarioName: string;
   occurrences: number;
@@ -48,21 +48,64 @@ function failedNetworkLines(requests: NetworkRequest[] | undefined): string[] {
 }
 
 /** The concrete console/exception/network error lines the SITE emitted for this step. */
-function errorLines(step: TestStep): string[] {
+export function productErrorLines(step: TestStep): string[] {
   const sig = step.result.signals;
   if (!sig) return [];
   const lines: string[] = [];
-  for (const c of sig.consoleErrors ?? []) if (c.text?.trim()) lines.push(`console: ${c.text.trim()}`);
-  for (const e of sig.pageErrors ?? []) if (e.message?.trim()) lines.push(`exception: ${e.message.trim()}`);
+  const visible = `${sig.snapshot.raw}\n${sig.snapshot.interactive}`;
+  const visibleError = visible.match(
+    /\b(?:video is not edited[^.\n!]*(?:!+)?|something went wrong[^.\n]*(?:\.)?|internal server error[^.\n]*(?:\.)?|failed to (?:generate|save|create|upload|render|edit)[^.\n]*(?:\.)?|unexpected error[^.\n]*(?:\.)?|try again later[^.\n]*(?:\.)?)\b/i,
+  )?.[0];
+  const verifierCorrelatedRuntimeError = step.result.reasons.some((reason) =>
+    /\b(?:page error|console error|application failure|product error|uncaught|exception)\b/i.test(reason),
+  );
+  const matchesVisibleError = (value: string): boolean => {
+    if (!visibleError) return false;
+    const left = value.toLowerCase().replace(/\s+/g, ' ').trim();
+    const right = visibleError.toLowerCase().replace(/\s+/g, ' ').trim();
+    return left.includes(right) || right.includes(left);
+  };
+  for (const c of sig.consoleErrors ?? []) {
+    if (
+      c.text?.trim() &&
+      (verifierCorrelatedRuntimeError || matchesVisibleError(c.text))
+    ) {
+      lines.push(`console: ${c.text.trim()}`);
+    }
+  }
+  for (const e of sig.pageErrors ?? []) {
+    if (
+      e.message?.trim() &&
+      (verifierCorrelatedRuntimeError || matchesVisibleError(e.message))
+    ) {
+      lines.push(`exception: ${e.message.trim()}`);
+    }
+  }
   for (const n of failedNetworkLines(sig.networkRequests)) lines.push(`network: ${n}`);
+  if (visibleError) lines.push(`visible: ${visibleError.trim()}`);
   // de-dup while preserving order, then cap
   const seen = new Set<string>();
   const deduped = lines.filter((l) => (seen.has(l) ? false : (seen.add(l), true)));
   return deduped.slice(0, MAX_ERROR_LINES);
 }
 
-function isProductBug(step: TestStep): boolean {
-  return step.result.verdict === 'fail' && errorLines(step).length > 0;
+export function isProductBug(step: TestStep): boolean {
+  if (step.result.verdict === 'pass') return false;
+  const lines = productErrorLines(step);
+  // Manual task-graph audits deliberately soften a concrete product FAIL to
+  // NEEDS REVIEW so independent later checks still run. Reporting happens
+  // after the run and must not lose that real visible/backend failure merely
+  // because execution continued.
+  if (lines.some((line) => line.startsWith('visible:') || line.startsWith('network:'))) return true;
+  if (step.result.verdict !== 'fail') return false;
+  // Console/page errors can be historical ambient noise in long SPA sessions.
+  // Require the verifier to have tied them to this failed checkpoint.
+  return (
+    lines.length > 0 &&
+    step.result.reasons.some((reason) =>
+      /\b(?:page error|console error|application failure|product error|uncaught|exception)\b/i.test(reason),
+    )
+  );
 }
 
 function normalizeErrorSignature(line: string): string {
@@ -84,13 +127,13 @@ function normalizeErrorSignature(line: string): string {
 }
 
 function bugSignature(step: TestStep): string {
-  return errorLines(step).map(normalizeErrorSignature).sort().join('\n');
+  return productErrorLines(step).map(normalizeErrorSignature).sort().join('\n');
 }
 
 function shortTitle(step: TestStep): string {
   // Prefer the first real site error as the "what's broken" summary; fall back to
   // the deterministic reason, then the workflow id alone.
-  const firstError = errorLines(step)[0]?.replace(/^(console|exception|network):\s*/, '');
+  const firstError = productErrorLines(step)[0]?.replace(/^(console|exception|network):\s*/, '');
   const reason = step.result.reasons?.find((r) => r.trim());
   const summary = (firstError ?? reason ?? step.action ?? '').trim();
   const clipped = summary.length > 120 ? `${summary.slice(0, 120)}…` : summary;
@@ -105,9 +148,9 @@ function formatBug(
   flowCount = 1,
 ): string {
   const url = step.result.signals?.url || '—';
-  const errors = errorLines(step).join('\n');
+  const errors = productErrorLines(step).join('\n');
   const firstError =
-    errorLines(step)[0]?.replace(/^(console|exception|network):\s*/, '') ??
+    productErrorLines(step)[0]?.replace(/^(console|exception|network):\s*/, '') ??
     'The site emitted an error.';
   const what = shortTitle(step).replace(`${step.workflow} — `, '');
   const backendText = backendLog
@@ -127,7 +170,7 @@ function formatBug(
   ].join('\n');
 }
 
-function groupedProductBugs(report: RunReport): ProductBugGroup[] {
+export function groupedProductBugs(report: RunReport): ProductBugGroup[] {
   const grouped = new Map<string, ProductBugGroup>();
   for (const scenario of report.scenarios) {
     for (const step of scenario.steps) {
@@ -213,7 +256,7 @@ function matchingBackendLog(
   step: TestStep,
   endpoint: string,
 ): BackendLogMatch | undefined {
-  const errorText = errorLines(step).join(' ').toLowerCase();
+  const errorText = productErrorLines(step).join(' ').toLowerCase();
   const tokens = [...new Set(
     errorText
       .split(/[^a-z0-9]+/)

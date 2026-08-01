@@ -10,6 +10,7 @@ import { Interact } from '../agent/interact.js';
 import { RecipePlayer } from '../agent/recipes.js';
 import { SiteState } from '../agent/site-state.js';
 import { Statements } from '../agent/statements.js';
+import { ProductionPromptSupervisor } from '../agent/prompt-supervisor.js';
 import { matchPage } from '../agent/sitemap.js';
 import {
   fieldValueKey,
@@ -37,11 +38,21 @@ export interface Session {
 // it owns instead of leaking Chrome profiles (or broad-killing other runs).
 const activeSessions = new Set<Session>();
 
-export type UploadKind = 'pdf' | 'audio' | 'any';
+export type UploadKind = 'pdf' | 'audio' | 'image' | 'video' | 'any';
 
 /** Infer what kind of file an upload wants from the LLM's reason / selector hint. */
 export function inferUploadKind(selectorHint?: string, reason?: string): UploadKind {
   const context = `${selectorHint ?? ''} ${reason ?? ''}`.toLowerCase();
+  // Check explicit reference/motion video language before generic "asset" or
+  // incidental extension words in validation copy. Live Manual v2 previously
+  // offered a PNG to Koyal's "Upload reference video" control because every
+  // non-PDF/audio slot collapsed to `any`.
+  if (/reference video|video file|upload video|motion capture|reference motion|\.mp4\b|\.mov\b|\.webm\b/.test(context)) {
+    return 'video';
+  }
+  if (/character image|avatar image|image file|asset (?:image|file)|upload[^.\n]{0,40}asset|photo|logo|\.png\b|\.jpe?g\b|\.webp\b/.test(context)) {
+    return 'image';
+  }
   if (/pdf|script|document/.test(context)) return 'pdf';
   if (/audio|wav|mp3|m4a|narration|music|song|voice/.test(context)) return 'audio';
   return 'any';
@@ -49,8 +60,10 @@ export function inferUploadKind(selectorHint?: string, reason?: string): UploadK
 
 const KIND_EXT: Record<UploadKind, RegExp> = {
   pdf: /\.pdf$/i,
-  audio: /\.(wav|mp3|m4a|mp4)$/i,
-  any: /\.(pdf|txt|wav|mp3|png|jpg|csv|mp4|m4a)$/i,
+  audio: /\.(wav|mp3|m4a|aac|ogg|flac)$/i,
+  image: /\.(png|jpe?g|webp|gif|heic|avif)$/i,
+  video: /\.(mp4|mov|webm|m4v)$/i,
+  any: /\.(pdf|txt|wav|mp3|m4a|aac|ogg|flac|png|jpe?g|webp|gif|mp4|mov|webm|csv)$/i,
 };
 
 /** Known local test assets offered as suggestions when the agent needs a file. */
@@ -84,14 +97,27 @@ export function bootstrap(): Session {
   LlmClient.budget = config.llm.callBudget;
 
   const state = new SiteState(baseUrl);
+  const llm = new LlmClient();
+  const browser = new AgentBrowser({ session: `${config.session}-${state.hostname}` });
+  browser.startExitWatchdog();
+  const supervisor = config.supervisor.enabled
+    ? new ProductionPromptSupervisor(llm, () => {
+        const screenshotPath = path.join(state.screensDir, 'supervisor-current.png');
+        browser.screenshotAnnotated(screenshotPath);
+        return {
+          screenshotPath,
+          snapshot: browser.snapshotFull(),
+          url: browser.getUrl(),
+        };
+      })
+    : undefined;
   const interact = new Interact(
     state.inboxDir,
     2000,
     Number(process.env.AUTOQA_PROMPT_TIMEOUT_MS ?? '300000'),
+    supervisor,
+    config.supervisor.humanOverrideMs,
   );
-  const browser = new AgentBrowser({ session: `${config.session}-${state.hostname}` });
-  browser.startExitWatchdog();
-  const llm = new LlmClient();
   const guard = new Guard(state, interact);
   const pageIdNow = (): string => {
     try {
@@ -171,7 +197,8 @@ export function bootstrap(): Session {
     siteDescription: baseUrl,
     siteHints: state.sitemap.siteHints,
     hooks: {
-      beforeClick: (label) => guard.confirmClick(label, pageIdNow()),
+      beforeClick: (label, _ref, actionReason) =>
+        guard.confirmClick(label, pageIdNow(), actionReason),
       onUploadRequested: async (selector, reason) => {
         try {
           const kind = inferUploadKind(selector, reason);

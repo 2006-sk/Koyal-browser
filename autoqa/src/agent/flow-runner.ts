@@ -54,6 +54,7 @@ import {
   type FlowRunMode,
   type MilestoneExecution,
 } from './flow-lifecycle.js';
+import { manualEditVerificationGuidance } from './manual-task-engine.js';
 
 const STEP_BASE: Partial<VerificationExpectation> = {
   allowPageErrors: true,
@@ -190,6 +191,324 @@ function baseExpectationFor(milestone: FlowMilestone): VerificationExpectation {
     expectation.snapshotIncludesAny = [milestone.successHint];
   }
   return expectation;
+}
+
+export function manualEditRequiresZeroErrorSignals(
+  flow: Flow,
+  milestone: FlowMilestone,
+): boolean {
+  if (!flow.manualContract) return false;
+  const taskRequirement = milestone.manualTaskId
+    ? flow.manualExecution?.tasks.find((task) => task.id === milestone.manualTaskId)?.requirement
+    : milestone.manualContractAudit && milestone.manualContractItem
+      ? flow.manualContract.checklist[milestone.manualContractItem - 1]
+      : milestone.goal;
+  return Boolean(taskRequirement && manualEditVerificationGuidance(taskRequirement));
+}
+
+function runtimeSignalSignature(value: unknown): string {
+  return typeof value === 'string'
+    ? value.trim().toLowerCase()
+    : JSON.stringify(value).toLowerCase();
+}
+
+function freshRuntimeEntries<T>(after: readonly T[], before: readonly T[] = []): T[] {
+  const remaining = new Map<string, number>();
+  for (const entry of before) {
+    const key = runtimeSignalSignature(entry);
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  }
+  return after.filter((entry) => {
+    const key = runtimeSignalSignature(entry);
+    const count = remaining.get(key) ?? 0;
+    if (count <= 0) return true;
+    remaining.set(key, count - 1);
+    return false;
+  });
+}
+
+/** Narrow third-party/media teardown failures proven non-blocking by live runs. */
+export function isKnownNonBlockingManualRuntimeError(text: string): boolean {
+  return /(?:wavesurfer|posthog|rrweb)[\s\S]{0,400}(?:aborterror|signal is aborted|failed to fetch)|(?:aborterror|signal is aborted)[\s\S]{0,400}wavesurfer/i.test(
+    text,
+  );
+}
+
+/** Keep the raw evidence in reports, but judge this action only on fresh signals. */
+export function manualFreshSignalBundle(
+  after: SignalBundle,
+  before?: SignalBundle,
+): SignalBundle {
+  const pageErrors = freshRuntimeEntries(after.pageErrors, before?.pageErrors).filter(
+    (error) => !isKnownNonBlockingManualRuntimeError(error.message),
+  );
+  const consoleErrors = freshRuntimeEntries(
+    after.consoleErrors,
+    before?.consoleErrors,
+  ).filter((error) => !isKnownNonBlockingManualRuntimeError(error.text));
+  const fresh5xx = freshRuntimeEntries(
+    after.networkRequests.filter((request) => Number(request.status ?? 0) >= 500),
+    before?.networkRequests.filter((request) => Number(request.status ?? 0) >= 500),
+  );
+  return {
+    ...after,
+    pageErrors,
+    consoleErrors,
+    networkRequests: [
+      ...after.networkRequests.filter((request) => Number(request.status ?? 0) < 500),
+      ...fresh5xx,
+    ],
+  };
+}
+
+function patternAppears(text: string, pattern: string | RegExp): boolean {
+  if (typeof pattern === 'string') return text.toLowerCase().includes(pattern.toLowerCase());
+  pattern.lastIndex = 0;
+  return pattern.test(text);
+}
+
+function freshVisibleProductError(after: string, before: string): boolean {
+  const patterns = [
+    /\b(?:something went wrong|internal server error|unexpected error|insufficient credits)\b/i,
+    /\bfailed to (?:generate|save|create|upload|render)\b/i,
+    /\b(?:video is not edited|no image available|try again later)\b/i,
+    /\b(?:project|workspace|record|document|item)\s*id\s+is\s+not\s+allowed\s+to\s+be\s+empty\b/i,
+  ];
+  return patterns.some((pattern) => patternAppears(after, pattern) && !patternAppears(before, pattern));
+}
+
+/**
+ * A product error raised by one manual acceptance task may remain rendered on
+ * the SPA while later, independent tasks succeed.  Vision must retain that
+ * evidence, but it must not charge the same old banner/tile to every later
+ * milestone.  This is intentionally limited to explicit product-error UI that
+ * was already visible in the milestone's pre-action baseline.
+ */
+export function manualVisualConcernIsHistoricalProductError(
+  visual: TestStep['result']['visualAssessment'],
+  beforeSnapshot: string,
+  afterSnapshot: string,
+): boolean {
+  if (visual?.status !== 'concern') return false;
+  const assessment = `${visual.summary}\n${visual.concerns.join('\n')}`;
+  const explicitErrorPatterns = [
+    {
+      assessment: /\bvideo is not edited(?: please try again later)?\b/i,
+      snapshot: /\bvideo is not edited(?: please try again later)?\b/i,
+    },
+    {
+      assessment: /\b(?:shot|scene|tile|card)\b.{0,80}\berror\b/i,
+      snapshot: /(?:button|statictext)\s+"!?\s*error\b|\b(?:shot|scene)\b.{0,80}\berror\b/i,
+    },
+    {
+      assessment: /\b(?:failed to (?:generate|save|create|upload|render)|no image available)\b/i,
+      snapshot: /\b(?:failed to (?:generate|save|create|upload|render)|no image available)\b/i,
+    },
+    {
+      assessment: /\b(?:something went wrong|internal server error|unexpected error)\b/i,
+      snapshot: /\b(?:something went wrong|internal server error|unexpected error)\b/i,
+    },
+  ];
+  return explicitErrorPatterns.some(
+    ({ assessment: assessmentPattern, snapshot: snapshotPattern }) =>
+      patternAppears(assessment, assessmentPattern) &&
+      patternAppears(beforeSnapshot, snapshotPattern) &&
+      patternAppears(afterSnapshot, snapshotPattern),
+  );
+}
+
+function normalizeManualVerificationResult(
+  step: TestStep,
+  before: SignalBundle,
+  expectation: VerificationExpectation,
+  verification: VerificationLayer,
+): void {
+  const beforeSnapshot = `${before.snapshot.raw}\n${before.snapshot.interactive}`;
+  const afterSnapshot = `${step.result.signals.snapshot.raw}\n${step.result.signals.snapshot.interactive}`;
+  const effectiveSignals = manualFreshSignalBundle(step.result.signals, before);
+  const effectiveExpectation: VerificationExpectation = {
+    ...expectation,
+    // A KB exclusion already present before this action is historical context,
+    // not evidence that the current action introduced the error.
+    snapshotExcludes: expectation.snapshotExcludes?.filter(
+      (pattern) => !patternAppears(beforeSnapshot, pattern),
+    ),
+  };
+  const effective = verification.evaluateSignals(effectiveSignals, effectiveExpectation);
+  const fresh5xx = effectiveSignals.networkRequests.some(
+    (request) =>
+      Number(request.status ?? 0) >= 500 &&
+      !config.ignored5xxHostsPattern.test(request.url ?? ''),
+  );
+  const visiblyTimedOutProcessing =
+    /\b(?:processing|generating|rendering)\b/i.test(afterSnapshot) &&
+    step.result.reasons.some((reason) => /exceeded .{0,30}(?:wait|timeout)|processing timeout/i.test(reason));
+  step.result.freshProductFailureEvidence =
+    effectiveSignals.pageErrors.length > 0 ||
+    effectiveSignals.consoleErrors.length > 0 ||
+    fresh5xx ||
+    freshVisibleProductError(afterSnapshot, beforeSnapshot) ||
+    visiblyTimedOutProcessing;
+
+  const historicalVisualProductError =
+    !step.result.freshProductFailureEvidence &&
+    manualVisualConcernIsHistoricalProductError(
+      step.result.visualAssessment,
+      beforeSnapshot,
+      afterSnapshot,
+    );
+
+  const runtimeNoiseOnly =
+    step.result.reasons.length > 0 &&
+    step.result.reasons.every((reason) =>
+      /^(?:Uncaught JS exceptions|Console errors|Unexpected 5xx responses|Snapshot should not include)/i.test(
+        reason,
+      ),
+    );
+  if (
+    step.result.verdict !== 'pass' &&
+    effective.verdict === 'pass' &&
+    (runtimeNoiseOnly || historicalVisualProductError) &&
+    (step.result.visualAssessment?.status !== 'concern' || historicalVisualProductError)
+  ) {
+    step.result.verdict = 'pass';
+    step.result.severity = 'low';
+    step.result.actual = verification.buildActualSummary(effectiveSignals);
+    step.result.reasons = [
+      ...effective.reasons,
+      historicalVisualProductError
+        ? 'Baseline-aware manual verification kept the earlier product error on its originating task instead of charging it to this later independent milestone'
+        : 'Baseline-aware manual verification removed only cumulative or known non-blocking runtime noise',
+    ];
+  }
+}
+
+/**
+ * A healthy submitted mutation must not be turned into NEEDS REVIEW merely
+ * because a second semantic/vision audit cannot prove the artistic delta or
+ * reconstruct every label. This is deliberately narrower than "the explorer
+ * said done": it requires same-run input + submit evidence and clean captured
+ * product signals. Creation, deletion, and terminal-artifact requirements keep
+ * their stronger persistence/identity proof.
+ */
+export function manualOperationalMutationVerified(
+  item: string,
+  evidence: readonly string[],
+  step: TestStep,
+  explorerSucceeded: boolean,
+  beforeSnapshot = '',
+  beforeSignals?: SignalBundle,
+): boolean {
+  if (
+    hasFreshOperationalProductFailure(step, beforeSnapshot, beforeSignals)
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:delete|remove)\b/i.test(item) ||
+    /\b(?:terminal artifact|final[- ]video|rendered video|create video|downloadable)\b/i.test(item) ||
+    /\bexactly three distinct characters\b/i.test(item) ||
+    /\b(?:create|finalize).{0,60}\b(?:character|asset|location|project)\b/i.test(item) ||
+    /\b(?:new reusable asset|asset library)\b/i.test(item)
+  ) {
+    return false;
+  }
+
+  const joined = evidence.join('\n').toLowerCase();
+  const mutationShaped =
+    Boolean(manualEditVerificationGuidance(item)) ||
+    /\b(?:add assets?|add reference|upload)\b/i.test(item);
+  if (!mutationShaped) return false;
+
+  const hasInput =
+    /\b(?:filled|selected|uploaded) "[^"]+"/.test(joined) ||
+    /clicked "[^"]*(?:top down|low angle|high angle|eye level|side profile|over[- ]the[- ]shoulder|close[- ]up|wide shot|bird'?s[- ]eye|dutch angle|melancholy|euphoric|serene)[^"]*"/.test(
+      joined,
+    );
+  const hasSubmit =
+    /clicked "[^"]*(?:save|apply|change look|regenerate|reshoot|retake|reframe|add assets?|add reference|add video|submit edit)[^"]*"/.test(
+      joined,
+    );
+  if (!hasInput || !hasSubmit) return false;
+
+  // The explorer can time out after the requested mutation has already been
+  // submitted (most commonly by repeating `done` while the SPA remains on the
+  // same surface). For operational edits, the recorded input + submit pair and
+  // clean post-action signals are stronger evidence than that bookkeeping
+  // failure. The strict creation/deletion/terminal cases above still require a
+  // genuinely successful explorer result and persisted identity proof.
+  void explorerSucceeded;
+
+  // Compound script-edit tasks must still prove each requested operation was
+  // actually visited; clean signals alone cannot invent a skipped sub-action.
+  if (/\bvoice\b/i.test(item) && !/\bvoice\b/.test(joined)) return false;
+  if (
+    /\bemotion\b/i.test(item) &&
+    !/\b(?:emotion|melancholy|euphoric|serene|happy|sad|angry|fearful|excited|calm)\b/.test(
+      joined,
+    )
+  ) {
+    return false;
+  }
+  if (
+    /\b(?:dialogue|spoken text|script line)\b/i.test(item) &&
+    !/\bfilled "[^"]+" with "[^"]+"/.test(joined)
+  ) {
+    return false;
+  }
+  if (/\badd assets?\b/i.test(item) && !/uploaded "[^"]+"/.test(joined)) return false;
+  return true;
+}
+
+/** Koyal rounds tiny valid fixtures to 0.00 MB; accepted upload state wins. */
+export function manualRoundedUploadVerified(
+  item: string,
+  evidence: readonly string[],
+  step: TestStep,
+  explorerSucceeded: boolean,
+  beforeSnapshot = '',
+  beforeSignals?: SignalBundle,
+): boolean {
+  if (
+    !explorerSucceeded ||
+    hasFreshOperationalProductFailure(step, beforeSnapshot, beforeSignals)
+  ) {
+    return false;
+  }
+  if (!/\bupload\b/i.test(item) || !manualEvidenceSupportsItem(item, evidence)) return false;
+  const visual = step.result.visualAssessment;
+  if (!visual || visual.status !== 'concern') return false;
+  const concernText = [visual.summary, ...visual.concerns].join('\n');
+  if (!/\b(?:0\.00\s*mb|0\s*kb)\b/i.test(concernText)) return false;
+
+  const uploadedPaths = evidence
+    .map((entry) => entry.match(/uploaded "([^"]+)"/i)?.[1])
+    .filter((value): value is string => Boolean(value));
+  const snapshot = step.result.signals.snapshot.raw.toLowerCase();
+  const attached = uploadedPaths.some((filePath) =>
+    snapshot.includes(path.basename(filePath).toLowerCase()),
+  );
+  const forwardDisabled = /\b(?:next|continue|submit)\b[^\n]*\bdisabled\b/i.test(snapshot);
+  return attached && !forwardDisabled;
+}
+
+/**
+ * Agent-browser asks Chrome to clear runtime channels before each milestone,
+ * but SPAs can retain or immediately re-emit cumulative errors. Compare the
+ * captured baseline as a multiset and treat only genuinely new blocking
+ * evidence as belonging to this mutation. Visible error text follows the same
+ * before/after rule.
+ */
+function hasFreshOperationalProductFailure(
+  step: TestStep,
+  beforeSnapshot: string,
+  beforeSignals?: SignalBundle,
+): boolean {
+  const signals = manualFreshSignalBundle(step.result.signals, beforeSignals);
+  if (signals.pageErrors.length > 0 || signals.consoleErrors.length > 0) return true;
+  if (signals.networkRequests.some((request) => Number(request.status ?? 0) >= 500)) return true;
+  const after = `${signals.snapshot.raw}\n${signals.snapshot.interactive}`;
+  return freshVisibleProductError(after, beforeSnapshot);
 }
 
 export function manualEntryNeedsContextRecovery(snapshot: string): boolean {
@@ -681,10 +1000,21 @@ function emptySignals(url: string): SignalBundle {
 }
 
 /**
+ * Production supervisor reports are binary. A downstream milestone skipped
+ * after an unrecoverable journey break was not tested, but it is still an
+ * unmet production check and therefore fails rather than entering a review
+ * queue. Interactive/non-production runs retain the more descriptive
+ * needs-review state.
+ */
+export function skippedMilestoneVerdict(supervisorEnabled: boolean): Verdict {
+  return supervisorEnabled ? 'fail' : 'needs-review';
+}
+
+/**
  * A synthetic step recording that a milestone was NOT tested because an upstream
  * milestone failed and its position could not be recovered to test this one
- * independently. Verdict is `needs-review` (honest: neither a pass nor a real
- * failure of THIS milestone — it simply never ran), with empty signals so the
+ * independently. Interactive runs use `needs-review`; production-supervisor
+ * runs use binary `fail` because an unexecuted required check is unmet. Empty signals ensure the
  * Slack product-bug filter (fail + real error evidence) never treats it as a bug.
  * This replaces the old behavior of silently dropping every milestone after a
  * `break` — a skipped-with-reason record is strictly more honest than a milestone
@@ -697,12 +1027,13 @@ function skippedStep(
   priorGoals: string[],
 ): TestStep {
   const actual = `skipped — not tested because upstream milestone "${brokenAtId}" failed and position could not be recovered to test this one independently`;
+  const verdict = skippedMilestoneVerdict(config.supervisor.enabled);
   return {
     workflow: milestone.id,
     action: milestone.goal,
     expected: milestone.goal,
     result: {
-      verdict: 'needs-review',
+      verdict,
       severity: 'low',
       expected: milestone.goal,
       actual,
@@ -1180,10 +1511,23 @@ export function manualJourneyDestinationIssue(
   milestone: FlowMilestone,
   pageId: string,
 ): string | undefined {
+  const primaryIds = flow.manualExecution?.primaryJourneyPageIds ?? [];
+  const destinationIndex = milestone.manualJourneyDestinationPageId
+    ? primaryIds.indexOf(milestone.manualJourneyDestinationPageId)
+    : -1;
+  const currentIndex = primaryIds.indexOf(pageId);
+  // A task-graph checkpoint may legitimately over-achieve by moving through
+  // more than one wizard screen before the runner verifies it. Any later state
+  // on the same ordered primary journey proves the required destination was
+  // crossed; demanding exact equality sends the explorer backwards or
+  // false-fails healthy forward progress.
+  const laterJourneyStateProvesTraversal =
+    destinationIndex >= 0 && currentIndex > destinationIndex;
   if (
     !flow.manualExecution ||
     !milestone.manualJourneyDestinationPageId ||
-    pageId === milestone.manualJourneyDestinationPageId
+    pageId === milestone.manualJourneyDestinationPageId ||
+    laterJourneyStateProvesTraversal
   ) {
     return undefined;
   }
@@ -1267,6 +1611,9 @@ function looksLikeIdempotentSkipReason(actions: ExplorerAction[]): boolean {
 }
 
 function hasConcreteProductFailureEvidence(step: TestStep): boolean {
+  if (step.result.freshProductFailureEvidence !== undefined) {
+    return step.result.freshProductFailureEvidence;
+  }
   const signals = step.result.signals;
   if (signals.pageErrors.length > 0 || signals.consoleErrors.length > 0) return true;
   if (signals.networkRequests.some((request) => Number(request.status ?? 0) >= 500)) return true;
@@ -1726,10 +2073,10 @@ async function runMilestone(
       // post-verification continuation below is allowed to cross it.
       returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
       manualMode: Boolean(flow.manualContract),
-      manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+      manualReadOnly: Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
       allowDoneWithoutProgress:
         priorEvidenceProvesActiveTask ||
-        Boolean(flow.manualContract && milestone.kind === 'verify'),
+        Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
     });
     // mid-flow auth wall → re-login once and retry. This used to be a bare
     // `/log ?in|password/i` regex over the snapshot text — a much weaker,
@@ -1756,10 +2103,10 @@ async function runMilestone(
       explored = await deps.explorer.achieveGoal(goal, {
         returnOnUrlChange: runMode === 'learning' ? true : milestoneReturnsOnUrlChange(goal),
         manualMode: Boolean(flow.manualContract),
-        manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+        manualReadOnly: Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
         allowDoneWithoutProgress:
           priorEvidenceProvesActiveTask ||
-          Boolean(flow.manualContract && milestone.kind === 'verify'),
+          Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
       });
     }
   }
@@ -1779,6 +2126,15 @@ async function runMilestone(
 
   // verify with the KB-augmented expectation
   const base = baseExpectationFor(milestone);
+  if (manualEditRequiresZeroErrorSignals(flow, milestone)) {
+    // Manual edit checks judge operational health, not artistic compliance.
+    // Signals were cleared immediately before this milestone, so any captured
+    // page exception/console error/5xx belongs to this edit attempt rather than
+    // stale ambient history.
+    base.allowPageErrors = false;
+    base.allowConsoleErrors = false;
+    base.maxUnexpectedNetwork5xx = 0;
+  }
   // a login-shaped milestone that authenticated successfully proves itself via
   // ensureAuthenticated() above, not via a login-page landmark that may never
   // reappear when the session silently restores — drop the literal-text check
@@ -1844,21 +2200,68 @@ async function runMilestone(
       : undefined,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
+  if (flow.manualContract) {
+    normalizeManualVerificationResult(step, before, expectation, verification);
+  }
 
   const completionActionSeen = flowHasCompletionAction(flow, state, explored);
   const currentRecipeEvidence = manualEvidenceFromRecipeSteps(replayCompletedSteps);
-  const firstAttemptManualAuditIssue = manualTaskGraphRepairIssue(
-    flow,
-    milestone,
-    [
-      ...manualEvidence,
-      ...currentRecipeEvidence,
-      ...(explored ? manualEvidenceFromActions(explored.actions) : []),
-    ],
-    step.result.signals.snapshot.raw,
-    manualVisualAssessmentFromActions(explored?.actions ?? []) ??
-      step.result.visualAssessment,
+  const firstAttemptManualEvidence = [
+    ...manualEvidence,
+    ...currentRecipeEvidence,
+    ...(explored ? manualEvidenceFromActions(explored.actions) : []),
+  ];
+  const firstAttemptRequirement =
+    flow.manualContract && milestone.manualContractAudit && milestone.manualContractItem
+      ? flow.manualContract.checklist[milestone.manualContractItem - 1] ?? milestone.goal
+      : milestone.goal;
+  const firstAttemptOperationallyVerified = Boolean(
+    flow.manualContract &&
+      milestone.manualContractAudit &&
+      explored &&
+      (
+        manualOperationalMutationVerified(
+          firstAttemptRequirement,
+          firstAttemptManualEvidence,
+          step,
+          explored.success,
+          `${before.snapshot.raw}\n${before.snapshot.interactive}`,
+          before,
+        ) ||
+        manualRoundedUploadVerified(
+          firstAttemptRequirement,
+          firstAttemptManualEvidence,
+          step,
+          true,
+          `${before.snapshot.raw}\n${before.snapshot.interactive}`,
+          before,
+        )
+      ),
   );
+  if (
+    firstAttemptOperationallyVerified &&
+    step.result.verdict !== 'pass'
+  ) {
+    step.result.verdict = 'pass';
+    step.result.reasons = step.result.reasons.filter(
+      (reason) =>
+        !/^Visual review found a concrete concern:/i.test(reason) &&
+        !/^(?:Uncaught page|Console error|Unexpected.*5\d\d)/i.test(reason),
+    );
+    step.result.reasons.push(
+      'Same-run operational mutation evidence and clean product signals override non-terminal visual ambiguity',
+    );
+  }
+  const firstAttemptManualAuditIssue = firstAttemptOperationallyVerified
+    ? undefined
+    : manualTaskGraphRepairIssue(
+        flow,
+        milestone,
+        firstAttemptManualEvidence,
+        step.result.signals.snapshot.raw,
+        manualVisualAssessmentFromActions(explored?.actions ?? []) ??
+          step.result.visualAssessment,
+      );
   const firstAttemptJourneyDestinationIssue = manualJourneyDestinationIssue(
     flow,
     milestone,
@@ -1958,10 +2361,10 @@ async function runMilestone(
       // verification retry cannot resubmit Generate/Try/Finalize/Save.
       blockedClickLabels: priorSuccessfulMutations,
       manualMode: Boolean(flow.manualContract),
-      manualReadOnly: Boolean(flow.manualContract && milestone.kind === 'verify'),
+      manualReadOnly: Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
       allowDoneWithoutProgress:
         priorEvidenceProvesActiveTask ||
-        Boolean(flow.manualContract && milestone.kind === 'verify'),
+        Boolean(flow.manualContract && isManualFinalProofMilestone(milestone)),
     });
     explored = mergeExplorerResults(explored, continuation);
     execution = 'explore';
@@ -1987,6 +2390,13 @@ async function runMilestone(
         : undefined,
     });
     step.explorerSteps = explored.stepsTaken;
+    if (flow.manualContract) {
+      // The continuation may be the attempt that finally performs the required
+      // mutation. Apply the same fresh-vs-baseline classifier to its result;
+      // otherwise stale SPA banners re-enter through this second verification
+      // path and turn successful repairs into false failures.
+      normalizeManualVerificationResult(step, before, expectation, verification);
+    }
   }
 
   // recordVerifiedStep() already wrote step-summary.md to disk with THIS verdict
@@ -2021,7 +2431,7 @@ async function runMilestone(
     explored && !explored.success && !hasConcreteProductFailureEvidence(step),
   );
   const infrastructureBlocked = explorerInfrastructureBlocked(explored);
-  const visualConcernDowngrade = step.result.visualAssessment?.status === 'concern';
+  let visualConcernDowngrade = step.result.visualAssessment?.status === 'concern';
   const creationCompletionMissing =
     creationMustPersist && !flowHasCompletionAction(flow, state, explored);
   const creationVisuallyUnproven =
@@ -2089,10 +2499,55 @@ async function runMilestone(
     ...currentRecipeEvidence,
     ...(explored ? manualEvidenceFromActions(explored.actions) : []),
   ];
-  const manualAuditIssue =
+  const finalManualRequirement =
+    flow.manualContract && milestone.manualContractAudit && milestone.manualContractItem
+      ? flow.manualContract.checklist[milestone.manualContractItem - 1] ?? milestone.goal
+      : milestone.goal;
+  const finalOperationallyVerified = Boolean(
+    flow.manualContract &&
+      milestone.manualContractAudit &&
+      explored &&
+      (
+        manualOperationalMutationVerified(
+          finalManualRequirement,
+          [...manualEvidence, ...milestoneManualEvidence],
+          step,
+          explored.success,
+          `${before.snapshot.raw}\n${before.snapshot.interactive}`,
+          before,
+        ) ||
+        manualRoundedUploadVerified(
+          finalManualRequirement,
+          [...manualEvidence, ...milestoneManualEvidence],
+          step,
+          true,
+          `${before.snapshot.raw}\n${before.snapshot.interactive}`,
+          before,
+        )
+      ),
+  );
+  if (
+    finalOperationallyVerified &&
+    step.result.verdict !== 'pass'
+  ) {
+    step.result.verdict = 'pass';
+    visualConcernDowngrade = false;
+    step.result.reasons = step.result.reasons.filter(
+      (reason) =>
+        !/^Visual review found a concrete concern:/i.test(reason) &&
+        !/^Manual audit lacks distinct persisted evidence/i.test(reason) &&
+        !/^(?:Uncaught page|Console error|Unexpected.*5\d\d)/i.test(reason),
+    );
+    step.result.reasons.push(
+      'Same-run operational mutation evidence and clean product signals override non-terminal audit ambiguity',
+    );
+  }
+  const manualAuditIssue = finalOperationallyVerified
+    ? undefined
+    :
     flow.manualContract && milestone.manualContractAudit && milestone.manualContractItem
       ? manualAuditEvidenceIssue(
-          flow.manualContract.checklist[milestone.manualContractItem - 1] ?? milestone.goal,
+          finalManualRequirement,
           [...manualEvidence, ...milestoneManualEvidence],
           step.result.signals.snapshot.raw,
           flow.manualExecution?.tasks.find(
@@ -2102,6 +2557,26 @@ async function runMilestone(
             step.result.visualAssessment,
         )
       : undefined;
+  const finalManualVisual =
+    manualVisualAssessmentFromActions(explored?.actions ?? []) ??
+    step.result.visualAssessment;
+  const acceptedCharacterPresentationAmbiguity = Boolean(
+    flow.manualContract &&
+      milestone.manualContractAudit &&
+      !manualAuditIssue &&
+      !hasConcreteProductFailureEvidence(step) &&
+      manualVisionAffirmsPersistedOutcome(finalManualRequirement, finalManualVisual),
+  );
+  if (acceptedCharacterPresentationAmbiguity && step.result.verdict !== 'pass') {
+    step.result.verdict = 'pass';
+    visualConcernDowngrade = false;
+    step.result.reasons = step.result.reasons.filter(
+      (reason) => !/^Visual review found a concrete concern:/i.test(reason),
+    );
+    step.result.reasons.push(
+      'Same-run method provenance and visible finalized entities resolve the app-specific character-section presentation ambiguity',
+    );
+  }
   const journeyDestinationIssue = manualJourneyDestinationIssue(
     flow,
     milestone,
@@ -2158,8 +2633,20 @@ async function runMilestone(
     // the KB (including anything just classified) may resolve a non-pass verdict
     if (step.result.verdict !== 'pass') {
       const augmented = statements.augmentExpectation(base, currentPageId(deps));
-      const re = verification.evaluateSignals(step.result.signals, augmented);
-      const successSeen = statements.hasSuccessStatement(step.result.signals, currentPageId(deps));
+      const beforeSnapshot = `${before.snapshot.raw}\n${before.snapshot.interactive}`;
+      const reExpectation = flow.manualContract
+        ? {
+            ...augmented,
+            snapshotExcludes: augmented.snapshotExcludes?.filter(
+              (pattern) => !patternAppears(beforeSnapshot, pattern),
+            ),
+          }
+        : augmented;
+      const reSignals = flow.manualContract
+        ? manualFreshSignalBundle(step.result.signals, before)
+        : step.result.signals;
+      const re = verification.evaluateSignals(reSignals, reExpectation);
+      const successSeen = statements.hasSuccessStatement(reSignals, currentPageId(deps));
       // soften hint-only failures here too (same rule as above)
       let reVerdict = re.verdict;
       if (
@@ -2227,6 +2714,30 @@ async function runMilestone(
           humanRejectedSuccessHint = true;
         }
       }
+    }
+
+    if (config.supervisor.enabled && step.result.verdict === 'needs-review') {
+      const binary = productionBinaryVerdict({
+        current: step.result.verdict,
+        milestone,
+        explorerSucceeded: explored?.success,
+        explorerSteps: explored?.stepsTaken,
+        visual:
+          manualVisualAssessmentFromActions(explored?.actions ?? []) ??
+          step.result.visualAssessment,
+        manualAuditIssue,
+        journeyDestinationIssue,
+        infrastructureBlocked,
+        concreteProductFailure: hasConcreteProductFailureEvidence(step),
+      });
+      step.result.kbTriage = step.result.kbTriage ?? { statementsSeen: [], newlyClassified: [] };
+      step.result.kbTriage.verdictFlippedFrom = 'needs-review';
+      step.result.verdict = binary;
+      step.result.reasons.push(
+        binary === 'pass'
+          ? 'Production binary adjudication found goal-specific persisted success evidence; no human review queue is required'
+          : 'Production binary adjudication could not prove the required outcome after bounded repair; unresolved work is a failure, not a review item',
+      );
     }
 
     step.humanDecisions = interact.decisions.slice(decisionsBefore);
@@ -2412,6 +2923,10 @@ export function manualVisionAffirmsPersistedOutcome(
         /\bnamed ai[- ]generated character\b/.test(summary) &&
         /\blibrary character\b/.test(summary) &&
         /\basset[- ]section image\b/.test(summary)
+      ) ||
+      (
+        /\btwo characters?\b/.test(summary) &&
+        /\b(?:third|uploaded)\b[\s\S]{0,100}\b(?:asset|assets\/animals)\b/.test(summary)
       )
     ) &&
     !/\b(?:disabled|loading|processing|generating|no image available|failed)\b/.test(
@@ -2421,6 +2936,16 @@ export function manualVisionAffirmsPersistedOutcome(
       !/\b(?:missing|empty)\b/.test(summary) ||
       /\bempty ['"]?add(?: another)?['"]? placeholder\b/.test(summary)
     );
+  const migratedCharacterSubsectionGrouping =
+    threeCharacterItem &&
+    /\b(?:appear|displayed|shown) under (?:the )?['"]?add assets and animals as character/i.test(summary) &&
+    (visual.summary.match(/\b[A-Z][a-z]+[A-Z][a-z]+\b/g)?.length ?? 0) >= 2 &&
+    !/\b(?:missing|empty|disabled|loading|processing|generating|no image available|failed)\b/.test(summary) &&
+    visual.concerns.every((concern) =>
+      /\b(?:assets and animals as character|character[- ]assets|separate (?:asset|character) section|in-flow character slot|wrong section)\b/i.test(
+        concern,
+      ),
+    );
   // Some applications persist an uploaded character in a dedicated
   // character-assets group rather than rendering it as a normal avatar card.
   // The action audit separately proves AI Finalize + image Upload/Save +
@@ -2429,9 +2954,9 @@ export function manualVisionAffirmsPersistedOutcome(
   // missing mutation. Never extend this exception to an empty/disabled/loading
   // state or a generic asset unrelated to the uploaded-character provenance.
   if (
-    uploadedCharacterAssetGrouping &&
-    visual.concerns.every((concern) =>
-      /\b(?:asset entry|character entit|method|section|upload|finalized as three|attribution|add placeholder)\b/i.test(
+    (uploadedCharacterAssetGrouping || migratedCharacterSubsectionGrouping) &&
+    !visual.concerns.some((concern) =>
+      /\b(?:upload (?:did not|never)|existing (?:was not|never)|ai avatar (?:was not|never)|still processing|empty slot|next (?:is|remains) disabled|no image)\b/i.test(
         concern,
       ),
     )
@@ -2495,6 +3020,51 @@ export function manualVisionAffirmsPersistedOutcome(
     return /\bvideo\b/.test(summary) && /\b(?:playable|downloadable|persisted|rendered)\b/.test(summary);
   }
   return false;
+}
+
+/**
+ * Unattended production runs have no human review queue. After the normal
+ * deterministic checks, visual audit, bounded repair, and supervisor prompt
+ * have all run, collapse any residual ambiguity to a binary operational
+ * verdict. A goal-specific success toast/playback/persistence observation may
+ * prove the current operation even when an unrelated older error remains on
+ * the page; missing required evidence, infrastructure loss, or an explicit
+ * audit gap is a fail. Nothing is silently parked for later review.
+ */
+export function productionBinaryVerdict(args: {
+  current: Verdict;
+  milestone: FlowMilestone;
+  explorerSucceeded?: boolean;
+  explorerSteps?: readonly string[];
+  visual?: ManualVisualAssessment;
+  manualAuditIssue?: string;
+  journeyDestinationIssue?: string;
+  infrastructureBlocked?: boolean;
+  concreteProductFailure?: boolean;
+}): Exclude<Verdict, 'needs-review'> {
+  if (args.current === 'pass' || args.current === 'fail') return args.current;
+  if (
+    args.manualAuditIssue ||
+    args.journeyDestinationIssue ||
+    args.infrastructureBlocked ||
+    args.concreteProductFailure
+  ) {
+    return 'fail';
+  }
+  const evidence = (args.explorerSteps ?? []).join('\n').toLowerCase();
+  const operationSpecificSuccess =
+    /(?:toast|message)[^\n]{0,100}\b(?:success|successfully|completed)\b/.test(evidence) ||
+    /\b(?:actively playing|playback advancing|scrubber (?:moving|advancing))\b/.test(evidence) ||
+    /\b(?:download video|export xml)[^\n]{0,100}\benabled\b/.test(evidence) ||
+    /\b(?:persisted|finalized)[^\n]{0,100}\b(?:visible|shown|library|scene|video)\b/.test(evidence);
+  if (operationSpecificSuccess) return 'pass';
+  if (
+    args.visual?.status === 'clear' &&
+    (args.explorerSucceeded || args.milestone.kind === 'verify')
+  ) {
+    return 'pass';
+  }
+  return 'fail';
 }
 
 /**
@@ -2873,19 +3443,28 @@ export function manualContractRuntimeGuidance(
   const evidenceText = uniqueEvidence.length
     ? `\n\nRecorded successful action evidence from this same run:\n- ${uniqueEvidence.join('\n- ')}`
     : '\n\nThere is no successful action evidence from an earlier checkpoint yet.';
-  const threeCharacterMethodTask = /\bexactly three distinct characters\b/i.test(
+  const threeCharacterMethodTask = /\bexactly three distinct (?:characters|character methods)\b/i.test(
     taskGraphTask?.requirement ?? contract,
   );
   const artifactGroupingRule = threeCharacterMethodTask
-    ? 'For this exact three-character task, an application may intentionally display an uploaded character or ' +
-      'library-selected character in a dedicated character-assets/animals-as-character section. That dedicated ' +
-      'section counts when the screenshot visibly shows three finalized character entities and same-run actions ' +
-      'prove AI generation, image upload, and existing-library selection. Do not require method labels in the ' +
-      'final list. If uploading migrated an entry out of a newly added slot and left only an unused empty ' +
-      'placeholder that disables Next, remove that empty placeholder once; never remove a finalized entity. '
-    : 'Use screenshot grouping to ensure an upload/create/select control belongs to the requested artifact ' +
-      'section or empty slot. Never use a visually separate assets, attachments, animals, or media section as ' +
-      'proof of a character/person upload. ';
+    ? 'For this exact three-character-method task, complete all methods inside the active video wizard through the owning Character section or ' +
+      'an empty character slot. The uploaded-character method must begin from the upload control belonging to that ' +
+      'character slot; never substitute the standalone reusable Assets, Attachments, Animals, or Media section. ' +
+      'The application may later display a finalized uploaded character or library-selected character in a ' +
+      'dedicated character-assets/animals-as-character subsection. That dedicated section counts only when same-run ' +
+      'actions prove the upload or selection originated from the Character section and the screenshot visibly shows ' +
+      'three finalized character entities. Do not require method labels in the final list. If uploading migrated ' +
+      'an entry out of a newly added slot and left only an unused empty ' +
+      'placeholder that disables Next, remove that empty placeholder once; never remove a finalized entity. Confirm ' +
+      'the requested selected set before advancing, and never defer this task to or revisit it later through the ' +
+      'standalone Characters library. '
+    : /\b(?:new )?reusable asset\b|\basset library\b/i.test(taskGraphTask?.requirement ?? contract)
+      ? 'Create/add the reusable asset only through the standalone Asset section or Asset library. Never use a ' +
+        'character slot, character uploader, or Assets/Animals-as-Character subsection as proof of the reusable ' +
+        'asset. Verify the finalized item on its owning Asset surface. '
+      : 'Use screenshot grouping to ensure an upload/create/select control belongs to the requested artifact ' +
+        'section or empty slot. Never use a visually separate assets, attachments, animals, or media section as ' +
+        'proof of a character/person upload. ';
   const operatingRule = verificationOnly
     ? '\nThis checkpoint is strictly read-only. The contract and evidence are provided only for assessment. Do not ' +
       'click Edit/Create/Save/Generate/Upload/Submit controls, fill fields, or retry a missing mutation.'
@@ -2925,10 +3504,14 @@ export function manualContractRuntimeGuidance(
     flow.manualExecution?.constraints.length
       ? `\nGlobal run constraints (apply silently; do not turn them into extra tasks):\n- ${flow.manualExecution.constraints.join('\n- ')}`
       : '';
+  const editGuidance = milestone.goal.includes('Operational edit contract:')
+    ? ''
+    : manualEditVerificationGuidance(taskGraphTask?.requirement ?? contract);
   return (
     `\n\nManual acceptance contract:\n${contract}${constraints}${evidenceText}\n` +
     'Do not infer completion merely from reaching a later page. Use the evidence to avoid duplicate work and to ' +
-    `distinguish an attempted-but-visually-ambiguous check from an omitted check.${operatingRule}`
+    `distinguish an attempted-but-visually-ambiguous check from an omitted check.${operatingRule}` +
+    editGuidance
   );
 }
 
@@ -2993,8 +3576,8 @@ export async function runFlows(
     let lastAttemptedIndex = -1;
     const milestoneExecutions: MilestoneExecution[] = [];
     const manualEvidence: string[] = [];
-    const manualAuditFailures: string[] = [];
     const visitedPageIds = new Set<string>();
+    let verifiedProductBlockSeen = false;
 
     try {
       // Nothing has navigated anywhere for THIS flow yet at this point — the
@@ -3092,41 +3675,35 @@ export async function runFlows(
           manualEvidence,
           visitedPageIds,
         );
-        if (milestone.manualContractAudit && step.result.verdict === 'fail') {
-          step.result.verdict = 'needs-review';
-          step.result.reasons.push(
-            'This manual audit is independent; keeping it unresolved so later checklist items are still tested',
-          );
-          if (step.artifactDir) {
-            patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
-          }
-        }
+        // Capture this before an independent manual audit is softened from FAIL
+        // to NEEDS REVIEW. The product verdict and the replay-health verdict are
+        // separate axes: a real application error must remain lifecycle evidence
+        // even when later contract checks are allowed to continue.
+        const productBlocked =
+          step.result.verdict === 'fail' && hasConcreteProductFailureEvidence(step);
+        if (productBlocked) verifiedProductBlockSeen = true;
         scenario.steps.push(step);
         manualEvidence.push(...newManualEvidence);
-        if (milestone.manualContractAudit && step.result.verdict !== 'pass') {
-          manualAuditFailures.push(
-            `item ${milestone.manualContractItem ?? milestone.id}: ${step.result.verdict}`,
-          );
-        }
-        if (
-          flow.manualContract &&
-          isManualFinalProofMilestone(milestone) &&
-          manualAuditFailures.length > 0
-        ) {
-          step.result.verdict = 'fail';
-          step.result.reasons.push(
-            `Manual contract is incomplete because audit checks remain unresolved: ${manualAuditFailures.join(', ')}`,
-          );
-          if (step.artifactDir) {
-            patchStepSummaryVerdict(step.artifactDir, step.result.verdict, step.result.reasons);
-          }
-        }
-        milestoneExecutions.push({ milestoneId: milestone.id, verdict: step.result.verdict, execution });
+        milestoneExecutions.push({
+          milestoneId: milestone.id,
+          verdict: step.result.verdict,
+          execution,
+          productBlocked,
+          qualificationExcluded:
+            productBlocked ||
+            (verifiedProductBlockSeen && isManualFinalProofMilestone(milestone)),
+        });
         if (step.result.verdict === 'fail') {
           const remaining = flow.milestones.length - (mi + 1);
           if (remaining <= 0) {
             console.log(`[flow] ✗ ${flow.id} broken at ${milestone.id} (final milestone) — flow done`);
             break;
+          }
+          if (milestone.manualContractAudit) {
+            console.log(
+              `[flow:v2] acceptance task ${milestone.manualContractItem ?? milestone.id} failed — continuing to the next independent task`,
+            );
+            continue;
           }
           // Don't abandon the rest of the flow on one failed milestone. Try to
           // recover position to the next milestone's expected start so
@@ -3153,6 +3730,12 @@ export async function runFlows(
           const priorGoals = flow.milestones.slice(0, mi + 1).map((m) => m.goal);
           for (let k = mi + 1; k < flow.milestones.length; k++) {
             scenario.steps.push(skippedStep(flow, flow.milestones[k], milestone.id, priorGoals));
+            milestoneExecutions.push({
+              milestoneId: flow.milestones[k].id,
+              verdict: skippedMilestoneVerdict(config.supervisor.enabled),
+              execution: 'none',
+              qualificationExcluded: productBlocked,
+            });
           }
           break;
         }

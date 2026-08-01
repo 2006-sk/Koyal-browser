@@ -10,6 +10,7 @@ import {
 import {
   compileManualTaskGraph,
   lowerManualTaskGraph,
+  manualEditVerificationGuidance,
   splitCrossPageAcceptanceItems,
 } from '../agent/manual-task-engine.js';
 import type { SiteState } from '../agent/site-state.js';
@@ -28,7 +29,7 @@ export interface ManualPlan {
 
 // Bump only when the execution contract changes in a way that makes previously
 // learned manual recipes unsafe to reuse.
-const MANUAL_FLOW_CONTRACT_VERSION = '27';
+const MANUAL_FLOW_CONTRACT_VERSION = '28';
 export type ManualEngine = 'legacy' | 'task-graph';
 
 function normalizedWords(value: string): string[] {
@@ -211,17 +212,83 @@ function flowSearchText(flow: Flow): string {
     .toLowerCase();
 }
 
+type RequestedMediaSource = 'script' | 'audio';
+
+function requestedMediaSource(request: string): RequestedMediaSource | undefined {
+  const script = /\b(?:script(?:-to-|\s+to\s+|[- ]based\b|\s+(?:path|flow|file|upload))|upload\s+(?:the\s+)?script)\b/i.test(
+    request,
+  );
+  const audio = /\b(?:audio(?:-to-|\s+to\s+|[- ]based\b|\s+(?:path|flow|file|upload))|upload\s+(?:the\s+)?audio)\b/i.test(
+    request,
+  );
+  return script === audio ? undefined : script ? 'script' : 'audio';
+}
+
+function flowMatchesRequestedMediaSource(flow: Flow, source: RequestedMediaSource): boolean {
+  // Source identity belongs to the flow title/id/description and its opening
+  // upload checkpoints. Do not search the whole journey: an Audio flow may
+  // legitimately contain a later "edit script line" acceptance task, which
+  // must never make it eligible for an explicit Script-to-video request.
+  const sourceIdentity = [
+    flow.id,
+    flow.title,
+    flow.description,
+    ...flow.milestones.slice(0, 2).map((milestone) => milestone.goal),
+  ].join(' ');
+  return source === 'script'
+    ? /\bscript\b/i.test(sourceIdentity)
+    : /\baudio\b/i.test(sourceIdentity);
+}
+
+export function authoritativeManualSourceFlow(
+  sitemap: SiteMap,
+  request: string,
+): Flow | undefined {
+  const mediaSource = requestedMediaSource(request);
+  if (!mediaSource || !requestsEndToEndJourney(request)) return undefined;
+  return sitemap.flows
+    .filter(
+      (flow) =>
+        flow.status !== 'skipped' &&
+        !isManualFlow(flow) &&
+        flowMatchesRequestedMediaSource(flow, mediaSource) &&
+        flowHasRequestedCapabilities(flow, request),
+    )
+    .sort(
+      (left, right) =>
+        right.milestones.length - left.milestones.length ||
+        left.id.localeCompare(right.id),
+    )[0];
+}
+
 /** Deterministic fallback for clear requests that match a complete mapped flow. */
 export function bestManualFlow(sitemap: SiteMap, request: string): Flow | undefined {
   if (isReadOnlyManualRequest(request)) return undefined;
   const words = manualKeywords(requestForTargetMatching(request));
   if (words.length === 0) return undefined;
+  const explicitlyScopedSurface = requestsEndToEndJourney(request)
+    ? undefined
+    : request.match(
+      /\b(?:go\s+to|return\s+to|open|visit|in|on|from)\s+(?:the\s+)?(projects?|characters?|locations?|assets?|outfits?)\s*(?:area|page|library)?\b/i,
+    )?.[1]?.toLowerCase().replace(/s$/, '');
+  const mediaSource = requestedMediaSource(request);
+  if (mediaSource && !explicitlyScopedSurface) {
+    const authoritativeSource = authoritativeManualSourceFlow(sitemap, request);
+    if (authoritativeSource) return authoritativeSource;
+  }
   const ranked = sitemap.flows
     .filter(
       (flow) =>
         flow.status !== 'skipped' &&
         !isManualFlow(flow) &&
-        flowHasRequestedCapabilities(flow, request),
+        flowHasRequestedCapabilities(flow, request) &&
+        (!mediaSource || flowMatchesRequestedMediaSource(flow, mediaSource)) &&
+        (
+          !explicitlyScopedSurface ||
+          normalizedWords(`${flow.entry.pageId} ${flow.id} ${flow.title}`).some(
+            (token) => token.replace(/s$/, '') === explicitlyScopedSurface,
+          )
+        ),
     )
     .map((flow) => {
       const haystack = flowSearchText(flow);
@@ -632,7 +699,8 @@ function manualDirective(request: string): string {
     'required option group and satisfy one safe option in each still-unanswered group before retrying an option that ' +
     'was already attempted. If loop analysis identifies a different unmet group, act on that group next. Before any ' +
     'create or edit action, satisfy every named search, selection, and owner requirement in the request and visibly ' +
-    'confirm that the active entity matches; never assume the currently selected entity is the requested one.'
+    'confirm that the active entity matches; never assume the currently selected entity is the requested one.' +
+    manualEditVerificationGuidance(request)
   );
 }
 
@@ -688,6 +756,23 @@ export function manualAuditTargetPage(sitemap: SiteMap, item: string): PageNode 
     if (/\b(?:delete|remove)\b.{0,50}\bcharacters?\b|\bcharacters?\b.{0,50}\b(?:delete|remove)\b/i.test(item)) {
       return find(/characters-list|\byour characters\b|\bcharacters library\b/i);
     }
+    // Multi-method character creation belongs to the active project's wizard,
+    // even when the user naturally says "in the Character section". Resolve
+    // this before the explicit standalone-library navigation rule below.
+    if (
+      /\b(three distinct characters|three distinct character methods)\b/i.test(
+        item,
+      )
+    ) {
+      return find(/wizard-story-type|select story type/i);
+    }
+    if (
+      /\b(?:go\s+to|return\s+to|open|visit|in|on|from)\s+(?:the\s+)?characters?\s*(?:area|page|library)?\b/i.test(
+        item,
+      )
+    ) {
+      return find(/characters-list|\byour characters\b|^characters?$/i);
+    }
     if (/\b(?:delete|remove)\b.{0,50}\bprojects?\b|\bprojects?\b.{0,50}\b(?:delete|remove)\b/i.test(item)) {
       return find(/projects-list|\byour projects\b|\bprojects library\b/i);
     }
@@ -710,7 +795,7 @@ export function manualAuditTargetPage(sitemap: SiteMap, item: string): PageNode 
     ) {
       return find(/wizard-story-type|select story type/i);
     }
-    if (/\b(ai avatar|existing character|character library|three distinct characters)\b/i.test(item)) {
+    if (/\b(ai avatar|existing character|character library)\b/i.test(item)) {
       return find(/wizard-story-type|select story type/i);
     }
     if (/\b(upload.+script|script file)\b/i.test(item)) {

@@ -217,6 +217,21 @@ Manual flow matching also respects the requested operation: an upload request
 needs an upload-capable path, a deletion request cannot reuse a creation recipe,
 and a render request needs a terminal render path.
 
+For unattended scheduled runs, enable the production prompt supervisor:
+
+```bash
+AUTOQA_PRODUCTION_SUPERVISOR=true \
+AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS=3000 \
+npm run qa -- test --url https://your-app.example
+```
+
+The supervisor answers non-secret field, file, classification, guard, and flow
+approval questions with auditable realistic values. A human inbox answer wins
+during the short override window. Credentials remain in the protected secret
+channel; nonexistent files and unrelated destructive actions are refused.
+Upload selection is constrained by the requested media type, and unique
+artifact names rotate after a visible duplicate-name rejection.
+
 To compare the same focused requests in manual v1 and v2, use the checked-in
 10-test matrix. Runs are sequential and a reported product failure does not
 prevent later matrix cases from running:
@@ -435,14 +450,13 @@ Selectors can be combined.
 | `AUTOQA_PROCESSING_WAIT_MS` | `1200000` | Maximum deterministic processing wait. |
 | `AUTOQA_TERMINAL_WAIT_MS` | `1200000` | Maximum final-artifact wait. |
 | `AUTOQA_PROMPT_TIMEOUT_MS` | `300000` | Detached question timeout. |
+| `AUTOQA_PRODUCTION_SUPERVISOR` | `false` | Answer safe non-secret run prompts autonomously for unattended production QA. |
+| `AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS` | `3000` | Short window in which an inbox/human answer overrides the production supervisor. |
 | `AUTOQA_LLM_BUDGET` | `0` | LLM-call cap; `0` means unlimited. |
 | `AUTOQA_LLM_TIMEOUT_MS` | `60000` | Timeout for one LLM request attempt. |
 | `AUTOQA_UPLOAD_SUGGESTIONS` | none | Comma-separated upload paths shown as suggestions. |
 | `AGENT_BROWSER_HEADED` | `true` | Set `false` to hide Chrome. |
 | `AGENT_SHOW_CURSOR` | `true` | Set `false` to hide the cursor overlay. |
-| `SLACK_BUGS_WEBHOOK_URL` | none | Post verified product bugs to Slack. Leave unset to disable posting. |
-| `KOYAL_ADMIN_TOKEN` | none | Admin token used only to fetch a matching backend error record for Slack bug reports. Never included in report output. |
-| `KOYAL_ADMIN_ERROR_LOGS_URL` | `https://<target-host>/v1/api/admin/error-logs?limit=300` for `*.koyal.ai` | Optional override for the backend error-log endpoint. |
 
 CLI flags override the corresponding environment values for that process.
 
@@ -563,6 +577,15 @@ For a detached run, inspect:
 
 Place the answer in `answer.txt` in the same directory.
 
-### Disable Slack bug notifications
+### Product bug reporting
 
-Leave `SLACK_BUGS_WEBHOOK_URL` unset for that process.
+On Koyal properties, verified product errors are filed after verdict
+finalization through the site’s own **Report a Bug** modal. The report states
+that AutoQA filed it, includes the concrete correlated error, a concise likely
+cause, and the blocked capability. Ambient console/page errors are excluded.
+Reporting failure never changes the QA verdict or repeats the tested action.
+Submission evidence is saved as `in-app-bug-reporting.json` in the run folder.
+
+Product-side failures and recipe health are separate: a verified application
+error can block a milestone without demoting an otherwise healthy
+replay-validation or deterministic recipe. Automation failures still demote.

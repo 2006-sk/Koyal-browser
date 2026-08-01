@@ -91,6 +91,13 @@ export interface VerificationResult {
    * screenshot reviewer) visibly confirmed that the created item persisted.
    */
   artifactPersistenceVerified?: boolean;
+  /**
+   * Manual acceptance runs compare runtime evidence with the milestone's
+   * pre-action baseline. When present, this is the authoritative product-bug
+   * classification used by recovery, reporting, and replay qualification;
+   * cumulative SPA/analytics noise must not be inferred as a fresh blocker.
+   */
+  freshProductFailureEvidence?: boolean;
   /** Set when knowledge-base triage touched this verdict */
   kbTriage?: {
     statementsSeen: string[];
@@ -104,6 +111,7 @@ export interface HumanDecision {
   question: string;
   answer: string;
   at: string;
+  source?: 'human' | 'supervisor' | 'default';
 }
 
 export interface TestStep {
