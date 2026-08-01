@@ -1,0 +1,182 @@
+name: AutoQA Beta Koyal
+
+on:
+  schedule:
+    # 08:00/20:00 Pacific during daylight time; 07:00/19:00 in standard time.
+    - cron: "0 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      flow:
+        description: Flow(s) to run
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - script
+          - audio
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autoqa-beta-production
+  cancel-in-progress: false
+
+jobs:
+  qa:
+    name: Script and audio production validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      AUTOQA_URL: https://beta.koyal.ai
+      AUTOQA_EMAIL: ${{ secrets.AUTOQA_EMAIL }}
+      AUTOQA_PASSWORD: ${{ secrets.AUTOQA_PASSWORD }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AUTOQA_STATE_KEY: ${{ secrets.AUTOQA_STATE_KEY }}
+      LLM_PROVIDER: anthropic
+      LLM_MODEL: claude-opus-4-8
+      AUTOQA_EXHAUSTIVE: "true"
+      AUTOQA_PRODUCTION_SUPERVISOR: "true"
+      AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS: "0"
+      AUTOQA_PROMPT_TIMEOUT_MS: "60000"
+      AUTOQA_PROCESSING_WAIT_MS: "1200000"
+      AUTOQA_TERMINAL_WAIT_MS: "1200000"
+      AGENT_BROWSER_HEADED: "false"
+      AGENT_SHOW_CURSOR: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: autoqa/package-lock.json
+
+      - name: Install dependencies
+        working-directory: autoqa
+        run: npm ci
+
+      - name: Install browser
+        working-directory: autoqa
+        run: npx agent-browser install --with-deps
+
+      - name: Validate required secrets
+        run: |
+          for name in AUTOQA_EMAIL AUTOQA_PASSWORD ANTHROPIC_API_KEY AUTOQA_STATE_KEY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Restore encrypted learned state
+        id: state-cache
+        uses: actions/cache@v4
+        with:
+          path: autoqa/.scheduled-state/beta-koyal-state.tar.gz.enc
+          key: autoqa-beta-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            autoqa-beta-state-${{ runner.os }}-
+
+      - name: Decrypt learned state
+        run: |
+          cached="autoqa/.scheduled-state/beta-koyal-state.tar.gz.enc"
+          seed="autoqa/state-seed/beta-koyal-state.tar.gz.enc"
+          archive="$seed"
+          if [[ -s "$cached" ]]; then
+            archive="$cached"
+            echo "Using the latest encrypted state cache."
+          else
+            echo "No cache exists yet; using the encrypted production seed."
+          fi
+
+          test -s "$archive"
+          mkdir -p autoqa/.autoqa-state/beta.koyal.ai
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in "$archive" -pass env:AUTOQA_STATE_KEY \
+            | tar -xz -C autoqa/.autoqa-state/beta.koyal.ai
+
+          # Recipes were learned on a Mac. Make their fixture paths portable and
+          # map ignored local audio fixtures to the equivalent tracked fixture.
+          state="autoqa/.autoqa-state/beta.koyal.ai"
+          sed -i "s#/Users/apple/Desktop/happyflow#$GITHUB_WORKSPACE#g" \
+            "$state/sitemap.json" "$state/recipes.json"
+          sed -i \
+            -e "s#${GITHUB_WORKSPACE}/happyflow/test-audio-5sec.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
+            -e "s#${GITHUB_WORKSPACE}/happyflow/test-narration-short.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
+            "$state/sitemap.json" "$state/recipes.json"
+
+      - name: Run Script replay validation
+        id: script
+        if: ${{ github.event_name == 'schedule' || inputs.flow == 'both' || inputs.flow == 'script' }}
+        continue-on-error: true
+        working-directory: autoqa
+        run: |
+          npm run qa -- test \
+            --url https://beta.koyal.ai \
+            --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
+            --budget 800 --max-steps 40 --headless
+
+      - name: Run Audio replay validation
+        id: audio
+        if: ${{ github.event_name == 'schedule' || inputs.flow == 'both' || inputs.flow == 'audio' }}
+        continue-on-error: true
+        working-directory: autoqa
+        run: |
+          npm run qa -- test \
+            --url https://beta.koyal.ai \
+            --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
+            --budget 800 --max-steps 40 --headless
+
+      - name: Encrypt updated learned state
+        if: always()
+        run: |
+          state="autoqa/.autoqa-state/beta.koyal.ai"
+          out="autoqa/.scheduled-state/beta-koyal-state.tar.gz.enc"
+          mkdir -p "$(dirname "$out")"
+          tar -cz -C "$state" \
+            sitemap.json recipes.json statements.json allowlist.json \
+            | openssl enc -aes-256-cbc -pbkdf2 -salt \
+                -out "$out" -pass env:AUTOQA_STATE_KEY
+
+      - name: Upload QA reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoqa-beta-${{ github.run_id }}
+          path: autoqa/reports/beta.koyal.ai/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          {
+            echo "## AutoQA beta.koyal.ai"
+            echo
+            echo "| Flow | Outcome |"
+            echo "|---|---|"
+            echo "| Script | ${{ steps.script.outcome }} |"
+            echo "| Audio | ${{ steps.audio.outcome }} |"
+            echo
+            echo "Detailed reports are attached to this run as an artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set final workflow status
+        if: always()
+        run: |
+          failed=0
+          for outcome in "${{ steps.script.outcome }}" "${{ steps.audio.outcome }}"; do
+            if [[ "$outcome" == "failure" || "$outcome" == "cancelled" ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"

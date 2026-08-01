@@ -589,3 +589,25 @@ Submission evidence is saved as `in-app-bug-reporting.json` in the run folder.
 Product-side failures and recipe health are separate: a verified application
 error can block a milestone without demoting an otherwise healthy
 replay-validation or deterministic recipe. Automation failures still demote.
+
+## Scheduled production runs on GitHub Actions
+
+The repository includes `.github/workflows/autoqa-beta-scheduled.yml`. It runs
+the approved comprehensive Script and Audio flows sequentially at 03:00 and
+15:00 UTC every day. The workflow can also be started manually from the
+**Actions → AutoQA Beta Koyal → Run workflow** screen, for both flows or either
+flow individually.
+
+Required repository Actions secrets:
+
+- `ANTHROPIC_API_KEY`
+- `AUTOQA_EMAIL`
+- `AUTOQA_PASSWORD`
+- `AUTOQA_STATE_KEY`
+
+Learned sitemap/recipe data is stored only as an AES-256 encrypted seed and
+encrypted Actions cache. Authentication state, cookies, remembered field
+values, and application secrets are never cached or committed. Each run uploads
+its detailed reports as a 30-day artifact and writes the Script/Audio outcomes
+to the GitHub run summary. A failed flow makes the workflow fail after the other
+selected flow and report upload have finished.
