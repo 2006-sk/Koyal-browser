@@ -48,7 +48,7 @@ jobs:
       AUTOQA_TERMINAL_WAIT_MS: "1200000"
       AGENT_BROWSER_HEADED: "true"
       AUTOQA_ALLOW_BROAD_RECYCLE_KILL: "true"
-      AUTOQA_HOSTED_ATTEMPTS: "3"
+      AUTOQA_HOSTED_ATTEMPTS: "5"
       AGENT_SHOW_CURSOR: "false"
       DISPLAY: ":99"
 
@@ -154,6 +154,8 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+            timeout 20s npx agent-browser --session autoqa-beta.koyal.ai close || true
+            sleep 2
             if (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
@@ -177,6 +179,8 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
+            timeout 20s npx agent-browser --session autoqa-beta.koyal.ai close || true
+            sleep 2
             if (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
