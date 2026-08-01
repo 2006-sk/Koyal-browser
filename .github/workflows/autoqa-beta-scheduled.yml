@@ -26,7 +26,7 @@ concurrency:
 jobs:
   qa:
     name: Script and audio production validation
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     timeout-minutes: 360
     defaults:
       run:
@@ -48,9 +48,8 @@ jobs:
       AUTOQA_TERMINAL_WAIT_MS: "1200000"
       AGENT_BROWSER_HEADED: "true"
       AUTOQA_ALLOW_BROAD_RECYCLE_KILL: "true"
-      AUTOQA_HOSTED_ATTEMPTS: "5"
+      AUTOQA_HOSTED_ATTEMPTS: "2"
       AGENT_SHOW_CURSOR: "false"
-      DISPLAY: ":99"
 
     steps:
       - name: Check out repository
@@ -67,32 +66,16 @@ jobs:
         working-directory: autoqa
         run: npm ci
 
-      - name: Install browser dependencies
-        working-directory: autoqa
+      - name: Install native agent-browser and compatible browser
         run: |
-          npx agent-browser install --with-deps
-          sudo apt-get install -y xvfb unzip
-
-      - name: Use Google Chrome Stable
-        run: |
-          chrome_path="$(command -v google-chrome-stable || command -v google-chrome)"
-          test -x "$chrome_path"
-          "$chrome_path" --version
-          echo "AGENT_BROWSER_EXECUTABLE_PATH=$chrome_path" >> "$GITHUB_ENV"
-
-      - name: Start persistent virtual display
-        run: |
-          Xvfb "$DISPLAY" -screen 0 1440x1000x24 -ac \
-            > "$RUNNER_TEMP/xvfb.log" 2>&1 &
-          for attempt in $(seq 1 20); do
-            if [[ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]]; then
-              echo "Virtual display $DISPLAY is ready."
-              exit 0
-            fi
-            sleep 1
-          done
-          cat "$RUNNER_TEMP/xvfb.log"
-          exit 1
+          uname -m
+          brew install agent-browser
+          native_agent_browser="$(command -v agent-browser)"
+          test -x "$native_agent_browser"
+          "$native_agent_browser" install
+          rm -f autoqa/node_modules/.bin/agent-browser
+          ln -s "$native_agent_browser" autoqa/node_modules/.bin/agent-browser
+          autoqa/node_modules/.bin/agent-browser --version
 
       - name: Validate required secrets
         run: |
@@ -133,9 +116,9 @@ jobs:
           # Recipes were learned on a Mac. Make their fixture paths portable and
           # map ignored local audio fixtures to the equivalent tracked fixture.
           state="autoqa/.autoqa-state/beta.koyal.ai"
-          sed -i "s#/Users/apple/Desktop/happyflow#$GITHUB_WORKSPACE#g" \
+          perl -pi -e "s#/Users/apple/Desktop/happyflow#$GITHUB_WORKSPACE#g" \
             "$state/sitemap.json" "$state/recipes.json"
-          sed -i \
+          perl -pi \
             -e "s#${GITHUB_WORKSPACE}/happyflow/test-audio-5sec.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
             -e "s#${GITHUB_WORKSPACE}/happyflow/test-narration-short.wav#${GITHUB_WORKSPACE}/happyflow/audio/assets/test-narration-short.wav#g" \
             "$state/sitemap.json" "$state/recipes.json"
@@ -148,7 +131,7 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
-            timeout 20s npx agent-browser --session autoqa-beta.koyal.ai close || true
+            python3 -c 'import subprocess; subprocess.run(["npx", "agent-browser", "--session", "autoqa-beta.koyal.ai", "close"], timeout=20)' || true
             sleep 2
             if (
               set -euo pipefail
@@ -161,7 +144,7 @@ jobs:
             ); then
               exit 0
             fi
-            echo "[hosted] Script attempt $attempt failed; retrying on the persistent virtual display"
+            echo "[hosted] Script attempt $attempt failed; restarting with a clean native browser session"
           done
           exit 1
 
@@ -173,7 +156,7 @@ jobs:
         run: |
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
-            timeout 20s npx agent-browser --session autoqa-beta.koyal.ai close || true
+            python3 -c 'import subprocess; subprocess.run(["npx", "agent-browser", "--session", "autoqa-beta.koyal.ai", "close"], timeout=20)' || true
             sleep 2
             if (
               set -euo pipefail
@@ -186,7 +169,7 @@ jobs:
             ); then
               exit 0
             fi
-            echo "[hosted] Audio attempt $attempt failed; retrying on the persistent virtual display"
+            echo "[hosted] Audio attempt $attempt failed; restarting with a clean native browser session"
           done
           exit 1
 
@@ -223,6 +206,12 @@ jobs:
             echo
             echo "Detailed reports are attached to this run as an artifact."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure browser daemon and Chrome are closed
+        if: always()
+        working-directory: autoqa
+        run: |
+          python3 -c 'import subprocess; subprocess.run(["npx", "agent-browser", "--session", "autoqa-beta.koyal.ai", "close"], timeout=20)' || true
 
       - name: Set final workflow status
         if: always()
