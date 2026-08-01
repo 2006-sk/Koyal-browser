@@ -2,8 +2,8 @@ name: AutoQA Beta Koyal
 
 on:
   schedule:
-    # 08:00/20:00 Pacific during daylight time; 07:00/19:00 in standard time.
-    - cron: "0 3,15 * * *"
+    # 08:00 Pacific during daylight time; 07:00 during standard time.
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       flow:
