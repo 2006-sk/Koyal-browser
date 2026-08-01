@@ -611,3 +611,9 @@ values, and application secrets are never cached or committed. Each run uploads
 its detailed reports as a 30-day artifact and writes the Script/Audio outcomes
 to the GitHub run summary. A failed flow makes the workflow fail after the other
 selected flow and report upload have finished.
+
+For browser parity with the validated local environment, the hosted job pins
+agent-browser 0.31.1 and Chrome for Testing 150.0.7871.24. Chrome runs headed
+inside Xvfb with a fixed 1440×1000 viewport; the virtual display is not remotely
+visible, but it preserves headed rendering and input behavior on the Linux
+runner.

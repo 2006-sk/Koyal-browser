@@ -46,7 +46,7 @@ jobs:
       AUTOQA_PROMPT_TIMEOUT_MS: "60000"
       AUTOQA_PROCESSING_WAIT_MS: "1200000"
       AUTOQA_TERMINAL_WAIT_MS: "1200000"
-      AGENT_BROWSER_HEADED: "false"
+      AGENT_BROWSER_HEADED: "true"
       AGENT_SHOW_CURSOR: "false"
 
     steps:
@@ -64,9 +64,24 @@ jobs:
         working-directory: autoqa
         run: npm ci
 
-      - name: Install browser
+      - name: Install browser dependencies
         working-directory: autoqa
-        run: npx agent-browser install --with-deps
+        run: |
+          npx agent-browser install --with-deps
+          sudo apt-get install -y xvfb unzip
+
+      - name: Install pinned Chrome for Testing 150
+        run: |
+          chrome_root="$RUNNER_TEMP/pinned-chrome"
+          mkdir -p "$chrome_root"
+          curl -fsSL \
+            https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.24/linux64/chrome-linux64.zip \
+            -o "$RUNNER_TEMP/chrome-linux64.zip"
+          unzip -q "$RUNNER_TEMP/chrome-linux64.zip" -d "$chrome_root"
+          chrome_path="$chrome_root/chrome-linux64/chrome"
+          test -x "$chrome_path"
+          "$chrome_path" --version
+          echo "AGENT_BROWSER_EXECUTABLE_PATH=$chrome_path" >> "$GITHUB_ENV"
 
       - name: Validate required secrets
         run: |
@@ -120,10 +135,15 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
-          npm run qa -- test \
-            --url https://beta.koyal.ai \
-            --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
-            --budget 800 --max-steps 40 --headless
+          xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+            set -euo pipefail
+            npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
+            npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
+            npm run qa -- test \
+              --url https://beta.koyal.ai \
+              --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
+              --budget 800 --max-steps 40
+          '
 
       - name: Run Audio replay validation
         id: audio
@@ -131,10 +151,15 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
-          npm run qa -- test \
-            --url https://beta.koyal.ai \
-            --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
-            --budget 800 --max-steps 40 --headless
+          xvfb-run -a --server-args="-screen 0 1440x1000x24" bash -lc '
+            set -euo pipefail
+            npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
+            npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
+            npm run qa -- test \
+              --url https://beta.koyal.ai \
+              --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
+              --budget 800 --max-steps 40
+          '
 
       - name: Encrypt updated learned state
         if: always()
