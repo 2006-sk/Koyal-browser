@@ -593,8 +593,9 @@ replay-validation or deterministic recipe. Automation failures still demote.
 ## Scheduled production runs on GitHub Actions
 
 The repository includes `.github/workflows/autoqa-beta-scheduled.yml`. It runs
-the approved comprehensive Script and Audio flows sequentially at 15:00 UTC
-every day (8:00 AM Pacific during daylight time). The workflow can also be
+one approved comprehensive Script flow followed by one approved comprehensive
+Audio flow every day at 6:00 AM Pacific (`America/Los_Angeles`, including
+daylight-saving changes). The workflow can also be
 started manually from the **Actions → AutoQA Beta Koyal → Run workflow**
 screen, for both flows or either flow individually.
 
