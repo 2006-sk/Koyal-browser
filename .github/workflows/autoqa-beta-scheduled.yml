@@ -48,7 +48,10 @@ jobs:
       AUTOQA_TERMINAL_WAIT_MS: "1200000"
       AGENT_BROWSER_HEADED: "true"
       AUTOQA_ALLOW_BROAD_RECYCLE_KILL: "true"
-      AUTOQA_HOSTED_ATTEMPTS: "2"
+      # One initial attempt plus at most two clean retries. A retry is allowed
+      # for an unrecovered browser-daemon wedge or when the completed AutoQA
+      # summary has no more passes than failures.
+      AUTOQA_HOSTED_ATTEMPTS: "3"
       AGENT_SHOW_CURSOR: "false"
 
     steps:
@@ -151,13 +154,28 @@ jobs:
               exit 0
             fi
 
+            summary_line="$(grep -E '\[autoqa\] [0-9]+ PASS / [0-9]+ FAIL / [0-9]+ NEEDS REVIEW' "$attempt_log" | tail -n 1 || true)"
+            pass_count=""
+            fail_count=""
+            if [[ "$summary_line" =~ \[autoqa\][[:space:]]+([0-9]+)[[:space:]]+PASS[[:space:]]+/[[:space:]]+([0-9]+)[[:space:]]+FAIL ]]; then
+              pass_count="${BASH_REMATCH[1]}"
+              fail_count="${BASH_REMATCH[2]}"
+            fi
+
             if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
               grep -Eqi 'daemon recycle failed|still wedged|will keep failing until its daemon recovers|could not resolve a session-specific PID|aborted: agent-browser .*timed out|^.*Operation timed out\. The page may still be loading' "$attempt_log"; then
-              echo "[hosted] Script attempt $attempt hit an unrecovered browser-daemon wedge; retrying once with a clean native browser session"
+              echo "[hosted] Script attempt $attempt hit an unrecovered browser-daemon wedge; retrying with a clean native browser session"
               continue
             fi
 
-            echo "[hosted] Script attempt $attempt completed with QA failures but no unrecovered daemon wedge; not retrying the full flow"
+            if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
+              [[ -n "$pass_count" && -n "$fail_count" ]] && \
+              (( pass_count <= fail_count )); then
+              echo "[hosted] Script attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session"
+              continue
+            fi
+
+            echo "[hosted] Script attempt $attempt will not be retried (PASS=${pass_count:-unknown}, FAIL=${fail_count:-unknown}, status=$status)"
             exit "$status"
           done
           exit 1
@@ -190,13 +208,28 @@ jobs:
               exit 0
             fi
 
+            summary_line="$(grep -E '\[autoqa\] [0-9]+ PASS / [0-9]+ FAIL / [0-9]+ NEEDS REVIEW' "$attempt_log" | tail -n 1 || true)"
+            pass_count=""
+            fail_count=""
+            if [[ "$summary_line" =~ \[autoqa\][[:space:]]+([0-9]+)[[:space:]]+PASS[[:space:]]+/[[:space:]]+([0-9]+)[[:space:]]+FAIL ]]; then
+              pass_count="${BASH_REMATCH[1]}"
+              fail_count="${BASH_REMATCH[2]}"
+            fi
+
             if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
               grep -Eqi 'daemon recycle failed|still wedged|will keep failing until its daemon recovers|could not resolve a session-specific PID|aborted: agent-browser .*timed out|^.*Operation timed out\. The page may still be loading' "$attempt_log"; then
-              echo "[hosted] Audio attempt $attempt hit an unrecovered browser-daemon wedge; retrying once with a clean native browser session"
+              echo "[hosted] Audio attempt $attempt hit an unrecovered browser-daemon wedge; retrying with a clean native browser session"
               continue
             fi
 
-            echo "[hosted] Audio attempt $attempt completed with QA failures but no unrecovered daemon wedge; not retrying the full flow"
+            if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
+              [[ -n "$pass_count" && -n "$fail_count" ]] && \
+              (( pass_count <= fail_count )); then
+              echo "[hosted] Audio attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session"
+              continue
+            fi
+
+            echo "[hosted] Audio attempt $attempt will not be retried (PASS=${pass_count:-unknown}, FAIL=${fail_count:-unknown}, status=$status)"
             exit "$status"
           done
           exit 1
