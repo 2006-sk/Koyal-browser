@@ -104,6 +104,9 @@ export function renderMarkdownReport(report: RunReport, runDir: string): string 
   lines.push(`**Started:** ${report.startedAt}`);
   lines.push(`**Finished:** ${report.finishedAt || 'in progress'}`);
   lines.push(`**Base URL:** ${report.baseUrl}`);
+  if (report.functionalOutcome) {
+    lines.push(`**Functional outcome:** ${report.functionalOutcome.status.toUpperCase()} — ${report.functionalOutcome.summary}`);
+  }
   lines.push('');
   lines.push('## Summary');
   lines.push('');

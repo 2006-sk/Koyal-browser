@@ -64,6 +64,9 @@ export function writeSiteSummary(input: SiteSummaryInput): string {
   L.push(`# AutoQA — ${input.hostname}`);
   L.push('');
   L.push(`_Rewritten after every run. Latest run: \`${report.runId}\` (${report.scenarios.length} flows tested)._`);
+  if (report.functionalOutcome) {
+    L.push(`- **Functional outcome:** ${report.functionalOutcome.status.toUpperCase()} — ${report.functionalOutcome.summary}`);
+  }
   L.push('');
   L.push('## Flows');
   L.push('');

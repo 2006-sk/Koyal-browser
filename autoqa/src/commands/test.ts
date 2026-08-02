@@ -10,6 +10,7 @@ import {
   writeRunReport,
 } from '../core/report.js';
 import { reportKoyalBugsInApp } from '../core/in-app-bugs.js';
+import { functionalRunOutcome } from '../core/run-outcome.js';
 import { writeSiteSummary } from '../core/site-summary.js';
 import { bootstrap, teardown, type Session } from './shared.js';
 
@@ -45,15 +46,22 @@ export async function testCommand(
     );
   } finally {
     const finalized = finalizeRunReport(report);
+    const outcome = functionalRunOutcome(finalized);
+    finalized.functionalOutcome = {
+      status: outcome.success ? 'success' : 'failure',
+      terminalArtifactVerified: outcome.terminalArtifactVerified,
+      genuineBlockers: outcome.genuineBlockers.length,
+      summary: outcome.summary,
+    };
     writeRunReport(finalized, reportsRoot);
     writeArtifactsIndex(runDir, finalized.scenarios);
     appendReportNotes(runDir);
 
     const steps = finalized.scenarios.flatMap((s) => s.steps);
     const pass = steps.filter((s) => s.result.verdict === 'pass').length;
-    failed = steps.filter((s) => s.result.verdict === 'fail').length;
+    const rawFailed = steps.filter((s) => s.result.verdict === 'fail').length;
     const review = steps.filter((s) => s.result.verdict === 'needs-review').length;
-    console.log(`\n[autoqa] ${pass} PASS / ${failed} FAIL / ${review} NEEDS REVIEW`);
+    console.log(`\n[autoqa] ${pass} PASS / ${rawFailed} FAIL / ${review} NEEDS REVIEW`);
     console.log(`[autoqa] report → ${path.join(runDir, 'report.md')}`);
     console.log(`[autoqa] LLM calls this run: ${LlmClient.callCount}`);
 
@@ -90,7 +98,7 @@ export async function testCommand(
         flowsApproved: state.sitemap.flows.filter(
           (f) => f.status === 'exploratory' || f.status === 'deterministic' || f.status === 'approved',
         ).length,
-        verdicts: { pass, fail: failed, review },
+        verdicts: { pass, fail: rawFailed, review },
         total: {
           calls: LlmClient.callCount,
           inputTokens: LlmClient.inputTokens,
@@ -106,6 +114,9 @@ export async function testCommand(
     } catch (err) {
       console.warn(`[autoqa] site summary skipped: ${err instanceof Error ? err.message : err}`);
     }
+
+    failed = outcome.success ? 0 : outcome.genuineBlockers.length;
+    console.log(`[autoqa] functional outcome: ${outcome.success ? 'SUCCESS' : 'FAILURE'} — ${outcome.summary}`);
 
     if (!opts.keepOpen) teardown(session);
   }

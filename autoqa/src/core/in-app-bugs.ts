@@ -65,6 +65,70 @@ function reportGoal(): string {
   ].join('\n');
 }
 
+function reportFormVisible(browser: AgentBrowser): boolean {
+  const snapshot = `${browser.snapshotInteractive()}\n${browser.snapshotFull()}`;
+  return (
+    /\bReport a Bug\b/i.test(snapshot) &&
+    /\b(?:Please describe the bug|Bug Description)\b/i.test(snapshot) &&
+    /\bSubmit Report\b/i.test(snapshot)
+  );
+}
+
+/**
+ * The Koyal launcher is often an icon-only fixed button. A hosted Chromium
+ * trusted click can report success without reaching the live document, while
+ * Explorer then blacklists the only correct control. Prefer explicit labels,
+ * then activate one uniquely identifiable fixed bug-icon launcher in-page and
+ * prove the form appeared after every attempt.
+ */
+export function openKoyalBugReportForm(browser: AgentBrowser): boolean {
+  if (reportFormVisible(browser)) return true;
+  const verify = (): boolean => {
+    browser.wait(500);
+    return reportFormVisible(browser);
+  };
+
+  if (browser.clickButtonByText('Report a Bug', true) && verify()) return true;
+  if (browser.clickByText('Report a Bug') && verify()) return true;
+
+  const result = browser.evalScript(`
+    (function() {
+      const visible = (el) =>
+        (el.offsetParent !== null || el.getClientRects().length) &&
+        !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      const controls = [...document.querySelectorAll('button,[role=button],[onclick]')]
+        .filter(visible);
+      const labeled = controls.find((el) => {
+        const label = [
+          el.textContent,
+          el.getAttribute('aria-label'),
+          el.getAttribute('title'),
+          el.getAttribute('data-testid'),
+          el.getAttribute('class'),
+          el.querySelector('svg')?.getAttribute('data-lucide'),
+          el.querySelector('svg')?.getAttribute('aria-label'),
+        ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').toLowerCase();
+        return /(?:report.{0,12}bug|bug.{0,12}report|bug-icon|bugbutton)/.test(label);
+      });
+      const fixedIconButtons = controls.filter((el) => {
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        const nearBottomRight =
+          rect.right >= innerWidth - 180 && rect.bottom >= innerHeight - 180;
+        return style.position === 'fixed' && nearBottomRight &&
+          rect.width >= 32 && rect.width <= 120 && rect.height >= 32 && rect.height <= 120 &&
+          Boolean(el.querySelector('svg,img'));
+      });
+      const target = labeled || (fixedIconButtons.length === 1 ? fixedIconButtons[0] : null);
+      if (!target) return 'NO_UNIQUE_REPORT_CONTROL';
+      target.scrollIntoView({block: 'center'});
+      target.click();
+      return 'CLICKED_REPORT_CONTROL';
+    })();
+  `);
+  return result.includes('CLICKED_REPORT_CONTROL') && verify();
+}
+
 /**
  * File verified Koyal product errors through its own Report-a-Bug UI. This runs
  * after report finalization, so navigation/reporting failures cannot alter QA
@@ -97,14 +161,18 @@ export async function reportKoyalBugsInApp(opts: {
         opts.browser.open(url);
         opts.browser.wait(1200);
       }
-      const attempt = await opts.explorer.achieveGoal(reportGoal(), {
-        maxSteps: 4,
-        visionFirst: true,
-        manualMode: true,
-      });
-      if (!attempt.success) {
-        result.failures.push(`${bug.step.workflow}: ${attempt.error ?? 'report form was not confirmed submitted'}`);
-        continue;
+      let formOpen = openKoyalBugReportForm(opts.browser);
+      if (!formOpen) {
+        const attempt = await opts.explorer.achieveGoal(reportGoal(), {
+          maxSteps: 2,
+          visionFirst: true,
+          manualMode: true,
+        });
+        formOpen = attempt.success && reportFormVisible(opts.browser);
+        if (!formOpen) {
+          result.failures.push(`${bug.step.workflow}: ${attempt.error ?? 'report form was not visibly opened'}`);
+          continue;
+        }
       }
       const description = inAppBugDescription(bug, opts.report.runId);
       const filled =

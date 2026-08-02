@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import type { AgentBrowser } from './agent-browser.js';
 import type { Explorer } from './explorer.js';
-import { reportKoyalBugsInApp } from './in-app-bugs.js';
+import { openKoyalBugReportForm, reportKoyalBugsInApp } from './in-app-bugs.js';
 import { isProductBug } from './slack-bugs.js';
 import type { RunReport, TestStep } from './types.js';
 
@@ -72,16 +72,19 @@ test('in-app reporter submits one concise AutoQA report without repeating the ac
           submitted && ++confirmationPolls >= 3
             ? 'text "Bug report submitted successfully! Thank you for your feedback."'
             : filledText
-              ? `textbox "Please describe the bug you encountered" [ref=e1]\ntext "${filledText.slice(0, 40)}"`
-              : 'textbox "Please describe the bug you encountered" [ref=e1]',
+              ? `heading "Report a Bug"\ntextbox "Please describe the bug you encountered" [ref=e1]\ntext "${filledText.slice(0, 40)}"\nbutton "Submit Report"`
+              : 'heading "Report a Bug"\ntextbox "Please describe the bug you encountered" [ref=e1]\nbutton "Submit Report"',
         snapshotFull: () => '',
         fillVisible: (_ref: string, value: string) => {
           filledText = value;
         },
         clickButtonByText: (label: string) => {
+          if (label === 'Report a Bug') return false;
           submitted = label === 'Submit Report';
           return submitted;
         },
+        clickByText: () => false,
+        evalScript: () => 'NO_UNIQUE_REPORT_CONTROL',
       } as unknown as AgentBrowser,
       explorer: {
         achieveGoal: async (goal: string) => {
@@ -99,7 +102,7 @@ test('in-app reporter submits one concise AutoQA report without repeating the ac
     });
     assert.equal(result.submitted, 1);
     assert.deepEqual(opened, ['https://beta.koyal.ai/finalvideo']);
-    assert.match(goals[0], /Open the visible in-app "Report a Bug"/);
+    assert.equal(goals.length, 0);
     assert.match(filledText, /Reported automatically by AutoQA/);
     assert.match(filledText, /video is not edited please try again later/);
     assert.match(filledText, /Blocked capability: Submit Edit Video/);
@@ -109,6 +112,27 @@ test('in-app reporter submits one concise AutoQA report without repeating the ac
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('icon-only fixed Koyal bug launcher is activated deterministically and form visibility is proved', () => {
+  let modalOpen = false;
+  let evalCalls = 0;
+  const opened = openKoyalBugReportForm({
+    snapshotInteractive: () => modalOpen
+      ? 'heading "Report a Bug"\ntextbox "Please describe the bug"\nbutton "Submit Report"'
+      : 'button [ref=e13]',
+    snapshotFull: () => '',
+    wait: () => undefined,
+    clickButtonByText: () => false,
+    clickByText: () => false,
+    evalScript: () => {
+      evalCalls++;
+      modalOpen = true;
+      return 'CLICKED_REPORT_CONTROL';
+    },
+  } as unknown as AgentBrowser);
+  assert.equal(opened, true);
+  assert.equal(evalCalls, 1);
 });
 
 test('in-app reporting failure is contained and does not alter the product verdict', async () => {

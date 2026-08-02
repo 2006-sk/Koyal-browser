@@ -141,4 +141,11 @@ export interface RunReport {
   finishedAt: string;
   baseUrl: string;
   scenarios: ScenarioResult[];
+  /** Production process outcome; raw step verdicts remain unchanged evidence. */
+  functionalOutcome?: {
+    status: 'success' | 'failure';
+    terminalArtifactVerified: boolean;
+    genuineBlockers: number;
+    summary: string;
+  };
 }

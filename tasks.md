@@ -12,6 +12,15 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; ✅ = completed.
 
+### ✅ HIGH — `#functional-run-exit-and-hosted-bug-reporting` — terminal success exits cleanly; only genuine blockers fail
+
+- Raw milestone assertion disagreements remain fully visible in reports, but no longer force a production command to exit 1 by themselves.
+- A run exits successfully when it verifies its requested terminal artifact, or when it finishes without a concrete product/infrastructure/forward-progress blocker. A real product error, unrecovered browser/auth/processing failure, disabled forward path, or upstream break that skips the remaining journey still fails when no terminal artifact was verified.
+- Terminal proof is grounded only in observed URL/result/page evidence, never the repeated manual prompt, and a persisted intermediate Character/Asset/Outfit cannot masquerade as a final artifact.
+- Koyal in-app reporting now opens the icon-only fixed Report-a-Bug launcher deterministically, verifies the actual form before filling, submits once, and retains bounded visual/LLM fallback. Reporting never repeats the failed product operation or changes its verdict.
+- Validated against the exact hosted reports: Audio 22/9 becomes functional SUCCESS because its final playable/downloadable video was independently verified; Script 5/27 remains functional FAILURE because it never reached a terminal artifact and its blocked position caused 25 downstream skips.
+- Live Koyal verification passed: authenticated, opened the real modal, filled a clearly labeled pipeline-test report, submitted once, and observed the success confirmation. Full gate: 330/330 unit tests, TypeScript build, and diff check pass.
+
 ### 🟡 HIGH — `#stale-position-recipe-directed-remap` — stale recovery recipes must self-heal instead of skipping the remaining flow
 
 - Native macOS hosted Audio validation reached a playable final video without a daemon wedge, but a later position rebuild failed on the stale combined control label `EditRevertAnimated` and recorded 20 downstream milestones as skipped.
@@ -43,6 +52,8 @@ Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; 
 - Validate with the final-video edit failure (`video is not edited please try again later!!`) and a synthetic verified product-error case.
 
 The Koyal reporter now runs after verdict finalization, opens only the in-app Report-a-Bug modal, fills an exact redacted AutoQA description deterministically, submits once, polls for the asynchronous confirmation, and stores the submitted text in `in-app-bug-reporting.json`. Manual audits softened to NEEDS REVIEW remain reportable when concrete visible/network product evidence exists; unrelated historical SPA console/page errors are filtered out. Live Audio validation authenticated, opened the real `/finalvideo` modal, submitted the `video is not edited please try again later` bug, saw confirmation, and recorded the exact description. Reporting failure was separately live-proven safe. Unit/build gate is part of the current 283/283 suite.
+
+Hosted icon-click regression fixed 2026-08-02: when a trusted click on Koyal's unlabeled floating bug icon reports success but never reaches the live page, the reporter now identifies the unique fixed bug launcher in the DOM, activates it in-page, and requires the Report-a-Bug heading, description field, and Submit Report control before continuing. A clearly labeled live pipeline-test submission passed end to end.
 
 ### ✅ HIGH — `#production-prompt-supervisor-llm` — unattended, realistic answers for production runs — LIVE VALIDATED 2026-07-31
 
