@@ -9,6 +9,7 @@ import {
   compactSupersededFills,
   recordFromExplorer,
   recordWalkRecipe,
+  recipeStepsFromExplorer,
   waitForProcessingBarrier,
 } from './recipes.js';
 import type { SiteState } from './site-state.js';
@@ -71,6 +72,54 @@ test('consecutive recovery fills collapse to the final accepted value', () => {
       { kind: 'fill', hint: 'Enter the name', value: 'Sabrina' },
       { kind: 'click', label: 'Finalize character' },
     ],
+  );
+});
+
+test('directed recovery can append a portable explored suffix to its successful deterministic prefix', () => {
+  const suffix = recipeStepsFromExplorer({
+    goal: 'Reach Story Theme',
+    success: true,
+    actions: [
+      { action: 'click', resolvedLabel: 'Continue', resolvedRole: 'button' },
+      { action: 'wait', waitForProcessing: true, waitedMs: 45000 },
+      { action: 'click', resolvedLabel: 'Next', resolvedRole: 'button' },
+      { action: 'done', reason: 'target reached' },
+    ],
+    stepsTaken: [],
+    finalUrl: 'https://example.test/theme',
+    finalSnapshot: 'Story Theme',
+  });
+
+  assert.deepEqual(suffix, [
+    { kind: 'click', label: 'Continue', role: 'button' },
+    { kind: 'waitForProcessing', maxMs: config.deep.processingWaitMs },
+    { kind: 'click', label: 'Next', role: 'button' },
+  ]);
+  assert.deepEqual(
+    compactSupersededFills([
+      { kind: 'click', label: 'Start with Audio', role: 'button' },
+      ...(suffix ?? []),
+    ]),
+    [
+      { kind: 'click', label: 'Start with Audio', role: 'button' },
+      { kind: 'click', label: 'Continue', role: 'button' },
+      { kind: 'waitForProcessing', maxMs: config.deep.processingWaitMs },
+      { kind: 'click', label: 'Next', role: 'button' },
+    ],
+  );
+});
+
+test('directed recovery refuses to persist a suffix with an unresolved interactive', () => {
+  assert.equal(
+    recipeStepsFromExplorer({
+      goal: 'Reach target',
+      success: true,
+      actions: [{ action: 'click', ref: 'e19' }, { action: 'done' }],
+      stepsTaken: [],
+      finalUrl: 'https://example.test/current',
+      finalSnapshot: 'Current page',
+    }),
+    null,
   );
 });
 

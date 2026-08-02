@@ -12,6 +12,12 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; ✅ = completed.
 
+### 🟡 HIGH — `#stale-position-recipe-directed-remap` — stale recovery recipes must self-heal instead of skipping the remaining flow
+
+- Native macOS hosted Audio validation reached a playable final video without a daemon wedge, but a later position rebuild failed on the stale combined control label `EditRevertAnimated` and recorded 20 downstream milestones as skipped.
+- Position recovery must retain the deterministic prefix that still works, invoke narrowly directed LLM exploration only for the stale suffix, confirm the next milestone's mapped guard state, and persist a complete entry-to-target recovery recipe for the following replay-validation run.
+- Validate with focused unit tests, the full unit/build gate, then sequential hosted VM runs: exploratory remapping first and deterministic replay validation second.
+
 ### 🟡 HIGH — `#supervisor-hindrance-cleanup-confirmation` — character/asset cleanup approval must survive site confirmation — CODE + UNIT VALIDATED 2026-07-31
 
 - The production supervisor approved a browser-grounded `Remove character` action for an empty slot blocking Next, but independently denied the site's immediately following generic `Remove` confirmation. The denial became user authority, so Explorer correctly refused to retry it and the Audio journey could not self-heal past the disabled forward control.

@@ -73,16 +73,21 @@ function redactRecipeGoal(
  * Convert a successful LLM exploration into a label-based recipe that replays
  * without any LLM calls. Refs (@eN) are never stored — labels survive refactors.
  */
-export function recordFromExplorer(
-  state: SiteState,
-  id: string,
+export interface RecipeFromExplorerOptions {
+  secrets?: { email?: string; password?: string };
+  successCheck?: Recipe['successCheck'];
+  fallbackFieldHint?: string;
+}
+
+/**
+ * Convert explorer actions into portable label-based recipe steps without
+ * writing them. Position recovery uses this to append a newly explored suffix
+ * to the deterministic prefix that already succeeded in the same run.
+ */
+export function recipeStepsFromExplorer(
   result: ExplorerResult,
-  options?: {
-    secrets?: { email?: string; password?: string };
-    successCheck?: Recipe['successCheck'];
-    fallbackFieldHint?: string;
-  },
-): Recipe | null {
+  options?: RecipeFromExplorerOptions,
+): RecipeStep[] | null {
   const steps: RecipeStep[] = [];
   const contextualTarget = contextualMutationTargetLabel(result.goal);
   const contextualParts = contextualTarget
@@ -143,6 +148,18 @@ export function recordFromExplorer(
     // barriers are preserved explicitly so replay cannot race async work.
   }
 
+  return compactSupersededFills(steps);
+}
+
+export function recordFromExplorer(
+  state: SiteState,
+  id: string,
+  result: ExplorerResult,
+  options?: RecipeFromExplorerOptions,
+): Recipe | null {
+  const steps = recipeStepsFromExplorer(result, options);
+  if (!steps) return null;
+
   const successCheck: Recipe['successCheck'] = options?.successCheck ?? {};
   if (!successCheck.urlIncludes && result.finalUrl) {
     try {
@@ -156,7 +173,7 @@ export function recordFromExplorer(
   const recipe: Recipe = {
     id,
     goal: redactRecipeGoal(result.goal, options?.secrets),
-    steps: compactSupersededFills(steps),
+    steps,
     successCheck,
     stats: {
       successes: existing?.stats.successes ?? 0,

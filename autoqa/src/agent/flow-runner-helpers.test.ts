@@ -35,6 +35,8 @@ import {
   milestoneReturnsOnUrlChange,
   orderRunnableFlows,
   productionBinaryVerdict,
+  positionRecoveryGoal,
+  positionRecoveryRecipeId,
   skippedMilestoneVerdict,
   requiresPersistedCreation,
   recoveryGuardPageIds,
@@ -62,6 +64,29 @@ function flow(id: string, status: Flow['status'], phase?: 'learning' | 'replay-v
 test('production supervisor converts structurally skipped milestones to binary fail', () => {
   assert.equal(skippedMilestoneVerdict(true), 'fail');
   assert.equal(skippedMilestoneVerdict(false), 'needs-review');
+});
+
+test('position recovery is narrowly directed and stored separately from acceptance recipes', () => {
+  const next = {
+    id: 'manual-task-10',
+    goal: 'Change one outfit',
+    kind: 'edit' as const,
+  };
+  const goal = positionRecoveryGoal(
+    next,
+    ['Choose Character Look & Art Style', 'Animated', 'Next'],
+    'could not click "EditRevertAnimated"',
+  );
+
+  assert.equal(
+    positionRecoveryRecipeId('audio-flow', next.id),
+    'recovery:audio-flow:manual-task-10',
+  );
+  assert.match(goal, /POSITION RECOVERY/);
+  assert.match(goal, /Choose Character Look & Art Style/);
+  assert.match(goal, /Do not perform the next milestone's own acceptance task/);
+  assert.match(goal, /Do not restart, repeat, or resubmit/);
+  assert.match(goal, /EditRevertAnimated/);
 });
 
 test('a stale product-error tile is charged only to its originating manual task', () => {

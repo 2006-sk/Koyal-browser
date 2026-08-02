@@ -24,7 +24,14 @@ import { VerificationLayer } from '../core/verification.js';
 import { ensureAuthenticated, type AuthContext } from './auth.js';
 import { extractCandidates, type Statements } from './statements.js';
 import { runProbesForMilestone, type ProbeContext } from './probes.js';
-import { recordFromExplorer, type RecipePlayer, type RecipeStep } from './recipes.js';
+import {
+  compactSupersededFills,
+  recordFromExplorer,
+  recordWalkRecipe,
+  recipeStepsFromExplorer,
+  type RecipePlayer,
+  type RecipeStep,
+} from './recipes.js';
 import { Nav, parseContextualControlLabel } from '../core/nav.js';
 import type { Interact } from './interact.js';
 import type { SiteState } from './site-state.js';
@@ -925,8 +932,21 @@ export function flowHasCompletionAction(
   );
 }
 
+interface PositionReplayResult {
+  ok: boolean;
+  completedSteps: RecipeStep[];
+  startedFromEntry: boolean;
+  failedRecipeId?: string;
+  detail?: string;
+}
+
 /** Rebuild flow position by replaying prior milestones' recipes from the entry. */
-async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: number): Promise<void> {
+async function replayUpTo(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  milestoneIndex: number,
+  options: { forceFromEntry?: boolean } = {},
+): Promise<PositionReplayResult> {
   // Prefer continuing from a verified intermediate state over resetting to the
   // entry URL. Stateful wizards often make a direct entry URL resume a draft or
   // redirect past its real first screen; resetting there can make an otherwise
@@ -934,13 +954,16 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
   // milestone whose guard explicitly matches the live page.
   const livePageId = currentFlowPageId(deps, flow);
   let startIndex = -1;
-  for (let j = milestoneIndex - 1; j >= 0; j--) {
-    if (flow.milestones[j].guardPhases?.includes(livePageId)) {
-      startIndex = j;
-      break;
+  if (!options.forceFromEntry) {
+    for (let j = milestoneIndex - 1; j >= 0; j--) {
+      if (flow.milestones[j].guardPhases?.includes(livePageId)) {
+        startIndex = j;
+        break;
+      }
     }
   }
-  if (startIndex < 0) {
+  const startedFromEntry = options.forceFromEntry || startIndex < 0;
+  if (startedFromEntry) {
     await navigateToEntry(deps, flow);
     startIndex = 0;
   } else {
@@ -949,6 +972,7 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
     );
   }
 
+  const completedSteps: RecipeStep[] = [];
   for (let j = startIndex; j < milestoneIndex; j++) {
     const recipeId = `flow:${flow.id}:${flow.milestones[j].id}`;
     if (!deps.player.has(recipeId)) continue;
@@ -960,9 +984,106 @@ async function replayUpTo(deps: FlowRunnerDeps, flow: Flow, milestoneIndex: numb
       console.warn(
         `[replay] stopped position recovery: ${recipeId} failed at step ${replay.failedAtStep ?? 'unknown'}${replay.detail ? ` (${replay.detail})` : ''}`,
       );
-      return;
+      completedSteps.push(...(replay.completedSteps ?? []));
+      return {
+        ok: false,
+        completedSteps,
+        startedFromEntry,
+        failedRecipeId: recipeId,
+        detail: replay.detail,
+      };
     }
+    completedSteps.push(...(replay.completedSteps ?? []));
   }
+  return { ok: true, completedSteps, startedFromEntry };
+}
+
+export function positionRecoveryRecipeId(flowId: string, milestoneId: string): string {
+  return `recovery:${flowId}:${milestoneId}`;
+}
+
+export function positionRecoveryGoal(
+  next: FlowMilestone,
+  targetLabels: readonly string[],
+  failedDetail?: string,
+): string {
+  const target = targetLabels.filter(Boolean).join(' / ') || next.id;
+  return `[POSITION RECOVERY]\nRebuild the current flow only far enough to reach the mapped start of the next milestone "${next.id}". The target state is identified by: ${target}.\nContinue from the current browser state after the deterministic prefix. Do not restart, repeat, or resubmit a Create, Generate, Upload, Finalize, Save, Render, or other mutation that is already complete. Use safe forward controls and satisfy only prerequisites required to reach the target. Do not perform the next milestone's own acceptance task. Stop as soon as the target state is visibly reached.${failedDetail ? `\nThe stale deterministic step that needs remapping failed with: ${failedDetail}` : ''}`;
+}
+
+/**
+ * A stale deterministic position recipe must not make every downstream check
+ * disappear. Re-run from the verified entry, retain every deterministic step
+ * that still works, explore only the stale suffix, and persist the resulting
+ * full entry-to-target recovery recipe for the next VM run.
+ */
+async function remapPositionTo(
+  deps: FlowRunnerDeps,
+  flow: Flow,
+  nextIndex: number,
+  guards: readonly string[],
+  initialReplay?: PositionReplayResult,
+): Promise<boolean> {
+  const next = flow.milestones[nextIndex];
+  const recoveryId = positionRecoveryRecipeId(flow.id, next.id);
+
+  if (deps.player.has(recoveryId)) {
+    await navigateToEntry(deps, flow);
+    const replay = await deps.player.tryReplay(recoveryId, {
+      pageId: flow.entry.pageId,
+      secrets: { email: deps.state.secrets.email, password: deps.state.secrets.password },
+    });
+    if (replay.ok && guards.includes(currentFlowPageId(deps, flow))) {
+      console.log(`[recovery] ${recoveryId} restored the mapped position deterministically`);
+      return true;
+    }
+    console.log(`[recovery] stale ${recoveryId} did not restore the target — remapping it`);
+  }
+
+  // The caller may have just replayed from the entry and stopped at the stale
+  // step. Continue from that exact state instead of restarting and repeating
+  // its successful mutations. If it resumed from an intermediate state, rebuild
+  // once from entry so the persisted recovery recipe is complete and portable.
+  const replay = initialReplay?.startedFromEntry
+    ? initialReplay
+    : await replayUpTo(deps, flow, nextIndex, { forceFromEntry: true });
+  if (replay.ok && guards.includes(currentFlowPageId(deps, flow))) return true;
+
+  const targetPages = guards
+    .map((id) => deps.state.sitemap.pages[id])
+    .filter((page): page is PageNode => Boolean(page));
+  const targetLabels = targetPages.flatMap((page) => [
+    page.title,
+    ...page.detection.snapshotAnyOf.slice(0, 3),
+  ]);
+  const explored = await deps.explorer.achieveGoal(
+    positionRecoveryGoal(next, targetLabels, replay.detail),
+    {
+      returnOnUrlChange: false,
+      manualMode: Boolean(flow.manualContract),
+    },
+  );
+  if (!explored.success || !guards.includes(currentFlowPageId(deps, flow))) {
+    console.warn(`[recovery] directed remapping did not reach the mapped start for ${next.id}`);
+    return false;
+  }
+
+  const suffix = recipeStepsFromExplorer(explored, {
+    secrets: { email: deps.state.secrets.email, password: deps.state.secrets.password },
+  });
+  if (!suffix) {
+    console.warn(`[recovery] reached ${next.id}, but the explored suffix was not safely replayable`);
+    return true;
+  }
+  recordWalkRecipe(
+    deps.state,
+    recoveryId,
+    positionRecoveryGoal(next, targetLabels),
+    compactSupersededFills([...replay.completedSteps, ...suffix]),
+    {},
+  );
+  console.log(`[recovery] remapped and saved ${recoveryId} for deterministic validation`);
+  return true;
 }
 
 /**
@@ -1071,11 +1192,23 @@ async function tryRecoverAfterBreak(
   // hasAnyPriorRecipe's doc comment).
   if (hasAnyPriorRecipe(deps, flow, nextIndex)) {
     try {
-      await replayUpTo(deps, flow, nextIndex);
+      const replay = await replayUpTo(deps, flow, nextIndex);
+      if (!replay.ok) {
+        return remapPositionTo(deps, flow, nextIndex, guards, replay);
+      }
+    } catch {
+      try {
+        return await remapPositionTo(deps, flow, nextIndex, guards);
+      } catch {
+        return false;
+      }
+    }
+    if (guards.includes(currentFlowPageId(deps, flow))) return true;
+    try {
+      return await remapPositionTo(deps, flow, nextIndex, guards);
     } catch {
       return false;
     }
-    if (guards.includes(currentFlowPageId(deps, flow))) return true;
   }
   // A manual task graph may overshoot a requested task while recovering from a
   // prior verifier. When the current page is a LATER state in the exact same
