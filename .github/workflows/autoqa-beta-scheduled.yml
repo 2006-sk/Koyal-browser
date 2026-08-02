@@ -2,8 +2,8 @@ name: AutoQA Beta Koyal
 
 on:
   schedule:
-    # 08:00 Pacific during daylight time; 07:00 during standard time.
-    - cron: "0 15 * * *"
+    - cron: "0 19 * * *"
+      timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
       flow:
@@ -129,11 +129,14 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
+          set -u
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Script attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
             python3 -c 'import subprocess; subprocess.run(["npx", "agent-browser", "--session", "autoqa-beta.koyal.ai", "close"], timeout=20)' || true
             sleep 2
-            if (
+            attempt_log="$RUNNER_TEMP/autoqa-script-attempt-$attempt.log"
+            set +e
+            (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
@@ -141,10 +144,21 @@ jobs:
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-script-to-final-v-51c33530 \
                 --budget 800 --max-steps 40
-            ); then
+            ) 2>&1 | tee "$attempt_log"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" -eq 0 ]]; then
               exit 0
             fi
-            echo "[hosted] Script attempt $attempt failed; restarting with a clean native browser session"
+
+            if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
+              grep -Eqi 'daemon recycle failed|still wedged|will keep failing until its daemon recovers|could not resolve a session-specific PID|aborted: agent-browser .*timed out|^.*Operation timed out\. The page may still be loading' "$attempt_log"; then
+              echo "[hosted] Script attempt $attempt hit an unrecovered browser-daemon wedge; retrying once with a clean native browser session"
+              continue
+            fi
+
+            echo "[hosted] Script attempt $attempt completed with QA failures but no unrecovered daemon wedge; not retrying the full flow"
+            exit "$status"
           done
           exit 1
 
@@ -154,11 +168,14 @@ jobs:
         continue-on-error: true
         working-directory: autoqa
         run: |
+          set -u
           for attempt in $(seq 1 "$AUTOQA_HOSTED_ATTEMPTS"); do
             echo "[hosted] Audio attempt $attempt/$AUTOQA_HOSTED_ATTEMPTS"
             python3 -c 'import subprocess; subprocess.run(["npx", "agent-browser", "--session", "autoqa-beta.koyal.ai", "close"], timeout=20)' || true
             sleep 2
-            if (
+            attempt_log="$RUNNER_TEMP/autoqa-audio-attempt-$attempt.log"
+            set +e
+            (
               set -euo pipefail
               npx agent-browser --session autoqa-beta.koyal.ai --headed open about:blank
               npx agent-browser --session autoqa-beta.koyal.ai --headed set viewport 1440 1000
@@ -166,10 +183,21 @@ jobs:
                 --url https://beta.koyal.ai \
                 --flow manual-run-a-complete-new-audio-to-final-vi-d688b458 \
                 --budget 800 --max-steps 40
-            ); then
+            ) 2>&1 | tee "$attempt_log"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" -eq 0 ]]; then
               exit 0
             fi
-            echo "[hosted] Audio attempt $attempt failed; restarting with a clean native browser session"
+
+            if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
+              grep -Eqi 'daemon recycle failed|still wedged|will keep failing until its daemon recovers|could not resolve a session-specific PID|aborted: agent-browser .*timed out|^.*Operation timed out\. The page may still be loading' "$attempt_log"; then
+              echo "[hosted] Audio attempt $attempt hit an unrecovered browser-daemon wedge; retrying once with a clean native browser session"
+              continue
+            fi
+
+            echo "[hosted] Audio attempt $attempt completed with QA failures but no unrecovered daemon wedge; not retrying the full flow"
+            exit "$status"
           done
           exit 1
 
