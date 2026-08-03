@@ -115,7 +115,13 @@ test('in-app reporter submits one concise AutoQA report without repeating the ac
     assert.match(filledText, /Where: https:\/\/beta\.koyal\.ai\/finalvideo — audio:edit-video\s*$/);
     assert.equal(result.submittedReports[0]?.description, filledText);
     assert.ok(confirmationPolls >= 3);
-    assert.equal(fs.existsSync(path.join(dir, 'in-app-bug-reporting.json')), true);
+    assert.equal(fs.existsSync(path.join(dir, 'artifacts', 'in-app-bug-reporting.json')), true);
+    const bugReport = fs.readFileSync(path.join(dir, 'bugs-reported.md'), 'utf8');
+    assert.match(bugReport, /Reporting status:\*\* SUBMITTED/);
+    assert.match(bugReport, /Where:\*\* https:\/\/beta\.koyal\.ai\/finalvideo/);
+    assert.match(bugReport, /Console errors and page exceptions/);
+    assert.match(bugReport, /video is not edited please try again later/);
+    assert.match(bugReport, /Network errors/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -259,9 +265,13 @@ test('zero-issue run still writes in-app reporting evidence', async () => {
     });
     assert.equal(result.found, 0);
     const evidence = JSON.parse(
-      fs.readFileSync(path.join(dir, 'in-app-bug-reporting.json'), 'utf8'),
+      fs.readFileSync(path.join(dir, 'artifacts', 'in-app-bug-reporting.json'), 'utf8'),
     ) as InAppBugReportResult;
     assert.equal(evidence.found, 0);
+    assert.match(
+      fs.readFileSync(path.join(dir, 'bugs-reported.md'), 'utf8'),
+      /No reportable product bugs were detected/,
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

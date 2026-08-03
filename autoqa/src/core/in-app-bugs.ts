@@ -9,12 +9,25 @@ import {
   productErrorLines,
   type ProductBugGroup,
 } from './slack-bugs.js';
+import { runArtifactsDir } from './evidence.js';
+
+export interface DetectedBugReport {
+  workflow: string;
+  where: string;
+  checkpoint: string;
+  issue: string;
+  consoleErrors: string[];
+  networkErrors: string[];
+  status: 'submitted' | 'not-submitted';
+  reportingError?: string;
+}
 
 export interface InAppBugReportResult {
   found: number;
   submitted: number;
   failures: string[];
   submittedReports: Array<{ workflow: string; description: string }>;
+  bugs: DetectedBugReport[];
 }
 
 function redact(value: string): string {
@@ -42,6 +55,29 @@ function likelyCause(bug: ProductBugGroup): string {
 }
 
 export function inAppBugDescription(bug: ProductBugGroup, runId: string): string {
+  const evidence = bugReportEvidence(bug);
+  return redact(
+    [
+      'AutoQA issue report',
+      `Issue: ${evidence.issue}`,
+      '',
+      'Console / exceptions:',
+      ...(evidence.consoleErrors.length ? evidence.consoleErrors : ['None captured for this checkpoint.']),
+      '',
+      'Network:',
+      ...(evidence.networkErrors.length ? evidence.networkErrors : ['None captured for this checkpoint.']),
+      '',
+      `Likely cause: ${likelyCause(bug)}`,
+      `Impact: ${bug.step.action}`,
+      `Occurrences in this run: ${bug.occurrences}`,
+      `Run: ${runId}`,
+      '',
+      `Where: ${evidence.where} — ${evidence.workflow}`,
+    ].join('\n'),
+  );
+}
+
+function bugReportEvidence(bug: ProductBugGroup): Omit<DetectedBugReport, 'status'> {
   const lines = productErrorLines(bug.step);
   const consoleLines = lines
     .filter((line) => /^(?:console|exception):/i.test(line))
@@ -53,32 +89,66 @@ export function inAppBugDescription(bug: ProductBugGroup, runId: string): string
     .filter((line) => /^(?:visible|issue):/i.test(line))
     .map((line) => line.replace(/^(?:visible|issue):\s*/i, ''));
   const issue = issueLines[0] ?? consoleLines[0] ?? networkLines[0] ?? bug.step.result.actual;
-  return redact(
-    [
-      'AutoQA issue report',
-      `Issue: ${issue}`,
-      '',
-      'Console / exceptions:',
-      ...(consoleLines.length ? consoleLines : ['None captured for this checkpoint.']),
-      '',
-      'Network:',
-      ...(networkLines.length ? networkLines : ['None captured for this checkpoint.']),
-      '',
-      `Likely cause: ${likelyCause(bug)}`,
-      `Impact: ${bug.step.action}`,
-      `Occurrences in this run: ${bug.occurrences}`,
-      `Run: ${runId}`,
-      '',
-      `Where: ${bug.step.result.signals.url} — ${bug.step.workflow}`,
-    ].join('\n'),
-  );
+  return {
+    workflow: bug.step.workflow,
+    where: bug.step.result.signals.url,
+    checkpoint: bug.step.action,
+    issue: redact(issue),
+    consoleErrors: consoleLines.map(redact),
+    networkErrors: networkLines.map(redact),
+  };
 }
 
-function writeReportingEvidence(runDir: string, result: InAppBugReportResult): void {
+function fenced(lines: string[]): string {
+  return lines.length ? `\`\`\`text\n${lines.join('\n')}\n\`\`\`` : '_None captured for this checkpoint._';
+}
+
+export function renderBugsReportedMarkdown(report: RunReport, result: InAppBugReportResult): string {
+  const lines = [
+    `# Bugs Reported — ${report.baseUrl}`,
+    '',
+    `**Run ID:** \`${report.runId}\``,
+    `**Detected:** ${result.found}`,
+    `**Submitted through Report a Bug:** ${result.submitted}`,
+    '',
+  ];
+  if (result.bugs.length === 0) {
+    lines.push('No reportable product bugs were detected in this run.', '');
+  }
+  result.bugs.forEach((bug, index) => {
+    lines.push(
+      `## ${index + 1}. ${bug.workflow}`,
+      '',
+      `**Reporting status:** ${bug.status === 'submitted' ? 'SUBMITTED' : 'NOT SUBMITTED'}`,
+      `**Where:** ${bug.where}`,
+      `**Checkpoint:** ${bug.checkpoint}`,
+      `**Issue:** ${bug.issue}`,
+      '',
+      '### Console errors and page exceptions',
+      '',
+      fenced(bug.consoleErrors),
+      '',
+      '### Network errors',
+      '',
+      fenced(bug.networkErrors),
+      '',
+    );
+    if (bug.reportingError) lines.push(`**Reporting error:** ${bug.reportingError}`, '');
+  });
+  return `${lines.join('\n')}\n`;
+}
+
+function writeReportingEvidence(runDir: string, report: RunReport, result: InAppBugReportResult): void {
   try {
+    const artifactsDir = runArtifactsDir(runDir);
     fs.writeFileSync(
-      path.join(runDir, 'in-app-bug-reporting.json'),
+      path.join(artifactsDir, 'in-app-bug-reporting.json'),
       `${JSON.stringify(result, null, 2)}\n`,
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(runDir, 'bugs-reported.md'),
+      renderBugsReportedMarkdown(report, result),
       'utf8',
     );
   } catch {
@@ -176,18 +246,19 @@ export async function reportKoyalBugsInApp(opts: {
     submitted: 0,
     failures: [],
     submittedReports: [],
+    bugs: bugs.map((bug) => ({ ...bugReportEvidence(bug), status: 'not-submitted' })),
   };
   if (bugs.length === 0) {
-    writeReportingEvidence(opts.runDir, result);
+    writeReportingEvidence(opts.runDir, opts.report, result);
     return result;
   }
   if (!/\.?koyal\.ai$/i.test(opts.hostname)) {
     result.failures.push('in-app product reporting is currently available only on Koyal properties');
-    writeReportingEvidence(opts.runDir, result);
+    writeReportingEvidence(opts.runDir, opts.report, result);
     return result;
   }
 
-  for (const bug of bugs) {
+  for (const [bugIndex, bug] of bugs.entries()) {
     try {
       const url = bug.step.result.signals.url;
       if (url.startsWith('http')) {
@@ -203,7 +274,9 @@ export async function reportKoyalBugsInApp(opts: {
         });
         formOpen = attempt.success && reportFormVisible(opts.browser);
         if (!formOpen) {
-          result.failures.push(`${bug.step.workflow}: ${attempt.error ?? 'report form was not visibly opened'}`);
+          const failure = `${bug.step.workflow}: ${attempt.error ?? 'report form was not visibly opened'}`;
+          result.failures.push(failure);
+          result.bugs[bugIndex].reportingError = failure;
           continue;
         }
       }
@@ -213,11 +286,15 @@ export async function reportKoyalBugsInApp(opts: {
         fillFieldByHint(opts.browser, 'Bug Description', description).ok ||
         fillFieldByHint(opts.browser, 'Description', description).ok;
       if (!filled) {
-        result.failures.push(`${bug.step.workflow}: report description field was not fillable`);
+        const failure = `${bug.step.workflow}: report description field was not fillable`;
+        result.failures.push(failure);
+        result.bugs[bugIndex].reportingError = failure;
         continue;
       }
       if (!opts.browser.clickButtonByText('Submit Report', true)) {
-        result.failures.push(`${bug.step.workflow}: Submit Report was not available`);
+        const failure = `${bug.step.workflow}: Submit Report was not available`;
+        result.failures.push(failure);
+        result.bugs[bugIndex].reportingError = failure;
         continue;
       }
       let confirmed = false;
@@ -230,22 +307,25 @@ export async function reportKoyalBugsInApp(opts: {
         }
       }
       if (!confirmed) {
-        result.failures.push(`${bug.step.workflow}: submission confirmation was not visible`);
+        const failure = `${bug.step.workflow}: submission confirmation was not visible`;
+        result.failures.push(failure);
+        result.bugs[bugIndex].reportingError = failure;
         continue;
       }
       result.submitted++;
+      result.bugs[bugIndex].status = 'submitted';
       result.submittedReports.push({
         workflow: bug.step.workflow,
         description,
       });
     } catch (error) {
-      result.failures.push(
-        `${bug.step.workflow}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      const failure = `${bug.step.workflow}: ${error instanceof Error ? error.message : String(error)}`;
+      result.failures.push(failure);
+      result.bugs[bugIndex].reportingError = failure;
     }
   }
 
-  writeReportingEvidence(opts.runDir, result);
+  writeReportingEvidence(opts.runDir, opts.report, result);
   console.log(
     `[bugs] in-app reporting: ${result.submitted}/${result.found} submitted` +
       (result.failures.length ? ` (${result.failures.length} safely skipped/failed)` : ''),

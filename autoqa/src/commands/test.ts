@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { config } from '../config.js';
 import { runFlows } from '../agent/flow-runner.js';
-import { ensureDir, writeArtifactsIndex } from '../core/evidence.js';
+import { ensureDir, runArtifactsDir, writeArtifactsIndex } from '../core/evidence.js';
 import { LlmClient } from '../core/llm/client.js';
 import {
   appendReportNotes,
@@ -33,7 +33,7 @@ export async function testCommand(
   const report = createRunReport(state.sitemap.origin);
   const runDir = path.join(reportsRoot, report.runId);
   ensureDir(runDir);
-  interact.setDecisionLog(runDir);
+  interact.setDecisionLog(runArtifactsDir(runDir));
 
   let failed = 0;
   try {
