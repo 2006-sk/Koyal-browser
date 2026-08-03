@@ -1038,6 +1038,98 @@ test('execution-level mutation denylist suppresses a repeated create click', asy
   assert.match(result.stepsTaken.join('\n'), /suppressed duplicate mutation click/i);
 });
 
+test('manual mode uses dialog-scoped fallback when an explicit modal close click has no effect', async () => {
+  let modalOpen = true;
+  let llmCalls = 0;
+  const browser = {
+    getUrl: () => 'https://example.test/editscene',
+    snapshotInteractive: () => modalOpen
+      ? '- dialog "Scene 1"\n  - button "Close" [ref=e9]'
+      : '- heading "Edit scenes"\n- button "Create Video" [ref=e20]',
+    snapshotFull: () => modalOpen
+      ? 'dialog "Scene 1"\nbutton "Close" [ref=e9]'
+      : 'heading "Edit scenes"\nbutton "Create Video" [ref=e20]',
+    dialogStatus: () => undefined,
+    fieldLabelAtRef: () => '',
+    wait: () => undefined,
+    clickVisible: () => undefined,
+    dismissVisibleModalOverlay: (_ref: string, explicit: boolean) => {
+      assert.equal(explicit, true);
+      modalOpen = false;
+      return true;
+    },
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete() {
+      llmCalls++;
+      return llmCalls === 1
+        ? '{"action":"click","ref":"@e9","reason":"Close the active scene modal"}'
+        : '{"action":"done","reason":"The scene modal is gone and Edit scenes is visible"}';
+    },
+  } as unknown as LlmClient;
+
+  const result = await new Explorer(browser, { llm }).achieveGoal('Close the Scene 1 modal', {
+    maxSteps: 2,
+    manualMode: true,
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.actions[0]?.executionFailed, undefined);
+  assert.match(result.stepsTaken.join('\n'), /dialog-scoped DOM fallback closed the active overlay/i);
+});
+
+test('manual mode closes a blocking modal then retries the background control from the new state', async () => {
+  let modalOpen = true;
+  let rendered = false;
+  let llmCalls = 0;
+  let createClicks = 0;
+  const browser = {
+    getUrl: () => rendered
+      ? 'https://example.test/finalvideo'
+      : 'https://example.test/editscene',
+    snapshotInteractive: () => rendered
+      ? '- heading "Final video"'
+      : modalOpen
+        ? '- button "Create Video" [ref=e20]\n- dialog "Scene 1"\n  - button "Close" [ref=e9]'
+        : '- heading "Edit scenes"\n- button "Create Video" [ref=e20]',
+    snapshotFull: () => rendered
+      ? 'heading "Final video"\ntext "Playable"'
+      : modalOpen
+        ? 'button "Create Video" [ref=e20]\ndialog "Scene 1"\nbutton "Close" [ref=e9]'
+        : 'heading "Edit scenes"\nbutton "Create Video" [ref=e20]',
+    dialogStatus: () => undefined,
+    fieldLabelAtRef: () => '',
+    wait: () => undefined,
+    clickVisible: () => {
+      createClicks++;
+      if (!modalOpen) rendered = true;
+    },
+    dismissVisibleModalOverlay: (_ref: string, explicit: boolean) => {
+      assert.equal(explicit, false);
+      modalOpen = false;
+      return true;
+    },
+  } as unknown as AgentBrowser;
+  const llm = {
+    async complete() {
+      llmCalls++;
+      if (llmCalls <= 2) {
+        return '{"action":"click","ref":"@e20","reason":"Create the final video"}';
+      }
+      return '{"action":"done","reason":"Final video is visible and playable"}';
+    },
+  } as unknown as LlmClient;
+
+  const result = await new Explorer(browser, { llm }).achieveGoal('Create the final video', {
+    maxSteps: 3,
+    manualMode: true,
+  });
+  assert.equal(result.success, true);
+  assert.equal(createClicks, 2);
+  assert.equal(result.actions[0]?.executionFailed, true);
+  assert.equal(result.actions[1]?.executionFailed, undefined);
+  assert.match(result.stepsTaken.join('\n'), /blocked by an active modal/i);
+});
+
 test('exact walk-entry fallback executes a mutation only once even when the LLM asks again', async () => {
   let clickCalls = 0;
   let llmCalls = 0;

@@ -42,19 +42,48 @@ function likelyCause(bug: ProductBugGroup): string {
 }
 
 export function inAppBugDescription(bug: ProductBugGroup, runId: string): string {
-  const errors = productErrorLines(bug.step).join('\n');
+  const lines = productErrorLines(bug.step);
+  const consoleLines = lines
+    .filter((line) => /^(?:console|exception):/i.test(line))
+    .map((line) => line.replace(/^(?:console|exception):\s*/i, ''));
+  const networkLines = lines
+    .filter((line) => /^network:/i.test(line))
+    .map((line) => line.replace(/^network:\s*/i, ''));
+  const issueLines = lines
+    .filter((line) => /^(?:visible|issue):/i.test(line))
+    .map((line) => line.replace(/^(?:visible|issue):\s*/i, ''));
+  const issue = issueLines[0] ?? consoleLines[0] ?? networkLines[0] ?? bug.step.result.actual;
   return redact(
     [
-      `AutoQA: ${bug.step.workflow} failed`,
-      'Reported automatically by AutoQA.',
-      `Run: ${runId}`,
-      `Page: ${bug.step.result.signals.url}`,
-      `Observed error: ${errors}`,
+      'AutoQA issue report',
+      `Issue: ${issue}`,
+      '',
+      'Console / exceptions:',
+      ...(consoleLines.length ? consoleLines : ['None captured for this checkpoint.']),
+      '',
+      'Network:',
+      ...(networkLines.length ? networkLines : ['None captured for this checkpoint.']),
+      '',
       `Likely cause: ${likelyCause(bug)}`,
-      `Blocked capability: ${bug.step.action}`,
+      `Impact: ${bug.step.action}`,
       `Occurrences in this run: ${bug.occurrences}`,
+      `Run: ${runId}`,
+      '',
+      `Where: ${bug.step.result.signals.url} — ${bug.step.workflow}`,
     ].join('\n'),
   );
+}
+
+function writeReportingEvidence(runDir: string, result: InAppBugReportResult): void {
+  try {
+    fs.writeFileSync(
+      path.join(runDir, 'in-app-bug-reporting.json'),
+      `${JSON.stringify(result, null, 2)}\n`,
+      'utf8',
+    );
+  } catch {
+    // Evidence logging is best-effort and cannot alter the QA result.
+  }
 }
 
 function reportGoal(): string {
@@ -148,9 +177,13 @@ export async function reportKoyalBugsInApp(opts: {
     failures: [],
     submittedReports: [],
   };
-  if (bugs.length === 0) return result;
+  if (bugs.length === 0) {
+    writeReportingEvidence(opts.runDir, result);
+    return result;
+  }
   if (!/\.?koyal\.ai$/i.test(opts.hostname)) {
     result.failures.push('in-app product reporting is currently available only on Koyal properties');
+    writeReportingEvidence(opts.runDir, result);
     return result;
   }
 
@@ -212,15 +245,7 @@ export async function reportKoyalBugsInApp(opts: {
     }
   }
 
-  try {
-    fs.writeFileSync(
-      path.join(opts.runDir, 'in-app-bug-reporting.json'),
-      `${JSON.stringify(result, null, 2)}\n`,
-      'utf8',
-    );
-  } catch {
-    // Evidence logging is best-effort and cannot alter the QA result.
-  }
+  writeReportingEvidence(opts.runDir, result);
   console.log(
     `[bugs] in-app reporting: ${result.submitted}/${result.found} submitted` +
       (result.failures.length ? ` (${result.failures.length} safely skipped/failed)` : ''),

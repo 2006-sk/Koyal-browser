@@ -478,6 +478,188 @@ export class AgentBrowser {
     this.click(ref);
   }
 
+  /**
+   * Dismiss one active HTML modal when its ordinary accessibility-ref click did
+   * not change the application state. The search is deliberately scoped to the
+   * top-most visible dialog/aria-modal element: it never clicks a page-level X,
+   * Delete, Back, or arbitrary icon outside that overlay.
+   *
+   * When `explicitDismissIntent` is false, the attempted click must have landed
+   * outside the active dialog. This is the safe "a modal is blocking the real
+   * control" recovery. A failed Save/Create inside the dialog must not close it.
+   */
+  dismissVisibleModalOverlay(
+    attemptedRef?: string,
+    explicitDismissIntent = false,
+  ): boolean {
+    let point: { x: number; y: number } | undefined;
+    if (attemptedRef) {
+      const box = this.getBox(attemptedRef.startsWith('@') ? attemptedRef : `@${attemptedRef}`);
+      if (box) {
+        point = {
+          x: Math.round(box.x + box.width / 2),
+          y: Math.round(box.y + box.height / 2),
+        };
+      }
+    }
+    try {
+      const result = this.evalScript(`
+        (() => {
+          const visible = (el) => {
+            if (!(el instanceof HTMLElement)) return false;
+            const rect = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+              style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity || '1') > 0;
+          };
+          const semanticDialogs = [...document.querySelectorAll(
+            '[role="dialog"],[aria-modal="true"],dialog[open]'
+          )].filter(visible);
+          const z = (el) => {
+            const value = Number.parseInt(getComputedStyle(el).zIndex || '0', 10);
+            return Number.isFinite(value) ? value : 0;
+          };
+          const structuralPanels = [...document.querySelectorAll('body *')]
+            .filter((el) => {
+              if (!visible(el)) return false;
+              const rect = el.getBoundingClientRect();
+              const style = getComputedStyle(el);
+              const coversViewport = rect.width >= innerWidth * 0.8 && rect.height >= innerHeight * 0.8;
+              const overlayShaped = style.position === 'fixed' && coversViewport &&
+                (z(el) >= 100 || /(?:modal|dialog|overlay|backdrop|inset-0)/i.test(String(el.className)));
+              return overlayShaped;
+            })
+            .map((overlay) => {
+              const candidates = [...overlay.children].filter((child) => {
+                if (!visible(child)) return false;
+                const r = child.getBoundingClientRect();
+                return r.width >= 240 && r.height >= 120 &&
+                  r.width < innerWidth * 0.95 && r.height < innerHeight * 0.98 &&
+                  Boolean(child.querySelector('button,[role="button"],[aria-label],[title]'));
+              });
+              return candidates.length === 1 ? candidates[0] : null;
+            })
+            .filter(Boolean);
+          const dialogs = [...new Set([...semanticDialogs, ...structuralPanels])];
+          if (!dialogs.length) return 'NO_VISIBLE_MODAL';
+          dialogs.sort((a, b) => z(a) - z(b));
+          const dialog = dialogs[dialogs.length - 1];
+          const rect = dialog.getBoundingClientRect();
+          const attempted = ${point ? `document.elementFromPoint(${point.x}, ${point.y})` : 'null'};
+          const explicit = ${explicitDismissIntent ? 'true' : 'false'};
+          if (!explicit && (!attempted || dialog.contains(attempted))) {
+            return 'ATTEMPT_WAS_INSIDE_MODAL';
+          }
+          const controls = [...dialog.querySelectorAll(
+            'button,[role="button"],input[type="button"],input[type="reset"],[data-testid],[aria-label],[title]'
+          )].filter((el) => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+          const identity = (el) => [
+            el.textContent,
+            el.getAttribute('aria-label'),
+            el.getAttribute('title'),
+            el.getAttribute('data-testid'),
+            el.getAttribute('name'),
+            el.querySelector('svg')?.getAttribute('data-lucide'),
+            el.querySelector('svg')?.getAttribute('aria-label'),
+          ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+          const explicitControls = controls.filter((el) =>
+            /^(?:close|cancel|dismiss|x|×)(?:\\s+(?:modal|dialog|panel))?$/i.test(identity(el)) ||
+            /(?:modal|dialog|panel)[-_ ]?(?:close|dismiss)|(?:close|dismiss)[-_ ]?(?:modal|dialog|panel)/i.test(identity(el))
+          );
+          let target = explicitControls.length === 1 ? explicitControls[0] : null;
+          if (!target) {
+            const topRightIcons = controls.filter((el) => {
+              const r = el.getBoundingClientRect();
+              const nearTopRight = r.top <= rect.top + Math.min(120, rect.height * 0.22) &&
+                r.right >= rect.right - Math.min(140, rect.width * 0.25);
+              const compact = r.width >= 18 && r.width <= 96 && r.height >= 18 && r.height <= 96;
+              const iconLike = Boolean(el.querySelector('svg,img')) || /^(?:x|×)$/i.test(identity(el));
+              return nearTopRight && compact && iconLike;
+            });
+            if (topRightIcons.length === 1) target = topRightIcons[0];
+          }
+          if (!target) return 'NO_UNIQUE_MODAL_DISMISS';
+          const overlay = [dialog, ...(() => {
+            const parents = [];
+            for (let el = dialog.parentElement; el; el = el.parentElement) parents.push(el);
+            return parents;
+          })()].find((el) => {
+            const r = el.getBoundingClientRect();
+            return getComputedStyle(el).position === 'fixed' &&
+              r.width >= innerWidth * 0.8 && r.height >= innerHeight * 0.8;
+          }) || null;
+          window.__autoqaActiveModalPanel = dialog;
+          window.__autoqaActiveModalOverlay = overlay;
+          target.scrollIntoView({ block: 'center', inline: 'center' });
+          target.click();
+          return 'CLICKED_MODAL_DISMISS';
+        })()
+      `, { skipEnsure: true });
+      if (!result.includes('CLICKED_MODAL_DISMISS')) return false;
+      const modalGone = (): boolean => {
+        try {
+          return this.evalScript(`
+            (() => {
+              const panel = window.__autoqaActiveModalPanel;
+              if (!panel || !panel.isConnected) return 'MODAL_GONE';
+              const r = panel.getBoundingClientRect();
+              const s = getComputedStyle(panel);
+              return r.width <= 0 || r.height <= 0 || s.display === 'none' ||
+                s.visibility === 'hidden' || Number(s.opacity || '1') <= 0
+                ? 'MODAL_GONE' : 'MODAL_STILL_VISIBLE';
+            })()
+          `, { skipEnsure: true }).includes('MODAL_GONE');
+        } catch {
+          return false;
+        }
+      };
+      this.wait(400);
+      if (modalGone()) return true;
+
+      // Some component libraries bind dismissal to keydown rather than the X
+      // button's synthetic click. Escape is non-mutating and scoped by the
+      // browser to the active overlay/focus context.
+      try {
+        this.press('Escape');
+        this.wait(350);
+        if (modalGone()) return true;
+      } catch {
+        // Continue to the verified backdrop fallback.
+      }
+
+      // Backdrop dismissal is attempted only on the exact full-viewport
+      // overlay that owned the panel, and only after its own Close + Escape
+      // paths failed. Dispatching to the overlay itself preserves libraries'
+      // common `event.target === event.currentTarget` safety check.
+      try {
+        const backdrop = this.evalScript(`
+          (() => {
+            const overlay = window.__autoqaActiveModalOverlay;
+            const panel = window.__autoqaActiveModalPanel;
+            if (!overlay || !overlay.isConnected || !panel || !panel.isConnected) return 'NO_BACKDROP';
+            const r = overlay.getBoundingClientRect();
+            if (getComputedStyle(overlay).position !== 'fixed' ||
+                r.width < innerWidth * 0.8 || r.height < innerHeight * 0.8) return 'NO_BACKDROP';
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+              overlay.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+            }
+            return 'CLICKED_MODAL_BACKDROP';
+          })()
+        `, { skipEnsure: true });
+        if (backdrop.includes('CLICKED_MODAL_BACKDROP')) {
+          this.wait(400);
+          if (modalGone()) return true;
+        }
+      } catch {
+        // The caller will report a verified modal blocker.
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   fillVisible(ref: string, value: string): void {
     if (this.showCursor) {
       this.pointAtRef(ref);

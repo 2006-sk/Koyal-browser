@@ -54,39 +54,44 @@ export function productErrorLines(step: TestStep): string[] {
   const lines: string[] = [];
   const visible = `${sig.snapshot.raw}\n${sig.snapshot.interactive}`;
   const visibleError = visible.match(
-    /\b(?:video is not edited[^.\n!]*(?:!+)?|something went wrong[^.\n]*(?:\.)?|internal server error[^.\n]*(?:\.)?|failed to (?:generate|save|create|upload|render|edit)[^.\n]*(?:\.)?|unexpected error[^.\n]*(?:\.)?|try again later[^.\n]*(?:\.)?)\b/i,
+    /\b(?:video is not edited[^.\n!]*(?:!+)?|something went wrong[^.\n]*(?:\.)?|internal server error[^.\n]*(?:\.)?|(?:failed|unable) to (?:generate|save|create|upload|render|edit|load|close|continue)[^.\n]*(?:\.)?|(?:prompts? data|image|video|scene|asset|character|location|file) (?:is|was) not (?:generated|saved|created|uploaded|rendered|edited|loaded)[^.\n]*(?:\.)?|unexpected error[^.\n]*(?:\.)?|try again later[^.\n]*(?:\.)?|(?:request|operation|generation|processing) (?:was )?(?:aborted|timed out|failed)[^.\n]*(?:\.)?|requested device not found[^.\n]*(?:\.)?)\b/i,
   )?.[0];
-  const verifierCorrelatedRuntimeError = step.result.reasons.some((reason) =>
-    /\b(?:page error|console error|application failure|product error|uncaught|exception)\b/i.test(reason),
-  );
-  const matchesVisibleError = (value: string): boolean => {
-    if (!visibleError) return false;
-    const left = value.toLowerCase().replace(/\s+/g, ' ').trim();
-    const right = visibleError.toLowerCase().replace(/\s+/g, ' ').trim();
-    return left.includes(right) || right.includes(left);
-  };
   for (const c of sig.consoleErrors ?? []) {
-    if (
-      c.text?.trim() &&
-      (verifierCorrelatedRuntimeError || matchesVisibleError(c.text))
-    ) {
-      lines.push(`console: ${c.text.trim()}`);
-    }
+    if (c.text?.trim()) lines.push(`console: ${c.text.trim()}`);
   }
   for (const e of sig.pageErrors ?? []) {
-    if (
-      e.message?.trim() &&
-      (verifierCorrelatedRuntimeError || matchesVisibleError(e.message))
-    ) {
-      lines.push(`exception: ${e.message.trim()}`);
-    }
+    if (e.message?.trim()) lines.push(`exception: ${e.message.trim()}`);
   }
   for (const n of failedNetworkLines(sig.networkRequests)) lines.push(`network: ${n}`);
   if (visibleError) lines.push(`visible: ${visibleError.trim()}`);
+  if (lines.length === 0 && step.result.verdict !== 'pass') {
+    const primaryReason = step.result.reasons?.find((reason) => reason.trim());
+    if (primaryReason) lines.push(`issue: ${primaryReason.trim()}`);
+  }
   // de-dup while preserving order, then cap
   const seen = new Set<string>();
   const deduped = lines.filter((l) => (seen.has(l) ? false : (seen.add(l), true)));
   return deduped.slice(0, MAX_ERROR_LINES);
+}
+
+function isSyntheticDownstreamSkip(step: TestStep): boolean {
+  const text = [step.action, step.result.actual, ...step.result.reasons].join('\n');
+  return /(?:remaining \d+ milestones? (?:as )?skipped|skipped\s*[—-]\s*not tested because upstream|not tested because (?:an )?upstream|upstream (?:milestone|checkpoint|task).*(?:failed|blocked)|recording remaining \d+ milestone)/i.test(text);
+}
+
+/**
+ * Reporting is intentionally broader than run failure. A primary unresolved
+ * checkpoint is useful production evidence even without a clean console line;
+ * a PASS with concrete runtime/network evidence is also worth reporting. The
+ * strict `isProductBug` predicate below remains the run-blocker policy.
+ */
+export function isReportableIssue(step: TestStep): boolean {
+  if (isSyntheticDownstreamSkip(step)) return false;
+  const lines = productErrorLines(step);
+  if (step.result.verdict !== 'pass') return lines.length > 0;
+  return lines.some((line) =>
+    /^(?:console|exception|network|visible):/i.test(line),
+  );
 }
 
 export function isProductBug(step: TestStep): boolean {
@@ -174,7 +179,7 @@ export function groupedProductBugs(report: RunReport): ProductBugGroup[] {
   const grouped = new Map<string, ProductBugGroup>();
   for (const scenario of report.scenarios) {
     for (const step of scenario.steps) {
-      if (!isProductBug(step)) continue;
+      if (!isReportableIssue(step)) continue;
       const signature = bugSignature(step);
       const existing = grouped.get(signature);
       if (existing) {
