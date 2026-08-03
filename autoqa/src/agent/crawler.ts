@@ -124,18 +124,15 @@ function transientErrorPage(url: string): PageNode {
  * click-probing nav elements to discover SPA transitions, then proposing flows.
  * Discovery only — no form submits, uploads, or edits happen here.
  */
-/** Resolve the walk budget without letting exhaustive mode erase a caller's
- * explicit safety/time cap. Infinity is intentional only when exhaustive was
- * requested and neither CLI nor environment supplied a deep-walk count. */
+/** Resolve the walk budget. Exhaustive controls coverage inside each walk; it
+ * must not erase the configured workflow cap and turn an ordinary explore into
+ * an unbounded run. */
 export function resolveDeepWalkCap(
   requested: number | undefined,
   configured: number,
-  configuredExplicitly: boolean,
-  exhaustive: boolean,
 ): number {
   if (requested !== undefined) return requested;
-  if (configuredExplicitly) return configured;
-  return exhaustive ? Number.POSITIVE_INFINITY : configured;
+  return configured;
 }
 
 function normalizedEntryLabel(label: string): string {
@@ -613,15 +610,11 @@ export async function explore(
 
   // ---- Deep-walk phase: actually enter create/upload flows ----
   const walkFlowIds: string[] = [];
-  // Exhaustive means every discovered creation entry, unless the caller gave an
-  // explicit --deep-flows budget. The old default cap of 3 silently left Koyal's
-  // character/assets/outfit/audio entries untouched while claiming the crawl
-  // was complete.
+  // Exhaustive controls how thoroughly each workflow is exercised. The deep
+  // workflow count remains bounded by --deep-flows / AUTOQA_DEEP_FLOWS.
   const deepCap = resolveDeepWalkCap(
     opts.deepFlows,
     config.deep.walksPerExplore,
-    config.deep.walksPerExploreExplicit,
-    config.probes.exhaustive,
   );
   if (config.deep.enabled && deepCap > 0) {
     const collectEntries = (): DeepWalkEntry[] => {

@@ -399,8 +399,8 @@ inspect or delete stale walk/recipe data, and manage remembered guard choices.
 | `--reset-values` | `run`, `explore`, `test` | Forget saved non-secret field answers but keep sitemap, recipes, and authentication. |
 | `--max-pages <N>` | browser commands | Maximum crawl pages. Default: 25. |
 | `--max-steps <N>` | browser commands | Maximum LLM decisions for one goal, not the whole run. Default: 12. |
-| `--budget <N>` | browser commands | Hard cap on total LLM calls for the process. Default: unlimited. |
-| `--deep-flows <N>` | exploration | Maximum deep walks in this exploration. Default: 3. |
+| `--budget <N>` | browser commands | Hard cap on total LLM calls for the process. Default: 800. |
+| `--deep-flows <N>` | exploration | Maximum deep workflow walks in this exploration. Default: 10. |
 | `--no-deep` | exploration | Disable deep walking. |
 | `--quick` | testing | Skip additional QA probes. |
 | `--headless` | browser commands | Hide the browser window. |
@@ -426,19 +426,19 @@ Selectors can be combined.
 | `AUTOQA_URL` | none | Default target URL. |
 | `AUTOQA_EMAIL`, `AUTOQA_PASSWORD` | none | Optional generic test credentials. |
 | `AUTOQA_SESSION` | `autoqa` | Browser-session name prefix. Use distinct values for concurrent runs. |
-| `AUTOQA_EXHAUSTIVE` | `false` | Exercise all option/edit probes instead of the normal cap. |
+| `AUTOQA_EXHAUSTIVE` | `true` | Exercise all option/edit probes instead of the normal cap. Set `false` to opt out. |
 | `AUTOQA_MAX_PAGES` | `25` | Crawl page cap. |
 | `AUTOQA_CRAWL_DEPTH` | `4` | Crawl depth cap. |
 | `AUTOQA_PROBES_PER_PAGE` | `6` | Click-probe cap per crawled page. |
 | `AUTOQA_DEEP` | `true` | Enable deep walking. |
-| `AUTOQA_DEEP_FLOWS` | `3` | Deep-walk cap when no CLI value is supplied. |
+| `AUTOQA_DEEP_FLOWS` | `10` | Deep-workflow cap when no CLI value is supplied. |
 | `AUTOQA_DEEP_WALK_MAX_STEPS` | `60` | State cap for one deep walk. |
 | `AUTOQA_PROCESSING_WAIT_MS` | `1200000` | Maximum deterministic processing wait. |
 | `AUTOQA_TERMINAL_WAIT_MS` | `1200000` | Maximum final-artifact wait. |
 | `AUTOQA_PROMPT_TIMEOUT_MS` | `300000` | Detached question timeout. |
 | `AUTOQA_PRODUCTION_SUPERVISOR` | `false` | Answer safe non-secret run prompts autonomously for unattended production QA. |
 | `AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS` | `3000` | Short window in which an inbox/human answer overrides the production supervisor. |
-| `AUTOQA_LLM_BUDGET` | `0` | LLM-call cap; `0` means unlimited. |
+| `AUTOQA_LLM_BUDGET` | `800` | LLM-call cap; `0` means unlimited. |
 | `AUTOQA_LLM_TIMEOUT_MS` | `60000` | Timeout for one LLM request attempt. |
 | `AUTOQA_UPLOAD_SUGGESTIONS` | none | Comma-separated upload paths shown as suggestions. |
 | `AGENT_BROWSER_HEADED` | `true` | Set `false` to hide Chrome. |

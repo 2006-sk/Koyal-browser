@@ -22,16 +22,16 @@ Commands:
 Flags:
   --url <URL>        target site (or AUTOQA_URL in .env)
   --flow id[,id]     only these flow ids (test/run)
-  --manual "<goal>"  use the saved sitemap to run one focused, recipe-learning test
-  --manual-v2        compile --manual into small dependency-aware tasks (opt-in)
+  --manual "<goal>"  run one focused Manual v2 test using the saved sitemap
+  --manual-v2        explicitly select the dependency-aware Manual v2 engine
   --fresh            re-explore even if a sitemap exists (run)
   --wipeout          delete all saved state for this site, then explore + test from zero (run)
   --reset-values     forget saved names/field values, then ask again during explore or replay
   --max-pages N      crawl page cap (default 25)
   --max-steps N      LLM steps per goal (default 12)
-  --budget N         hard cap on total LLM calls (default unlimited)
+  --budget N         hard cap on total LLM calls (default 800)
   --headless         run the browser headless
-  --deep-flows N     deep walks per explore (default 3)
+  --deep-flows N     deep workflow walks per explore (default 10)
   --no-deep          skip deep exploration (shallow crawl only)
   --quick            skip QA probes during testing (back/forward, matrices, edit sweeps)
   --upload-file <p>  force this file for every upload this run (format-parity testing)
