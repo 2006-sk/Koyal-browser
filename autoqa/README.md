@@ -53,7 +53,7 @@ Anthropic is the default:
 ```dotenv
 LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=your-key
-LLM_MODEL=claude-sonnet-4-6
+LLM_MODEL=claude-sonnet-5
 ```
 
 OpenAI:

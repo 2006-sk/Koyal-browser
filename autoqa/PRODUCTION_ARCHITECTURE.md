@@ -32,7 +32,7 @@ a tuning knob — it is the maximum, and it eliminates Lambda as the runner outr
 Your own site-summary feature already prices runs. Measured:
 
 - **filmarena.ai:** `$3.20` this run / `~$1.39` estimated future run (234 LLM calls)
-- **beta.koyal.ai:** 277 LLM calls, priced at `claude-opus-4-8` rates ($5 / $25 per MTok)
+- **beta.koyal.ai:** 277 LLM calls, now priced at `claude-sonnet-5` rates ($3 / $15 per MTok)
 
 A "selected flows" loop is the **test phase** — exploration is skipped and recipes replay at 0
 LLM calls — so per-cycle cost sits near the ~$1.4–2 replay figure, not the $3.20 cold start.
@@ -56,7 +56,7 @@ Two things follow, and they drive §4:
 
 Cost levers by leverage: **cadence** (dominant — every doubling doubles the bill),
 **`AUTOQA_LLM_BUDGET`** (currently `0`, unlimited — set a per-run ceiling), **model choice**
-(Sonnet 5 $3/$15 vs Opus 5 $5/$25; `config.ts:83` still defaults to `claude-sonnet-4-6`), and
+(Sonnet 5 $3/$15; `config.ts:83` defaults to `claude-sonnet-5`), and
 **recipe hit rate** (a replayed recipe costs 0 LLM calls — you only pay for flows that fall back
 to exploration).
 
@@ -377,7 +377,7 @@ deployment; the harness is provided. Access Claude via the `AnthropicFoundry` cl
 must go through Azure, or the standard client if not.
 
 Note the SDK is a *different package* from the API's tool runner — don't substitute one for the
-other. Default the model to `claude-opus-5`.
+other. Default the model to `claude-sonnet-5`.
 
 ### Wiring Jira in
 
@@ -450,5 +450,5 @@ A fix agent fed by an untrustworthy finder just automates the production of bad 
 
 - [VeilStream](https://www.veilstream.com/) · [Safe Seed Data](https://www.veilstream.com/safe-seed-data) · [VeilStream for GDPR](https://www.veilstream.com/resources/veilstream-for-gdpr)
 - [Replicas](https://tryreplicas.com/) · [Replicas docs](https://docs.tryreplicas.com/) · [Replicas on Y Combinator](https://www.ycombinator.com/companies/replicas)
-- Anthropic model pricing: Opus 5 $5/$25, Sonnet 5 $3/$15 ($2/$10 intro through 2026-08-31), Haiku 4.5 $1/$5, Opus 4.8 $5/$25 per MTok
+- Anthropic model pricing: Sonnet 5 $3/$15 ($2/$10 intro through 2026-08-31) per MTok
 - Run durations, artifact sizes, and state sizes measured from this repo on 2026-07-29

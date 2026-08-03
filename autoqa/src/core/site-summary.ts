@@ -12,15 +12,11 @@ import type { RunReport } from './types.js';
 
 /** USD per 1M tokens by model id (Anthropic list pricing). */
 const PRICING: Record<string, { input: number; output: number }> = {
-  'claude-opus-4-8': { input: 5, output: 25 },
-  'claude-opus-4-7': { input: 5, output: 25 },
-  'claude-opus-4-6': { input: 5, output: 25 },
   'claude-sonnet-5': { input: 3, output: 15 },
-  'claude-sonnet-4-6': { input: 3, output: 15 },
   'claude-haiku-4-5': { input: 1, output: 5 },
   'claude-fable-5': { input: 10, output: 50 },
 };
-const FALLBACK_PRICE = { input: 5, output: 25 };
+const FALLBACK_PRICE = { input: 3, output: 15 };
 
 function priceFor(model: string): { input: number; output: number } {
   // tolerate suffixes like "[1m]" / dated variants by stripping to the base id

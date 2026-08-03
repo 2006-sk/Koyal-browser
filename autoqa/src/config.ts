@@ -80,7 +80,7 @@ export const config = {
     provider: llmProvider,
     apiKey: llmApiKey,
     baseUrl: process.env.LLM_BASE_URL ?? '',
-    model: process.env.LLM_MODEL ?? (llmProvider === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o-mini'),
+    model: process.env.LLM_MODEL ?? (llmProvider === 'anthropic' ? 'claude-sonnet-5' : 'gpt-4o-mini'),
     maxStepsPerGoal: Number(process.env.LLM_MAX_STEPS_PER_GOAL ?? '12'),
     snapshotMaxChars: Number(process.env.AUTOQA_SNAPSHOT_MAX_CHARS ?? '8000'),
     /** Hard cap on LLM calls per run; 0 = unlimited */
