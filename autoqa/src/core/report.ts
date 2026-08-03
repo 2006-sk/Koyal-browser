@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { RunReport, ScenarioResult, TestStep, Verdict } from './types.js';
-import { ensureDir, relativeEvidencePath } from './evidence.js';
+import { ensureDir, relativeEvidencePath, runArtifactsDir } from './evidence.js';
 
 function verdictEmoji(verdict: Verdict): string {
   switch (verdict) {
@@ -63,7 +63,7 @@ export function writeRunReport(report: RunReport, reportsRoot: string): string {
   ensureDir(runDir);
 
   const mdPath = path.join(runDir, 'report.md');
-  const jsonPath = path.join(runDir, 'report.json');
+  const jsonPath = path.join(runArtifactsDir(runDir), 'report.json');
 
   fs.writeFileSync(mdPath, renderMarkdownReport(report, runDir), 'utf8');
   fs.writeFileSync(jsonPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
@@ -88,7 +88,9 @@ export function appendReportNotes(runDir: string): void {
     '- `page-errors.json` — uncaught JS exceptions',
     '- `screenshot.png` — annotated screenshot',
     '',
-    'See also [`ARTIFACTS.md`](ARTIFACTS.md) for a per-step index.',
+    'Product issues and their filing status are summarized in [`bugs-reported.md`](bugs-reported.md).',
+    '',
+    'See also [`artifacts/ARTIFACTS.md`](artifacts/ARTIFACTS.md) for a per-step index.',
     '',
   ].join('\n');
   fs.appendFileSync(mdPath, extra, 'utf8');
@@ -147,7 +149,7 @@ export function renderMarkdownReport(report: RunReport, runDir: string): string 
 }
 
 export function scenarioEvidenceDir(runDir: string, scenarioId: string): string {
-  const dir = path.join(runDir, scenarioId);
+  const dir = path.join(runArtifactsDir(runDir), scenarioId);
   ensureDir(dir);
   return dir;
 }

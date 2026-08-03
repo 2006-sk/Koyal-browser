@@ -53,7 +53,7 @@ Anthropic is the default:
 ```dotenv
 LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=your-key
-LLM_MODEL=claude-sonnet-4-6
+LLM_MODEL=claude-sonnet-5
 ```
 
 OpenAI:
@@ -160,28 +160,32 @@ The flow keeps its saved lifecycle state:
 - `exploratory`: use any available recipe, then let the LLM recover and learn
   when necessary.
 
-### Run a focused test from a natural-language request
+### Run a focused Manual v2 test from a natural-language request
 
 ```bash
 npm run qa -- run \
   --url https://your-app.example \
+  --manual-v2 \
   --manual "Test the Locations area: create or edit one location and verify it persists"
 ```
 
-`--manual` requires an existing sitemap. AutoQA asks the LLM to select the
-narrowest mapped page or an exactly matching existing flow, rejects invented
-page/flow IDs, and then runs only that target. It may use a mapped direct URL
-for intentional entry into the requested feature, but the browser agent remains
-inside the requested scope.
+Manual v2 requires an existing sitemap. `--manual-v2` selects the current
+dependency-aware task-graph engine; `--manual` supplies its natural-language
+request. AutoQA selects the narrowest mapped page or exactly matching flow,
+rejects invented page/flow IDs, and runs only the requested scope. It prefers
+verified UI entry paths and uses a mapped direct URL only for intentional
+resume or recovery.
 
-Manual requests preserve named entities, exact controls, ordering constraints,
-field values, and expected outcomes. Detailed values do not dilute a clear
-end-to-end flow match. For example, a request can select a mapped Audio-to-video
-flow while also specifying a sample name and exact trim timestamps:
+Manual v2 preserves named entities, exact controls, ordering constraints,
+field values, expected outcomes, and producer-to-consumer artifact identity.
+Detailed values do not dilute a clear end-to-end flow match. For example, a
+request can select a mapped Audio-to-video journey while also specifying a
+sample name and exact trim timestamps:
 
 ```bash
 npm run qa -- run \
   --url https://your-app.example \
+  --manual-v2 \
   --manual "Create a final video through Audio, select Sample A, trim 15s to 25s, and verify the playable 10-second result"
 ```
 
@@ -192,30 +196,29 @@ testing an unrelated page. Requests that name an owner or searchable entity
 must select and visibly confirm that entity before a mutation, then verify the
 result persisted under the same active context.
 
-The first successful manual run records a recipe. The next identical request
-replays that recipe for validation; after a complete successful replay it can
-become deterministic like any other flow. Normal login, upload, realistic
-field-value, guard, processing-wait, screenshot, and outcome-verification
-behavior still applies. `--manual` cannot be combined with `--wipeout`; map the
-site first.
-
-For long, multi-surface acceptance requests, opt into the task-graph engine:
-
-```bash
-npm run qa -- run \
-  --url https://your-app.example \
-  --manual-v2 \
-  --manual "Start a fresh project, upload a script, create an asset, use it in a scene, render the final video, and verify it is downloadable"
-```
-
-`--manual-v2` compiles the request once into small dependency-aware tasks.
+Manual v2 compiles the request once into small dependency-aware tasks.
 Focused requests may use the necessary prefix of a mapped multi-page journey
 (for example reaching an upload-only character step), but stop after that
 feature is completed and persisted. Only requests that explicitly ask for an
 end-to-end journey or final rendered artifact inherit the full mapped flow.
-Manual flow matching also respects the requested operation: an upload request
+Flow matching also respects the requested operation: an upload request
 needs an upload-capable path, a deletion request cannot reuse a creation recipe,
 and a render request needs a terminal render path.
+
+Mapped journey checkpoints determine page order; explicit dependencies carry
+artifacts between tasks; policy sentences become constraints instead of extra
+browser actions. Only the active task is sent to the LLM, completed mutations
+are not repeated by later journey steps, and unresolved tasks remain visible
+instead of being hidden by reaching a terminal page.
+
+The first successful Manual v2 run records semantic recipes. The next identical
+request replays them for validation; a complete successful replay can become
+deterministic like any other flow. A terminal artifact plus at least 80% passing
+milestones can enter replay validation, while deterministic promotion still
+requires every milestone and recipe to pass. Normal login, upload, realistic
+field-value, guard, processing-wait, screenshot, vision, recovery, and outcome
+verification behavior still applies. Manual v2 cannot be combined with
+`--wipeout`; map the site first.
 
 For unattended scheduled runs, enable the production prompt supervisor:
 
@@ -232,25 +235,8 @@ channel; nonexistent files and unrelated destructive actions are refused.
 Upload selection is constrained by the requested media type, and unique
 artifact names rotate after a visible duplicate-name rejection.
 
-To compare the same focused requests in manual v1 and v2, use the checked-in
-10-test matrix. Runs are sequential and a reported product failure does not
-prevent later matrix cases from running:
-
-```bash
-npm run test:manual-matrix -- --url https://beta.koyal.ai
-npm run test:manual-matrix -- --url https://beta.koyal.ai --tests 3,6,9,10 --engines v1,v2
-```
-
-Matrix tests 6, 9, and 10 delete data. Test 6 deletes only the location it
-creates. Tests 9 and 10 delete exactly ten existing characters/projects and
-must be run only with explicit authorization for that account.
-Mapped journey checkpoints determine page order; explicit dependencies carry
-artifacts between tasks; policy sentences become constraints instead of extra
-browser actions. Only the active task is sent to the LLM, completed mutations
-are not repeated by later journey steps, and unresolved tasks make the final
-proof fail rather than being hidden by reaching a terminal page. This mode is
-opt-in and does not change ordinary crawling, exploration, or legacy manual
-runs.
+Manual v2 is opt-in and does not change ordinary crawling, exhaustive mapping,
+approved-flow replay, or deterministic execution.
 
 ## How sitemap coverage stays current
 
@@ -406,15 +392,15 @@ inspect or delete stale walk/recipe data, and manage remembered guard choices.
 |---|---|---|
 | `--url <URL>` | all | Target application. Overrides `AUTOQA_URL`. |
 | `--flow <id[,id]>` | `run`, `test` | Run only the listed flow IDs. |
-| `--manual "<request>"` | `run` | Use the saved sitemap to plan and run one focused, recipe-learning test. |
-| `--manual-v2` | `run --manual` | Compile a detailed manual request into a dependency-aware, active-task execution graph. |
+| `--manual-v2` | `run --manual` | Use the current dependency-aware Manual v2 task-graph engine. |
+| `--manual "<request>"` | `run --manual-v2` | Supply the focused Manual v2 request; requires an existing sitemap. |
 | `--fresh` | `run` | Force exploration while preserving saved state. |
 | `--wipeout` | `run` | Delete all saved AutoQA state for the hostname, then explore and test from zero. |
 | `--reset-values` | `run`, `explore`, `test` | Forget saved non-secret field answers but keep sitemap, recipes, and authentication. |
 | `--max-pages <N>` | browser commands | Maximum crawl pages. Default: 25. |
 | `--max-steps <N>` | browser commands | Maximum LLM decisions for one goal, not the whole run. Default: 12. |
-| `--budget <N>` | browser commands | Hard cap on total LLM calls for the process. Default: unlimited. |
-| `--deep-flows <N>` | exploration | Maximum deep walks in this exploration. Default: 3. |
+| `--budget <N>` | browser commands | Hard cap on total LLM calls for the process. Default: 800. |
+| `--deep-flows <N>` | exploration | Maximum deep workflow walks in this exploration. Default: 10. |
 | `--no-deep` | exploration | Disable deep walking. |
 | `--quick` | testing | Skip additional QA probes. |
 | `--headless` | browser commands | Hide the browser window. |
@@ -440,19 +426,19 @@ Selectors can be combined.
 | `AUTOQA_URL` | none | Default target URL. |
 | `AUTOQA_EMAIL`, `AUTOQA_PASSWORD` | none | Optional generic test credentials. |
 | `AUTOQA_SESSION` | `autoqa` | Browser-session name prefix. Use distinct values for concurrent runs. |
-| `AUTOQA_EXHAUSTIVE` | `false` | Exercise all option/edit probes instead of the normal cap. |
+| `AUTOQA_EXHAUSTIVE` | `true` | Exercise all option/edit probes instead of the normal cap. Set `false` to opt out. |
 | `AUTOQA_MAX_PAGES` | `25` | Crawl page cap. |
 | `AUTOQA_CRAWL_DEPTH` | `4` | Crawl depth cap. |
 | `AUTOQA_PROBES_PER_PAGE` | `6` | Click-probe cap per crawled page. |
 | `AUTOQA_DEEP` | `true` | Enable deep walking. |
-| `AUTOQA_DEEP_FLOWS` | `3` | Deep-walk cap when no CLI value is supplied. |
+| `AUTOQA_DEEP_FLOWS` | `10` | Deep-workflow cap when no CLI value is supplied. |
 | `AUTOQA_DEEP_WALK_MAX_STEPS` | `60` | State cap for one deep walk. |
 | `AUTOQA_PROCESSING_WAIT_MS` | `1200000` | Maximum deterministic processing wait. |
 | `AUTOQA_TERMINAL_WAIT_MS` | `1200000` | Maximum final-artifact wait. |
 | `AUTOQA_PROMPT_TIMEOUT_MS` | `300000` | Detached question timeout. |
 | `AUTOQA_PRODUCTION_SUPERVISOR` | `false` | Answer safe non-secret run prompts autonomously for unattended production QA. |
 | `AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS` | `3000` | Short window in which an inbox/human answer overrides the production supervisor. |
-| `AUTOQA_LLM_BUDGET` | `0` | LLM-call cap; `0` means unlimited. |
+| `AUTOQA_LLM_BUDGET` | `800` | LLM-call cap; `0` means unlimited. |
 | `AUTOQA_LLM_TIMEOUT_MS` | `60000` | Timeout for one LLM request attempt. |
 | `AUTOQA_UPLOAD_SUGGESTIONS` | none | Comma-separated upload paths shown as suggestions. |
 | `AGENT_BROWSER_HEADED` | `true` | Set `false` to hide Chrome. |
@@ -481,10 +467,13 @@ Reports are written to:
 
 ```text
 autoqa/reports/<hostname>/<run-id>/
+├── report.md             # run summary and verdicts
+├── bugs-reported.md      # detected bugs, locations, console and network errors
+└── artifacts/            # JSON, screenshots, snapshots, logs, and step evidence
 ```
 
-Each report includes human-readable and JSON summaries, per-step screenshots,
-DOM snapshots, console/network evidence, and reproduction steps.
+The two Markdown files at the run root are the human-readable output. All
+machine-readable data and detailed evidence live under `artifacts/`.
 
 ## How replay and self-healing work
 
@@ -579,12 +568,16 @@ Place the answer in `answer.txt` in the same directory.
 
 ### Product bug reporting
 
-On Koyal properties, verified product errors are filed after verdict
-finalization through the site’s own **Report a Bug** modal. The report states
-that AutoQA filed it, includes the concrete correlated error, a concise likely
-cause, and the blocked capability. Ambient console/page errors are excluded.
-Reporting failure never changes the QA verdict or repeats the tested action.
-Submission evidence is saved as `in-app-bug-reporting.json` in the run folder.
+On Koyal properties, reportable primary issues are filed after verdict
+finalization through the site’s own **Report a Bug** modal. This includes fresh
+console/page/network/visible application errors and unresolved primary
+checkpoints; synthetic downstream skips are excluded. The report states that
+AutoQA filed it, includes the concrete evidence and blocked capability, and
+records whether submission succeeded. A submitted diagnostic is evidence of an
+observed issue, not automatic proof that Koyal caused it. Reporting failure
+never changes the QA verdict or repeats the tested action. Submission evidence
+is saved as `artifacts/in-app-bug-reporting.json`; the readable bug ledger is
+`bugs-reported.md` at the run root.
 
 Product-side failures and recipe health are separate: a verified application
 error can block a milestone without demoting an otherwise healthy

@@ -6,6 +6,13 @@ export function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+/** The single home for all non-summary files belonging to one run. */
+export function runArtifactsDir(runDir: string): string {
+  const dir = path.join(runDir, 'artifacts');
+  ensureDir(dir);
+  return dir;
+}
+
 export function writeText(filePath: string, content: string): void {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, content, 'utf8');
@@ -192,6 +199,7 @@ export function relativeEvidencePath(runDir: string, filePath: string): string {
 }
 
 export function writeArtifactsIndex(runDir: string, scenarios: Array<{ id: string; steps: TestStep[] }>): void {
+  const artifactsDir = runArtifactsDir(runDir);
   const lines: string[] = [
     '# Run Artifacts Index',
     '',
@@ -204,7 +212,7 @@ export function writeArtifactsIndex(runDir: string, scenarios: Array<{ id: strin
     lines.push('');
     for (const step of scenario.steps) {
       const dir = step.artifactDir ?? step.evidenceDir ?? '—';
-      const rel = path.relative(runDir, dir);
+      const rel = path.relative(artifactsDir, dir);
       lines.push(
         `- **${step.workflow}** (${step.result.verdict}) → [\`step-summary.md\`](${rel}/step-summary.md)`,
       );
@@ -212,5 +220,5 @@ export function writeArtifactsIndex(runDir: string, scenarios: Array<{ id: strin
     lines.push('');
   }
 
-  writeText(path.join(runDir, 'ARTIFACTS.md'), lines.join('\n'));
+  writeText(path.join(artifactsDir, 'ARTIFACTS.md'), lines.join('\n'));
 }

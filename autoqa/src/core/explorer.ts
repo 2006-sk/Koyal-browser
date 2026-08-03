@@ -2178,11 +2178,38 @@ export class Explorer {
           this.browser.wait(Math.max(config.actionDelayMs, 1500));
         }
         if (!effectObserved) {
-          decision.executionFailed = true;
-          ineffectiveManualClickRefs.add(decision.ref);
-          stepsTaken.push(
-            `manual click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel ?? decision.ref}") produced no observable application-state change; this control is blacklisted for the rest of the task`,
-          );
+          const explicitDismissIntent =
+            isSafeStateCycleRecoveryLabel(decision.resolvedLabel ?? '', { manualDismiss: true }) &&
+              /^(?:close|cancel|dismiss|x|×)$/i.test(decision.resolvedLabel?.trim() ?? '') ||
+            isVisionIdentifiedUnlabelledDismiss(
+              decision.resolvedRole,
+              decision.resolvedLabel,
+              decision.reason,
+              true,
+            );
+          const modalDismissed = this.browser.dismissVisibleModalOverlay?.(
+            decision.ref,
+            explicitDismissIntent,
+          ) ?? false;
+          if (modalDismissed) {
+            this.browser.wait(Math.max(config.actionDelayMs, 750));
+            if (explicitDismissIntent) {
+              stepsTaken.push(
+                `the ordinary modal-dismiss click had no effect; a dialog-scoped DOM fallback closed the active overlay`,
+              );
+            } else {
+              decision.executionFailed = true;
+              stepsTaken.push(
+                `the requested page control was blocked by an active modal; a dialog-scoped DOM fallback closed only that overlay so the control can be retried from the new state`,
+              );
+            }
+          } else {
+            decision.executionFailed = true;
+            ineffectiveManualClickRefs.add(decision.ref);
+            stepsTaken.push(
+              `manual click (${decision.resolvedRole ?? ''} "${decision.resolvedLabel ?? decision.ref}") produced no observable application-state change; this control is blacklisted for the rest of the task`,
+            );
+          }
         }
       }
 

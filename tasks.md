@@ -12,6 +12,15 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; ✅ = completed.
 
+### 🟡 HIGH — `#modal-obstruction-recovery-and-broad-in-app-reporting` — close blocking overlays and report every primary issue
+
+- A scene-detail modal remained open after its normal Close/X click had no observable effect, so the later Create Video control was unreachable and the remaining journey was skipped. Add a site-agnostic fallback scoped strictly to the active visible dialog: explicit Close/Cancel/Dismiss/X first, then one unique top-right icon. If a background control is blocked, close the modal and retry from the changed state; never close a modal after a failed Save/Create inside it.
+- Bug reporting is too conservative. Report every primary FAIL/NEEDS REVIEW and any passing step with concrete fresh console/page/network/visible error evidence, while excluding synthetic downstream “skipped because upstream” duplicates. Keep run-level success/blocker policy separate so a broadly reported diagnostic does not make an otherwise useful terminal run red.
+- Every in-app report must contain concise Console/Exception and Network sections, a short issue/cause/impact summary, and a final `Where:` line naming the page and workflow. Persist `in-app-bug-reporting.json` even when zero reports are found or reporting is unavailable.
+- Validate with focused unit tests, the full unit/build gate, and directed live Koyal tests that open/close a scene modal, retry a previously blocked control, and submit a real encountered issue through Report a Bug. Do not commit or push without explicit user permission.
+
+Code/local-live validated 2026-08-03: the real Koyal Scene 1 card required AutoQA's lost-click DOM activation fallback, then the real non-semantic fixed overlay was closed by the new verified modal recovery (`modalBefore:true`, `dismissed:true`, `modalAfter:false`, Edit Scenes still usable). A real scene error (`prompts data is not generated please try again later` plus `Cannot destructure property 'narrative' ... as it is null`) was submitted through the in-app Report-a-Bug UI with Console/Exceptions, Network, impact, and final Where line; result 1/1 submitted with no reporting failure. Full gate: 338/338 tests, clean TypeScript build, clean diff check. Hosted GitHub VM execution remains pending because the user explicitly prohibited commit/push without permission; uncommitted code cannot run in Actions.
+
 ### ✅ HIGH — `#functional-run-exit-and-hosted-bug-reporting` — terminal success exits cleanly; only genuine blockers fail
 
 - Raw milestone assertion disagreements remain fully visible in reports, but no longer force a production command to exit 1 by themselves.

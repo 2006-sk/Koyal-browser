@@ -280,7 +280,7 @@ export class Statements {
       `with exactly one entry per snippet.`;
 
     try {
-      // NB: no `temperature` — some models (e.g. claude-opus-4-8) reject the param
+      // NB: no `temperature` — some Anthropic models reject the param
       // with a 400, which would throw and silently degrade every candidate to the
       // human. Mirror the explorer's call, which omits it.
       const raw = await this.llm.complete({

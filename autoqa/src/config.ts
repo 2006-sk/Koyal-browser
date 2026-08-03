@@ -44,8 +44,7 @@ export const config = {
   /** Deep exploration: actually enter create/upload flows during explore */
   deep: {
     enabled: process.env.AUTOQA_DEEP !== 'false',
-    walksPerExplore: Number(process.env.AUTOQA_DEEP_FLOWS ?? '3'),
-    walksPerExploreExplicit: process.env.AUTOQA_DEEP_FLOWS !== undefined,
+    walksPerExplore: Number(process.env.AUTOQA_DEEP_FLOWS ?? '10'),
     walkMaxSteps: Number(process.env.AUTOQA_DEEP_WALK_MAX_STEPS ?? '60'),
     processingWaitMs: Number(process.env.AUTOQA_PROCESSING_WAIT_MS ?? '1200000'),
     terminalWaitMs: Number(process.env.AUTOQA_TERMINAL_WAIT_MS ?? '1200000'),
@@ -56,7 +55,7 @@ export const config = {
     thorough: process.env.AUTOQA_QUICK !== 'true',
     perMilestoneCap: Number(process.env.AUTOQA_PROBES_PER_MILESTONE ?? '3'),
     /** Exhaustive mode: exercise EVERY option/edit (no per-milestone cap, no 6-member slice) and treat nav/state-loss as first-class bugs. */
-    exhaustive: process.env.AUTOQA_EXHAUSTIVE === 'true',
+    exhaustive: process.env.AUTOQA_EXHAUSTIVE !== 'false',
   },
 
   /** Force this file for every upload this run (recipe replays + prompt default) */
@@ -80,11 +79,11 @@ export const config = {
     provider: llmProvider,
     apiKey: llmApiKey,
     baseUrl: process.env.LLM_BASE_URL ?? '',
-    model: process.env.LLM_MODEL ?? (llmProvider === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o-mini'),
+    model: process.env.LLM_MODEL ?? (llmProvider === 'anthropic' ? 'claude-sonnet-5' : 'gpt-4o-mini'),
     maxStepsPerGoal: Number(process.env.LLM_MAX_STEPS_PER_GOAL ?? '12'),
     snapshotMaxChars: Number(process.env.AUTOQA_SNAPSHOT_MAX_CHARS ?? '8000'),
     /** Hard cap on LLM calls per run; 0 = unlimited */
-    callBudget: Number(process.env.AUTOQA_LLM_BUDGET ?? '0'),
+    callBudget: Number(process.env.AUTOQA_LLM_BUDGET ?? '800'),
     /** Per-attempt network timeout for LLM HTTP calls; a stalled connection must
      *  fail fast and let the existing 3x retry/backoff (and callers' try/catch,
      *  e.g. proposeFlows "must never kill the run") actually run, instead of the
@@ -128,7 +127,6 @@ export function applyCliOverrides(overrides: CliOverrides): void {
   if (overrides.budget !== undefined) config.llm.callBudget = overrides.budget;
   if (overrides.deepFlows !== undefined) {
     config.deep.walksPerExplore = overrides.deepFlows;
-    config.deep.walksPerExploreExplicit = true;
   }
   if (overrides.noDeep) config.deep.enabled = false;
   if (overrides.quick) config.probes.thorough = false;

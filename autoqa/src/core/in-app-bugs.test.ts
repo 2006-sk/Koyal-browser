@@ -5,8 +5,12 @@ import path from 'node:path';
 import test from 'node:test';
 import type { AgentBrowser } from './agent-browser.js';
 import type { Explorer } from './explorer.js';
-import { openKoyalBugReportForm, reportKoyalBugsInApp } from './in-app-bugs.js';
-import { isProductBug } from './slack-bugs.js';
+import {
+  openKoyalBugReportForm,
+  reportKoyalBugsInApp,
+  type InAppBugReportResult,
+} from './in-app-bugs.js';
+import { isProductBug, isReportableIssue } from './slack-bugs.js';
 import type { RunReport, TestStep } from './types.js';
 
 function failedStep(): TestStep {
@@ -103,12 +107,21 @@ test('in-app reporter submits one concise AutoQA report without repeating the ac
     assert.equal(result.submitted, 1);
     assert.deepEqual(opened, ['https://beta.koyal.ai/finalvideo']);
     assert.equal(goals.length, 0);
-    assert.match(filledText, /Reported automatically by AutoQA/);
+    assert.match(filledText, /AutoQA issue report/);
     assert.match(filledText, /video is not edited please try again later/);
-    assert.match(filledText, /Blocked capability: Submit Edit Video/);
+    assert.match(filledText, /Impact: Submit Edit Video/);
+    assert.match(filledText, /Console \/ exceptions:/);
+    assert.match(filledText, /Network:/);
+    assert.match(filledText, /Where: https:\/\/beta\.koyal\.ai\/finalvideo — audio:edit-video\s*$/);
     assert.equal(result.submittedReports[0]?.description, filledText);
     assert.ok(confirmationPolls >= 3);
-    assert.equal(fs.existsSync(path.join(dir, 'in-app-bug-reporting.json')), true);
+    assert.equal(fs.existsSync(path.join(dir, 'artifacts', 'in-app-bug-reporting.json')), true);
+    const bugReport = fs.readFileSync(path.join(dir, 'bugs-reported.md'), 'utf8');
+    assert.match(bugReport, /Reporting status:\*\* SUBMITTED/);
+    assert.match(bugReport, /Where:\*\* https:\/\/beta\.koyal\.ai\/finalvideo/);
+    assert.match(bugReport, /Console errors and page exceptions/);
+    assert.match(bugReport, /video is not edited please try again later/);
+    assert.match(bugReport, /Network errors/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -159,13 +172,14 @@ test('in-app reporting failure is contained and does not alter the product verdi
   }
 });
 
-test('ambient page errors do not turn an automation failure into a product bug', () => {
+test('ambient page errors remain non-blocking but are broadly reportable', () => {
   const step = failedStep();
   step.result.signals.snapshot = { raw: 'Character Driven\nNext disabled', interactive: '' };
   step.result.signals.consoleErrors = [];
   step.result.signals.pageErrors = [{ message: 'AbortError: audio element was destroyed' }];
   step.result.reasons = ['Expected snapshot to include "Audio transcript"'];
   assert.equal(isProductBug(step), false);
+  assert.equal(isReportableIssue(step), true);
 });
 
 test('a visible application error is reportable even without a console error', () => {
@@ -181,7 +195,7 @@ test('a softened manual needs-review still reports a concrete visible product er
   assert.equal(isProductBug(step), true);
 });
 
-test('in-app description omits an ambient runtime error when a different visible product error is authoritative', async () => {
+test('in-app description includes captured runtime evidence and keeps location last', async () => {
   const step = failedStep();
   step.result.verdict = 'needs-review';
   step.result.signals.pageErrors = [{ message: 'AbortError: stale audio element was destroyed' }];
@@ -196,5 +210,69 @@ test('in-app description omits an ambient runtime error when a different visible
   };
   const description = inAppBugDescription(bug, 'run-ambient-filter');
   assert.match(description, /video is not edited please try again later/i);
-  assert.doesNotMatch(description, /AbortError|stale audio element/);
+  assert.match(description, /AbortError: stale audio element was destroyed/);
+  assert.match(description, /Where: https:\/\/beta\.koyal\.ai\/finalvideo — audio:edit-video\s*$/);
+});
+
+test('primary unresolved checkpoint without runtime logs is reportable, downstream synthetic skip is not', () => {
+  const primary = failedStep();
+  primary.result.signals.snapshot = { raw: 'Scene details modal remains open', interactive: '' };
+  primary.result.signals.consoleErrors = [];
+  primary.result.reasons = ['Scene modal blocked Create Video after Close had no effect'];
+  assert.equal(isProductBug(primary), false);
+  assert.equal(isReportableIssue(primary), true);
+
+  const downstream = failedStep();
+  downstream.result.signals.snapshot = { raw: '', interactive: '' };
+  downstream.result.signals.consoleErrors = [];
+  downstream.result.reasons = ['Skipped — not tested because upstream milestone failed'];
+  assert.equal(isReportableIssue(downstream), false);
+});
+
+test('visible generated-data failure keeps the affected subject in the report', async () => {
+  const step = failedStep();
+  step.result.signals.snapshot = {
+    raw: 'Error in Image 50: prompts data is not generated please try again later',
+    interactive: '',
+  };
+  step.result.signals.consoleErrors = [];
+  step.result.reasons = ['Visible product error blocked scene generation'];
+  const { inAppBugDescription } = await import('./in-app-bugs.js');
+  const description = inAppBugDescription({
+    step,
+    scenarioName: 'Scene generation',
+    occurrences: 1,
+    flows: new Set(['scene']),
+  }, 'run-scene-error');
+  assert.match(description, /Issue: prompts data is not generated please try again later/i);
+});
+
+test('zero-issue run still writes in-app reporting evidence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoqa-in-app-empty-'));
+  const passing = failedStep();
+  passing.result.verdict = 'pass';
+  passing.result.signals.consoleErrors = [];
+  passing.result.signals.pageErrors = [];
+  passing.result.signals.snapshot = { raw: 'All good', interactive: '' };
+  passing.result.reasons = [];
+  try {
+    const result = await reportKoyalBugsInApp({
+      report: report(passing),
+      hostname: 'beta.koyal.ai',
+      runDir: dir,
+      browser: {} as AgentBrowser,
+      explorer: {} as Explorer,
+    });
+    assert.equal(result.found, 0);
+    const evidence = JSON.parse(
+      fs.readFileSync(path.join(dir, 'artifacts', 'in-app-bug-reporting.json'), 'utf8'),
+    ) as InAppBugReportResult;
+    assert.equal(evidence.found, 0);
+    assert.match(
+      fs.readFileSync(path.join(dir, 'bugs-reported.md'), 'utf8'),
+      /No reportable product bugs were detected/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
