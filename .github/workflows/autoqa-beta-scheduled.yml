@@ -39,7 +39,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       AUTOQA_STATE_KEY: ${{ secrets.AUTOQA_STATE_KEY }}
       LLM_PROVIDER: anthropic
-      LLM_MODEL: claude-opus-4-8
+      LLM_MODEL: claude-sonnet-5
       AUTOQA_EXHAUSTIVE: "true"
       AUTOQA_PRODUCTION_SUPERVISOR: "true"
       AUTOQA_SUPERVISOR_HUMAN_OVERRIDE_MS: "0"
