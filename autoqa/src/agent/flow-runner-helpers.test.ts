@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   artifactIdentityForMilestone,
   boundaryConstrainedGoal,
+  blockedManualTaskDependencyIds,
   canDirectOpenManualTarget,
   exploratoryDirectedGoal,
   flowHasCompletionAction,
@@ -64,6 +65,94 @@ function flow(id: string, status: Flow['status'], phase?: 'learning' | 'replay-v
 test('production supervisor converts structurally skipped milestones to binary fail', () => {
   assert.equal(skippedMilestoneVerdict(true), 'fail');
   assert.equal(skippedMilestoneVerdict(false), 'needs-review');
+});
+
+test('manual v2 blocks only consumers whose explicit prerequisite did not pass', () => {
+  const candidate = flow('manual-v2-dependencies', 'exploratory');
+  candidate.manualExecution = {
+    version: 1,
+    sourceFlowId: 'source',
+    primaryJourneyPageIds: ['assets', 'edit-scenes'],
+    constraints: [],
+    tasks: [
+      {
+        id: 'acceptance-7',
+        requirement: 'Create one reusable asset',
+        phase: 'pre-terminal',
+        dependsOn: [],
+      },
+      {
+        id: 'acceptance-8',
+        requirement: 'Add that same asset to a generated scene',
+        phase: 'pre-terminal',
+        dependsOn: ['acceptance-7'],
+      },
+      {
+        id: 'acceptance-9',
+        requirement: 'Change one dialogue line',
+        phase: 'pre-terminal',
+        dependsOn: [],
+      },
+    ],
+    policy: {
+      context: 'active-task',
+      processing: 'manual-narrative-safe',
+      recovery: 'bounded-modal-dismiss',
+      probes: 'contract-only',
+    },
+  };
+  const consumer = {
+    id: 'manual-task-8',
+    goal: 'Add same asset',
+    kind: 'navigate' as const,
+    manualTaskId: 'acceptance-8',
+  };
+  const independent = {
+    id: 'manual-task-9',
+    goal: 'Change dialogue',
+    kind: 'navigate' as const,
+    manualTaskId: 'acceptance-9',
+  };
+
+  assert.deepEqual(
+    blockedManualTaskDependencyIds(
+      candidate,
+      consumer,
+      new Map([['acceptance-7', 'fail']]),
+    ),
+    ['acceptance-7'],
+  );
+  assert.deepEqual(
+    blockedManualTaskDependencyIds(
+      candidate,
+      consumer,
+      new Map([['acceptance-7', 'needs-review']]),
+    ),
+    ['acceptance-7'],
+    'an unproven producer cannot authorize its consumer',
+  );
+  assert.deepEqual(
+    blockedManualTaskDependencyIds(
+      candidate,
+      consumer,
+      new Map([['acceptance-7', 'pass']]),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    blockedManualTaskDependencyIds(candidate, independent, new Map()),
+    [],
+    'independent tasks continue even when another task failed',
+  );
+  assert.deepEqual(
+    blockedManualTaskDependencyIds(
+      { ...candidate, manualExecution: undefined },
+      consumer,
+      new Map([['acceptance-7', 'fail']]),
+    ),
+    [],
+    'ordinary and legacy flows are unaffected',
+  );
 });
 
 test('position recovery is narrowly directed and stored separately from acceptance recipes', () => {

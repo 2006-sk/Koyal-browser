@@ -12,6 +12,12 @@ Full narrative/evidence for anything here lives in CLAUDE.md (search by date or 
 
 Status key: unmarked heading = open; 🟡 = partially fixed; 👀 = watch-only; ✅ = completed.
 
+### ✅ HIGH — `#manual-v2-runtime-dependency-gating` — failed producers no longer launch impossible consumer tasks
+
+- Manual v2 already compiled producer/consumer relationships into `manualExecution.tasks[].dependsOn`, but the runtime ignored them and unconditionally described every later audit as independent. A failed reusable-asset creation could therefore launch “add that same asset to a scene,” causing long exploratory page hunting for an artifact that was never proven to exist.
+- The runner now tracks the final verdict of each Manual v2 task, skips only tasks whose explicit prerequisites did not pass, records a visible synthetic blocked result without browser activity, and continues every unrelated task. Ordinary flows, Manual v1, crawling, deep walks, replay, authentication, and processing policy are unchanged.
+- Contract-audit verification no longer prints provisional PASS lines before its task-specific audit/repair completes; one final acceptance verdict is logged instead. Focused dependency/non-regression coverage, the complete 338/338 unit suite, TypeScript build, and diff check all pass.
+
 ### 🟡 HIGH — `#modal-obstruction-recovery-and-broad-in-app-reporting` — close blocking overlays and report every primary issue
 
 - A scene-detail modal remained open after its normal Close/X click had no observable effect, so the later Create Video control was unreachable and the remaining journey was skipped. Add a site-agnostic fallback scoped strictly to the active visible dialog: explicit Close/Cancel/Dismiss/X first, then one unique top-right icon. If a background control is blocked, close the modal and retry from the changed state; never close a modal after a failed Save/Create inside it.
