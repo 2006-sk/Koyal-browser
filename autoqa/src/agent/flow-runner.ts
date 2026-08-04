@@ -1132,6 +1132,26 @@ export function skippedMilestoneVerdict(supervisorEnabled: boolean): Verdict {
 }
 
 /**
+ * Return the explicit task-graph prerequisites that have not been proven.
+ * This is deliberately Manual-v2-only: ordinary flows and legacy manual
+ * contracts have no task graph and therefore keep their existing behavior.
+ */
+export function blockedManualTaskDependencyIds(
+  flow: Flow,
+  milestone: FlowMilestone,
+  taskVerdicts: ReadonlyMap<string, Verdict>,
+): string[] {
+  if (!flow.manualExecution || !milestone.manualTaskId) return [];
+  const task = flow.manualExecution.tasks.find(
+    (candidate) => candidate.id === milestone.manualTaskId,
+  );
+  if (!task) return [];
+  return task.dependsOn.filter(
+    (dependencyId) => taskVerdicts.get(dependencyId) !== 'pass',
+  );
+}
+
+/**
  * A synthetic step recording that a milestone was NOT tested because an upstream
  * milestone failed and its position could not be recovered to test this one
  * independently. Interactive runs use `needs-review`; production-supervisor
@@ -1160,6 +1180,35 @@ function skippedStep(
       actual,
       signals: emptySignals('unknown'),
       reasons: [`skipped: upstream break at ${brokenAtId}`],
+      retried: false,
+    },
+    stepsToReproduce: [...priorGoals, milestone.goal],
+  };
+}
+
+/** Record one dependent task as untested without touching the browser. */
+function dependencyBlockedStep(
+  flow: Flow,
+  milestone: FlowMilestone,
+  dependencyIds: string[],
+  priorGoals: string[],
+): TestStep {
+  const dependencyList = dependencyIds.map((id) => `"${id}"`).join(', ');
+  const actual =
+    `blocked — not tested because required prerequisite task(s) ${dependencyList} ` +
+    'did not pass; running this consumer would produce invalid evidence';
+  const verdict = skippedMilestoneVerdict(config.supervisor.enabled);
+  return {
+    workflow: milestone.id,
+    action: milestone.goal,
+    expected: milestone.goal,
+    result: {
+      verdict,
+      severity: 'low',
+      expected: milestone.goal,
+      actual,
+      signals: emptySignals('unknown'),
+      reasons: [`blocked by unmet task dependency: ${dependencyIds.join(', ')}`],
       retried: false,
     },
     stepsToReproduce: [...priorGoals, milestone.goal],
@@ -2331,6 +2380,7 @@ async function runMilestone(
     artifactPersistenceIdentity: creationMustPersist
       ? artifactIdentityForMilestone(milestone, marker)
       : undefined,
+    logResult: !milestone.manualContractAudit,
   });
   if (explored) step.explorerSteps = explored.stepsTaken;
   if (flow.manualContract) {
@@ -2521,6 +2571,7 @@ async function runMilestone(
       artifactPersistenceIdentity: creationMustPersist
         ? artifactIdentityForMilestone(milestone, marker)
         : undefined,
+      logResult: !milestone.manualContractAudit,
     });
     step.explorerSteps = explored.stepsTaken;
     if (flow.manualContract) {
@@ -3709,6 +3760,7 @@ export async function runFlows(
     let lastAttemptedIndex = -1;
     const milestoneExecutions: MilestoneExecution[] = [];
     const manualEvidence: string[] = [];
+    const manualTaskVerdicts = new Map<string, Verdict>();
     const visitedPageIds = new Set<string>();
     let verifiedProductBlockSeen = false;
 
@@ -3751,6 +3803,33 @@ export async function runFlows(
 
       for (let mi = 0; mi < flow.milestones.length; mi++) {
         const milestone = flow.milestones[mi];
+
+        const blockedDependencies = blockedManualTaskDependencyIds(
+          flow,
+          milestone,
+          manualTaskVerdicts,
+        );
+        if (blockedDependencies.length > 0) {
+          const blockedStep = dependencyBlockedStep(
+            flow,
+            milestone,
+            blockedDependencies,
+            flow.milestones.slice(0, mi).map((candidate) => candidate.goal),
+          );
+          scenario.steps.push(blockedStep);
+          if (milestone.manualTaskId) {
+            manualTaskVerdicts.set(milestone.manualTaskId, blockedStep.result.verdict);
+          }
+          milestoneExecutions.push({
+            milestoneId: milestone.id,
+            verdict: blockedStep.result.verdict,
+            execution: 'none',
+          });
+          console.log(
+            `[flow:v2] acceptance task ${milestone.manualContractItem ?? milestone.id} blocked by unmet prerequisite(s) ${blockedDependencies.join(', ')} — skipping only this dependent task`,
+          );
+          continue;
+        }
 
         // wizard drafts can resume mid-flow: if we're already on a LATER
         // milestone's page, fast-forward instead of failing the earlier ones.
@@ -3826,6 +3905,12 @@ export async function runFlows(
             productBlocked ||
             (verifiedProductBlockSeen && isManualFinalProofMilestone(milestone)),
         });
+        if (milestone.manualTaskId) {
+          manualTaskVerdicts.set(milestone.manualTaskId, step.result.verdict);
+          console.log(
+            `[flow:v2] acceptance task ${milestone.manualContractItem ?? milestone.id} final verdict: ${step.result.verdict.toUpperCase()}`,
+          );
+        }
         if (step.result.verdict === 'fail') {
           const remaining = flow.milestones.length - (mi + 1);
           if (remaining <= 0) {
@@ -3834,7 +3919,7 @@ export async function runFlows(
           }
           if (milestone.manualContractAudit) {
             console.log(
-              `[flow:v2] acceptance task ${milestone.manualContractItem ?? milestone.id} failed — continuing to the next independent task`,
+              `[flow:v2] acceptance task ${milestone.manualContractItem ?? milestone.id} failed — continuing; explicit dependents will be blocked and unrelated tasks will still run`,
             );
             continue;
           }

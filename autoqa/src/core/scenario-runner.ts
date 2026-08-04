@@ -45,6 +45,12 @@ export async function recordVerifiedStep(
     artifactPersistenceVerification?: boolean;
     /** Run-specific name/description the artifact oracle should locate. */
     artifactPersistenceIdentity?: string;
+    /**
+     * Some callers perform a second, contract-specific audit after the generic
+     * verification layer. Suppress the provisional console verdict so users
+     * see only the final adjudicated result for those steps.
+     */
+    logResult?: boolean;
   },
 ): Promise<TestStep> {
   const result = await ctx.verification.verifyAfterAction(meta.expectation, meta.waitOptions);
@@ -142,9 +148,11 @@ export async function recordVerifiedStep(
 
   const withEvidence = attachEvidenceToStep(step, ctx.evidenceDir, files);
 
-  console.log(
-    `[${result.verdict.toUpperCase()}] ${meta.workflow} → ${path.join(stepDir, 'step-summary.md')}`,
-  );
+  if (meta.logResult !== false) {
+    console.log(
+      `[${result.verdict.toUpperCase()}] ${meta.workflow} → ${path.join(stepDir, 'step-summary.md')}`,
+    );
+  }
 
   return withEvidence;
 }
