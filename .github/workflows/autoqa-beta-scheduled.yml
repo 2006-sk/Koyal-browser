@@ -150,10 +150,6 @@ jobs:
             ) 2>&1 | tee "$attempt_log"
             status=${PIPESTATUS[0]}
             set -e
-            if [[ "$status" -eq 0 ]]; then
-              exit 0
-            fi
-
             summary_line="$(grep -E '\[autoqa\] [0-9]+ PASS / [0-9]+ FAIL / [0-9]+ NEEDS REVIEW' "$attempt_log" | tail -n 1 || true)"
             pass_count=""
             fail_count=""
@@ -171,8 +167,12 @@ jobs:
             if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
               [[ -n "$pass_count" && -n "$fail_count" ]] && \
               (( pass_count <= fail_count )); then
-              echo "[hosted] Script attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session"
+              echo "[hosted] Script attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session (even if terminal proof made the command exit 0)"
               continue
+            fi
+
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
             fi
 
             echo "[hosted] Script attempt $attempt will not be retried (PASS=${pass_count:-unknown}, FAIL=${fail_count:-unknown}, status=$status)"
@@ -204,10 +204,6 @@ jobs:
             ) 2>&1 | tee "$attempt_log"
             status=${PIPESTATUS[0]}
             set -e
-            if [[ "$status" -eq 0 ]]; then
-              exit 0
-            fi
-
             summary_line="$(grep -E '\[autoqa\] [0-9]+ PASS / [0-9]+ FAIL / [0-9]+ NEEDS REVIEW' "$attempt_log" | tail -n 1 || true)"
             pass_count=""
             fail_count=""
@@ -225,8 +221,12 @@ jobs:
             if [[ "$attempt" -lt "$AUTOQA_HOSTED_ATTEMPTS" ]] && \
               [[ -n "$pass_count" && -n "$fail_count" ]] && \
               (( pass_count <= fail_count )); then
-              echo "[hosted] Audio attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session"
+              echo "[hosted] Audio attempt $attempt ended with PASS=$pass_count and FAIL=$fail_count; PASS <= FAIL, retrying in exploratory recovery mode with a clean native browser session (even if terminal proof made the command exit 0)"
               continue
+            fi
+
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
             fi
 
             echo "[hosted] Audio attempt $attempt will not be retried (PASS=${pass_count:-unknown}, FAIL=${fail_count:-unknown}, status=$status)"
